@@ -8,8 +8,8 @@
   "scripts": {
     "postinstall": "prisma generate",
     "build:ui": "npm run build --prefix ../deedlit.dev.ui",
-    "dev": "prisma migrate deploy && next dev",
-    "build": "npm run build:ui && prisma generate && prisma migrate deploy && next build",
+    "dev": "next dev",
+    "build": "npm run build:ui && prisma generate && next build",
     "postbuild": "node ./scripts/prepare-standalone.mjs",
     "start": "next start",
     "lint": "eslint",

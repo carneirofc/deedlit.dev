@@ -23,6 +23,8 @@ declare global {
   var __comfyhelperPrismaClient: PrismaClient | undefined;
   // eslint-disable-next-line no-var
   var __comfyhelperDbInitialized: boolean | undefined;
+  // eslint-disable-next-line no-var
+  var __comfyhelperDbInitializationPromise: Promise<void> | undefined;
 }
 
 function createPrismaClient(): PrismaClient {
@@ -43,6 +45,14 @@ function createPrismaClient(): PrismaClient {
   enableWalOnConnect(client);
 
   return client;
+}
+
+function getOrCreatePrismaClient(): PrismaClient {
+  if (!globalThis.__comfyhelperPrismaClient) {
+    globalThis.__comfyhelperPrismaClient = createPrismaClient();
+  }
+
+  return globalThis.__comfyhelperPrismaClient;
 }
 
 /**
@@ -81,12 +91,16 @@ function enableWalOnConnect(client: PrismaClient): void {
     });
 }
 
-// Singleton: reuse across HMR cycles (dev) and within the same process (prod).
-export const prisma: PrismaClient =
-  globalThis.__comfyhelperPrismaClient ?? createPrismaClient();
-
-// Always persist so the next module evaluation reuses the same handle.
-globalThis.__comfyhelperPrismaClient = prisma;
+// Singleton: expose a stable PrismaClient-shaped proxy while instantiating the
+// actual SQLite connection lazily, so startup migrations can run before any
+// client opens the database file.
+export const prisma = new Proxy({} as PrismaClient, {
+  get(_target, property, receiver) {
+    const client = getOrCreatePrismaClient() as Record<PropertyKey, unknown>;
+    const value = Reflect.get(client, property, receiver);
+    return typeof value === "function" ? value.bind(getOrCreatePrismaClient()) : value;
+  },
+}) as PrismaClient;
 
 /** @deprecated Use `prisma` directly instead. Kept for migration compatibility. */
 export const db = prisma;
@@ -113,23 +127,7 @@ export async function disconnectDatabase(): Promise<void> {
   }
 }
 
-/**
- * Ensure the database schema is up to date by running Prisma migrations.
- * Safe to call multiple times — only runs once per process.  The `hasInitialized`
- * flag is stored on globalThis so it survives Next.js HMR module re-evaluation.
- */
-export async function ensureDatabase(): Promise<void> {
-  if (globalThis.__comfyhelperDbInitialized) {
-    return;
-  }
-
-  // Mark eagerly to prevent concurrent callers (e.g. parallel route handlers
-  // during startup) from spawning multiple migration processes at once.
-  globalThis.__comfyhelperDbInitialized = true;
-
-  // ------------------------------------------------------------------
-  // Backup before migrating so we can roll back on failure.
-  // ------------------------------------------------------------------
+async function runDatabaseMigration(): Promise<void> {
   const dbExists = existsSync(DATABASE_PATH);
   if (dbExists) {
     try {
@@ -144,7 +142,6 @@ export async function ensureDatabase(): Promise<void> {
   }
 
   try {
-    // Run pending migrations programmatically
     execSync("npx prisma migrate deploy", {
       cwd: process.cwd(),
       stdio: "pipe",
@@ -154,7 +151,6 @@ export async function ensureDatabase(): Promise<void> {
       },
     });
 
-    // Migration succeeded — remove the backup to keep the data directory clean.
     if (dbExists) {
       try {
         rmSync(DATABASE_BACKUP_PATH, { force: true });
@@ -163,10 +159,6 @@ export async function ensureDatabase(): Promise<void> {
       }
     }
   } catch (error) {
-    // ------------------------------------------------------------------
-    // Restore the pre-migration backup so the app can still start with
-    // the last known-good schema.
-    // ------------------------------------------------------------------
     if (dbExists && existsSync(DATABASE_BACKUP_PATH)) {
       try {
         renameSync(DATABASE_BACKUP_PATH, DATABASE_PATH);
@@ -180,9 +172,39 @@ export async function ensureDatabase(): Promise<void> {
       }
     }
 
-    console.warn(
-      "[prisma] migrate deploy failed (database may already be up to date):",
-      error instanceof Error ? error.message : error,
+    throw error;
+  }
+}
+
+/**
+ * Ensure the database schema is up to date by running Prisma migrations.
+ * Safe to call multiple times — only runs once per process.  The `hasInitialized`
+ * flag is stored on globalThis so it survives Next.js HMR module re-evaluation.
+ */
+export async function ensureDatabase(): Promise<void> {
+  if (globalThis.__comfyhelperDbInitialized) {
+    return;
+  }
+
+  if (globalThis.__comfyhelperDbInitializationPromise) {
+    await globalThis.__comfyhelperDbInitializationPromise;
+    return;
+  }
+
+  globalThis.__comfyhelperDbInitializationPromise = (async () => {
+    await disconnectDatabase();
+    await runDatabaseMigration();
+    globalThis.__comfyhelperDbInitialized = true;
+  })();
+
+  try {
+    await globalThis.__comfyhelperDbInitializationPromise;
+  } catch (error) {
+    globalThis.__comfyhelperDbInitialized = false;
+    throw new Error(
+      `[prisma] migrate deploy failed during startup: ${error instanceof Error ? error.message : String(error)}`,
     );
+  } finally {
+    globalThis.__comfyhelperDbInitializationPromise = undefined;
   }
 }

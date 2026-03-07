@@ -2,6 +2,9 @@ export async function register() {
   // Only bootstrap workers on the server (Node.js runtime), not during builds
   // or in the Edge runtime.
   if (process.env.NEXT_RUNTIME === "nodejs") {
+    const { ensureDatabase } = await import("@/lib/db/client");
+    await ensureDatabase();
+
     const { bootstrapWorkers } = await import("@/lib/workers/bootstrap");
     await bootstrapWorkers();
 
