@@ -18,25 +18,15 @@ import type {
   WorkflowNodePalette,
 } from "./gallery-types";
 
+const ADDITIONAL_GENERATION_DETAIL_CANDIDATES: Array<{ label: string; keys: string[] }> = [
+  { label: "Scheduler", keys: ["scheduler"] },
+  { label: "Denoise", keys: ["denoise", "denoise_strength"] },
+  { label: "Clip Skip", keys: ["clip_skip"] },
+  { label: "Batch Size", keys: ["batch_size", "batch"] },
+];
+
 function toInlineValue(value: unknown): string | undefined {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed || undefined;
-  }
-
-  if (text) {
-    return text;
-  }
-
-  if (typeof value === "string") {
-    return value.trim() || undefined;
-  }
-
-  return undefined;
+  return toDisplayValue(value);
 }
 
 function toFiniteNumber(value: unknown, fallback: number): number {
@@ -93,21 +83,6 @@ function parseNodeSize(value: unknown): { width: number; height: number } {
   return { width: 260, height: 120 };
 }
 
-function resolveNodeReference(value: unknown): string | null {
-  if (Array.isArray(value) && value.length > 0) {
-    const first = value[0];
-    if (typeof first === "string" || typeof first === "number") {
-      return String(first);
-    }
-  }
-
-  if (typeof value === "string" || typeof value === "number") {
-    return String(value);
-  }
-
-  return null;
-}
-
 export function buildGenerationDetails(image: ImageRecord): GenerationDetails {
   const metadata = image.metadata;
   const promptSummary = image.promptSummary;
@@ -162,14 +137,7 @@ export function buildGenerationDetails(image: ImageRecord): GenerationDetails {
   const combinedSize =
     sizeValue ?? (widthValue && heightValue ? `${widthValue}x${heightValue}` : undefined);
 
-  const additionalCandidates = [
-    { label: "Scheduler", keys: ["scheduler"] },
-    { label: "Denoise", keys: ["denoise", "denoise_strength"] },
-    { label: "Clip Skip", keys: ["clip_skip"] },
-    { label: "Batch Size", keys: ["batch_size", "batch"] },
-  ];
-
-  const additional = additionalCandidates
+  const additional = ADDITIONAL_GENERATION_DETAIL_CANDIDATES
     .map((candidate) => {
       const value = toDisplayValue(findFirstValueByKeys(searchableMetadata, candidate.keys));
       if (!value) {

@@ -3,8 +3,10 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 
 import { prisma, ensureDatabase } from "@/lib/db/client";
+import { PromptSummarySchema } from "@/lib/contracts/domain";
 import type { Prisma } from "@/lib/generated/prisma/client";
 import { readMetadataForImage, walkPngFiles } from "@/lib/library-scanner";
+import { tryParseJson, tryParseJsonWithSchema } from "@/lib/json-utils";
 import type { ImageRecord, PromptSummary, RootDirectory, ScanJobInfo, ScanJobStatus } from "@/lib/library-types";
 import { emitGalleryImagesChanged, emitGalleryImagesRemoved } from "@/lib/messaging/gallery";
 import { emitScanEvent } from "@/lib/messaging/scan";
@@ -81,16 +83,12 @@ function toIso(value?: number | null): string | undefined {
 }
 
 function parseWarnings(raw: string): string[] {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed)) {
-      return parsed.filter((entry): entry is string => typeof entry === "string");
-    }
-  } catch {
+  const parsed = tryParseJson(raw);
+  if (!Array.isArray(parsed)) {
     return [];
   }
 
-  return [];
+  return parsed.filter((entry): entry is string => typeof entry === "string");
 }
 
 function toScanJobInfo(row: ScanJobRow): ScanJobInfo {
@@ -109,44 +107,11 @@ function toScanJobInfo(row: ScanJobRow): ScanJobInfo {
 }
 
 function parseMetadata(raw: string | null): unknown {
-  if (!raw) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(raw) as unknown;
-  } catch {
-    return undefined;
-  }
+  return tryParseJson(raw);
 }
 
 function parsePromptSummary(raw: string | null | undefined): PromptSummary | undefined {
-  if (!raw) {
-    return undefined;
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return undefined;
-    }
-
-    const record = parsed as Record<string, unknown>;
-    const positivePrompt =
-      typeof record.positivePrompt === "string" ? record.positivePrompt : undefined;
-    const negativePrompt =
-      typeof record.negativePrompt === "string" ? record.negativePrompt : undefined;
-    const model = typeof record.model === "string" ? record.model : undefined;
-    const sampler = typeof record.sampler === "string" ? record.sampler : undefined;
-
-    if (!positivePrompt && !negativePrompt && !model && !sampler) {
-      return {};
-    }
-
-    return { positivePrompt, negativePrompt, model, sampler };
-  } catch {
-    return undefined;
-  }
+  return tryParseJsonWithSchema(raw, PromptSummarySchema);
 }
 
 function toPromptSummaryJson(metadata: unknown): string {
@@ -175,13 +140,10 @@ function toImageRecord(
   } = {},
 ): ImageRecord {
   const parsedPromptSummary = parsePromptSummary(row.promptSummaryJson);
-  const fallbackMetadata =
-    parsedPromptSummary || row.metadataJson === undefined ? undefined : parseMetadata(row.metadataJson ?? null);
-
-  const metadata =
-    options.includeMetadata && row.metadataJson !== undefined
-      ? parseMetadata(row.metadataJson ?? null)
-      : undefined;
+  const parsedMetadata =
+    row.metadataJson === undefined ? undefined : parseMetadata(row.metadataJson ?? null);
+  const metadata = options.includeMetadata ? parsedMetadata : undefined;
+  const fallbackMetadata = parsedPromptSummary === undefined ? parsedMetadata : undefined;
 
   // Parse metadata on the backend only when includeMetadata is true (detail view)
   // For list endpoints, this is skipped to keep responses lightweight

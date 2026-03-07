@@ -7,7 +7,7 @@ import { ZodError } from "zod";
 
 import { RevealImageBodySchema, RevealImageResponseSchema } from "@/lib/contracts/api";
 import { errorJson, jsonWithSchema, zodErrorMessage } from "@/lib/http/route-response";
-import { listRoots } from "@/lib/config-store";
+import { loadVisibleRootsContext } from "@/lib/http/route-context";
 import { isAllowedImagePath } from "@/lib/library-scanner";
 
 export const runtime = "nodejs";
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
     const payload = await request.json();
     const { path: requestedPath } = RevealImageBodySchema.parse(payload);
 
-    const roots = await listRoots({ visibleOnly: true });
+    const { roots } = await loadVisibleRootsContext();
     if (!isAllowedImagePath(requestedPath, roots)) {
       return errorJson("Image path is not allowed.", 403);
     }

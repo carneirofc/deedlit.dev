@@ -9,7 +9,8 @@ import { ZodError } from "zod";
 
 import { DeleteImageBodySchema, DeleteImageResponseSchema, ImageQuerySchema } from "@/lib/contracts/api";
 import { errorJson, jsonWithSchema, zodErrorMessage } from "@/lib/http/route-response";
-import { getTrashcanDirectory, listRoots } from "@/lib/config-store";
+import { getTrashcanDirectory } from "@/lib/config-store";
+import { loadVisibleRootsContext } from "@/lib/http/route-context";
 import { getCachedImageById, removeCachedImageEntry } from "@/lib/image-cache-store";
 import { moveToTrash } from "@/lib/image-trash";
 import { isAllowedImagePath } from "@/lib/library-scanner";
@@ -37,7 +38,7 @@ export async function GET(request: Request) {
       format: searchParams.get("format") ?? undefined,
     });
 
-    const roots = await listRoots({ visibleOnly: true });
+    const { roots } = await loadVisibleRootsContext();
     if (!isAllowedImagePath(requestedPath, roots)) {
       return errorJson("Image path is not allowed.", 403);
     }
@@ -94,13 +95,12 @@ export async function DELETE(request: Request) {
       return errorJson("Trashcan directory is not configured.", 409);
     }
 
-    const roots = await listRoots({ visibleOnly: true });
-    const visibleRootIds = new Set(roots.map((root) => root.id));
+    const { roots, rootIdSet } = await loadVisibleRootsContext();
     const cachedImage = await getCachedImageById(imageId);
     if (!cachedImage) {
       return errorJson("Image cache entry not found.", 404);
     }
-    if (!visibleRootIds.has(cachedImage.rootId)) {
+    if (!rootIdSet.has(cachedImage.rootId)) {
       return errorJson("Image is not in a visible root.", 403);
     }
     if (cachedImage.absolutePath !== requestedPath) {

@@ -3,8 +3,9 @@ import { stat } from "node:fs/promises";
 import { ZodError } from "zod";
 
 import { DeleteImagesBodySchema, DeleteImagesResponseSchema } from "@/lib/contracts/api";
-import { getTrashcanDirectory, listRoots } from "@/lib/config-store";
 import { errorJson, jsonWithSchema, zodErrorMessage } from "@/lib/http/route-response";
+import { getTrashcanDirectory } from "@/lib/config-store";
+import { loadVisibleRootsContext } from "@/lib/http/route-context";
 import { removeCachedImageEntriesByAbsolutePath } from "@/lib/image-cache-store";
 import { moveToTrash } from "@/lib/image-trash";
 import { isAllowedImagePath } from "@/lib/library-scanner";
@@ -33,7 +34,7 @@ export async function DELETE(request: Request) {
       return errorJson("Trashcan directory is not configured.", 409);
     }
 
-    const roots = await listRoots({ visibleOnly: true });
+    const { roots } = await loadVisibleRootsContext();
     const movedPaths: string[] = [];
     const failed: DeleteFailure[] = [];
 

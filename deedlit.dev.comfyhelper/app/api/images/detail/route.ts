@@ -2,7 +2,7 @@ import { ZodError } from "zod";
 
 import { ImageDetailQuerySchema, ImageDetailResponseSchema } from "@/lib/contracts/api";
 import { errorJson, jsonWithSchema, zodErrorMessage } from "@/lib/http/route-response";
-import { listRoots } from "@/lib/config-store";
+import { loadVisibleRootsContext } from "@/lib/http/route-context";
 import { getCachedImageById } from "@/lib/image-cache-store";
 
 export const runtime = "nodejs";
@@ -15,8 +15,8 @@ export async function GET(request: Request) {
       id: searchParams.get("id") ?? undefined,
     });
 
-    const [roots, image] = await Promise.all([
-      listRoots({ visibleOnly: true }),
+    const [{ rootIdSet }, image] = await Promise.all([
+      loadVisibleRootsContext(),
       getCachedImageById(query.id),
     ]);
 
@@ -24,8 +24,7 @@ export async function GET(request: Request) {
       return errorJson("Image not found.", 404);
     }
 
-    const visibleRootIds = new Set(roots.map((root) => root.id));
-    if (!visibleRootIds.has(image.rootId)) {
+    if (!rootIdSet.has(image.rootId)) {
       return errorJson("Image is not in a visible root.", 403);
     }
 

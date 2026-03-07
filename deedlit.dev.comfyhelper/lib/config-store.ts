@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AppSettings, RootDirectory, TagFilterPreset } from "@/lib/library-types";
 import { prisma, ensureDatabase } from "@/lib/db/client";
 import { removeCachedImagesForRoot } from "@/lib/image-cache-store";
+import { tryParseJson } from "@/lib/json-utils";
 import { normalizeExcludedTags } from "@/lib/prompt-tags";
 import { AppSettingsSchema, RootDirectorySchema } from "@/lib/schemas";
 
@@ -67,13 +68,9 @@ function parseExcludedTagsSetting(rawValue: string | undefined): string[] {
     return [];
   }
 
-  try {
-    const parsed = JSON.parse(rawValue) as unknown;
-    if (Array.isArray(parsed)) {
-      return normalizeExcludedTags(parsed.filter((value): value is string => typeof value === "string"));
-    }
-  } catch {
-    // Fall through to legacy plain-text parsing.
+  const parsed = tryParseJson(rawValue);
+  if (Array.isArray(parsed)) {
+    return normalizeExcludedTags(parsed.filter((value): value is string => typeof value === "string"));
   }
 
   return normalizeExcludedTags(
@@ -104,46 +101,42 @@ function parseTagFilterPresetsSetting(rawValue: string | undefined): TagFilterPr
     return [];
   }
 
-  try {
-    const parsed = JSON.parse(rawValue) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed
-      .map((entry) => {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-          return null;
-        }
-
-        const record = entry as Record<string, unknown>;
-        const id = typeof record.id === "string" ? record.id.trim() : "";
-        const name = typeof record.name === "string" ? record.name.trim() : "";
-        const createdAt =
-          typeof record.createdAt === "string" && record.createdAt.trim()
-            ? record.createdAt
-            : new Date().toISOString();
-        const positiveTags = normalizePresetTags(record.positiveTags);
-        const negativeTags = normalizePresetTags(record.negativeTags);
-
-        if (!id || !name || (positiveTags.length === 0 && negativeTags.length === 0)) {
-          return null;
-        }
-
-        return {
-          id,
-          name,
-          createdAt,
-          positiveTags,
-          negativeTags,
-        } satisfies TagFilterPreset;
-      })
-      .filter((entry): entry is TagFilterPreset => Boolean(entry))
-      .slice(0, 80)
-      .sort((a, b) => a.name.localeCompare(b.name) || a.createdAt.localeCompare(b.createdAt));
-  } catch {
+  const parsed = tryParseJson(rawValue);
+  if (!Array.isArray(parsed)) {
     return [];
   }
+
+  return parsed
+    .map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        return null;
+      }
+
+      const record = entry as Record<string, unknown>;
+      const id = typeof record.id === "string" ? record.id.trim() : "";
+      const name = typeof record.name === "string" ? record.name.trim() : "";
+      const createdAt =
+        typeof record.createdAt === "string" && record.createdAt.trim()
+          ? record.createdAt
+          : new Date().toISOString();
+      const positiveTags = normalizePresetTags(record.positiveTags);
+      const negativeTags = normalizePresetTags(record.negativeTags);
+
+      if (!id || !name || (positiveTags.length === 0 && negativeTags.length === 0)) {
+        return null;
+      }
+
+      return {
+        id,
+        name,
+        createdAt,
+        positiveTags,
+        negativeTags,
+      } satisfies TagFilterPreset;
+    })
+    .filter((entry): entry is TagFilterPreset => Boolean(entry))
+    .slice(0, 80)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.createdAt.localeCompare(b.createdAt));
 }
 
 function parseTrashcanDirectorySetting(rawValue: string | undefined): string | null {

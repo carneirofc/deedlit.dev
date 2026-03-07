@@ -13,12 +13,12 @@ import { getSettings, listRoots } from "@/lib/config-store";
 import {
   countCachedImagesByRootIds,
   getLatestCompletedScanTime,
-  getLatestScanJob,
   listCachedImagesByRootIds,
   queryCachedImagesByRootIds,
   removeCachedImageEntry,
   startAsyncLibraryScan,
 } from "@/lib/image-cache-store";
+import { loadVisibleImagesRouteContext, loadVisibleRootsContext } from "@/lib/http/route-context";
 import type { ScanResult } from "@/lib/library-types";
 
 export const runtime = "nodejs";
@@ -50,12 +50,7 @@ export async function GET(request: Request) {
       search: searchParams.get("search") ?? undefined,
     });
 
-    const [roots, settings, scan] = await Promise.all([
-      listRoots({ visibleOnly: true }),
-      getSettings(),
-      getLatestScanJob(),
-    ]);
-    const rootIds = roots.map((root) => root.id);
+    const { roots, rootIds, settings, scan } = await loadVisibleImagesRouteContext();
     const scannedAtPromise = getLatestCompletedScanTime();
 
     const search = query.search?.trim() ? query.search.trim() : undefined;
@@ -113,7 +108,7 @@ export async function POST(request: Request) {
     const payload = await request.json().catch(() => undefined);
     const body = StartScanBodySchema.parse(payload);
 
-    const roots = await listRoots({ visibleOnly: true });
+    const { roots } = await loadVisibleRootsContext();
     const { job, started } = await startAsyncLibraryScan(roots, { force: body?.force === true });
     return jsonWithSchema(StartScanResponseSchema, { job, started }, { status: started ? 202 : 200 });
   } catch (error) {
