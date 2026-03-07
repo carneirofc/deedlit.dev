@@ -4,8 +4,8 @@ import {
 import Image from "next/image";
 import { ImageRecord } from "@/lib/library-types";
 import { cn } from "@/lib/utils";
-import { HeartIcon, OutlineButton, Checkbox } from "@deedlit.dev/ui";
-import { toGalleryImageSrc, toNextImagePrefetchSrc } from "@/lib/image-utils";
+import { CheckIcon, HeartIcon, OutlineButton, Checkbox } from "@deedlit.dev/ui";
+import { toGalleryImageSrc } from "@/lib/image-utils";
 
 type GalleryImageCardProps = {
   image: ImageRecord;
@@ -49,14 +49,15 @@ export function GalleryImageCard({
         setCardRef(index, node);
       }}
       data-gallery-image-card="true"
+      aria-selected={isSelected}
       tabIndex={-1}
       onFocus={() => onCardFocus(index)}
       onMouseEnter={() => onHoverPrefetch(image)}
       className={cn(
-        `group overflow-hidden rounded-2xl bg-panel/92 shadow-[--ui-shadow-card] [contain-intrinsic-size:360px] [content-visibility:auto],
+        `group overflow-hidden rounded-2xl border border-transparent bg-panel/92 shadow-[--ui-shadow-card] transition-[border-color,box-shadow,transform] duration-150 [contain-intrinsic-size:360px] [content-visibility:auto],
         `,
         isSelected
-          ? " ring-2 ring-(--ui-accent) ring-offset-2 ring-offset-ui-bg"
+          ? "border-(--ui-accent) shadow-[0_0_0_1px_var(--ui-accent),var(--ui-shadow-card)] ring-4 ring-(--ui-accent) ring-offset-2 ring-offset-ui-bg"
           : "",
         isKeyboardActive
           ? " outline-2 outline-(--ui-accent) outline-offset-2"
@@ -64,14 +65,19 @@ export function GalleryImageCard({
       )}
     >
       <div className="relative">
+        {isSelected ? (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 z-10 bg-(--ui-accent)/12 shadow-[inset_0_0_0_2px_var(--ui-accent)]"
+          />
+        ) : null}
         <Checkbox
           title="Select image for bulk actions"
           checked={isSelected}
           className={
             cn(
               `absolute left-2 top-2 z-10
-                flex cursor-pointer
-                px-2 py-1`,
+                flex cursor-pointer rounded-full border border-slate-200/80 bg-white/92 px-2 py-1 shadow-md backdrop-blur-sm transition-opacity`,
               isSelected || isKeyboardActive
                 ? "opacity-100"
                 : "opacity-0 group-hover:opacity-100")}
@@ -81,6 +87,12 @@ export function GalleryImageCard({
             focusAndScrollImageAtIndex(index);
           }}
         />
+        {isSelected ? (
+          <div className="pointer-events-none absolute left-12 top-2 z-20 inline-flex items-center gap-1 rounded-full border border-(--ui-accent)/35 bg-(--ui-bg-card)/96 px-2.5 py-1 text-ui-xs font-semibold text-(--ui-accent) shadow-md backdrop-blur-sm">
+            <CheckIcon className="h-3.5 w-3.5" />
+            <span>Selected</span>
+          </div>
+        ) : null}
         {onToggleFavourite && (
           <button
             type="button"
