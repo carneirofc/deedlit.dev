@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "build:ui": "npm run build --prefix ../deedlit.dev.ui",
-    "dev": "npm run build:ui && next dev -p 3001",
+    "dev": "next dev -p 3001",
     "build": "npm run build:ui && next build",
     "postbuild": "node scripts/copy-next-static.js",
     "start": "cross-env PORT=3001 node .next/standalone/deedlit.dev/server.js",
