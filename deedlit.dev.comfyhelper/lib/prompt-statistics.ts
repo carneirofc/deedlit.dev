@@ -1,60 +1,9 @@
 import type { ImageRecord, PromptStatistics, TagMetric } from "@/lib/library-types";
-import {
-  extractFromComfyPromptGraph,
-  extractPromptTextFromMetadata,
-  findFirstValueByKeys,
-  getSearchableMetadata,
-  parseAutomatic1111Parameters,
-  toDisplayValue,
-  type PromptMetadataInsights,
-} from "@/lib/metadata-parsing";
+import { type PromptInsights, extractPromptInsightsFromMetadata } from "@/lib/metadata-insights";
 import { extractTagsFromPrompt } from "@/lib/prompt-tags";
+import { nowIsoDateTime } from "@/lib/time-utils";
 
-export type PromptInsights = Pick<
-  PromptMetadataInsights,
-  "positivePrompt" | "negativePrompt" | "model" | "sampler"
->;
-
-export function extractPromptInsightsFromMetadata(metadata: unknown): PromptInsights {
-  const searchableMetadata = getSearchableMetadata(metadata);
-
-  const parametersValue = findFirstValueByKeys(searchableMetadata, ["parameters"]);
-  const parametersText = toDisplayValue(parametersValue);
-  const parsedParameters = parametersText ? parseAutomatic1111Parameters(parametersText) : {};
-
-  const comfyPromptValue = findFirstValueByKeys(searchableMetadata, ["prompt"]);
-  const parsedComfy = extractFromComfyPromptGraph(comfyPromptValue);
-
-  const fallbackPositive = extractPromptTextFromMetadata(searchableMetadata, [
-    "positive",
-    "positive_prompt",
-    "prompt",
-    "text",
-    "prompt_text",
-    "text_g",
-    "text_l",
-  ]);
-  const fallbackNegative = extractPromptTextFromMetadata(searchableMetadata, [
-    "negative",
-    "negative_prompt",
-    "negative_text",
-    "uc",
-    "uncond",
-  ]);
-  const fallbackModel = toDisplayValue(
-    findFirstValueByKeys(searchableMetadata, ["model", "model_name", "ckpt_name", "checkpoint"]),
-  );
-  const fallbackSampler = toDisplayValue(
-    findFirstValueByKeys(searchableMetadata, ["sampler", "sampler_name"]),
-  );
-
-  return {
-    positivePrompt: parsedComfy.positivePrompt ?? parsedParameters.positivePrompt ?? fallbackPositive,
-    negativePrompt: parsedComfy.negativePrompt ?? parsedParameters.negativePrompt ?? fallbackNegative,
-    model: parsedComfy.model ?? parsedParameters.model ?? fallbackModel,
-    sampler: parsedComfy.sampler ?? parsedParameters.sampler ?? fallbackSampler,
-  };
-}
+export { extractPromptInsightsFromMetadata };
 
 function normalizeTag(tag: string): string {
   return tag.trim().toLowerCase();
@@ -199,7 +148,7 @@ export function finalizePromptStatistics(accumulator: PromptStatisticsAccumulato
     topNegativeTags: toTopMetrics(accumulator.negativeTagCounts),
     topModels: toTopMetrics(accumulator.modelCounts, 10),
     topSamplers: toTopMetrics(accumulator.samplerCounts, 10),
-    generatedAt: new Date().toISOString(),
+    generatedAt: nowIsoDateTime(),
   };
 }
 

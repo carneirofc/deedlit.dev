@@ -10,9 +10,10 @@ import { tryParseJson, tryParseJsonWithSchema } from "@/lib/json-utils";
 import type { ImageRecord, PromptSummary, RootDirectory, ScanJobInfo, ScanJobStatus } from "@/lib/library-types";
 import { emitGalleryImagesChanged, emitGalleryImagesRemoved } from "@/lib/messaging/gallery";
 import { emitScanEvent } from "@/lib/messaging/scan";
+import { extractPromptInsightsFromMetadata } from "@/lib/metadata-insights";
 import { invalidatePromptStatisticsCache } from "@/lib/prompt-statistics-cache";
-import { extractPromptInsightsFromMetadata } from "@/lib/prompt-statistics";
 import { buildGenerationDetails, extractWorkflowDetails } from "@/lib/metadata-utils";
+import { nowMs, toIsoDateTime, toOptionalIsoDateTime } from "@/lib/time-utils";
 
 const UPSERT_BATCH_SIZE = 80;
 const TOUCH_BATCH_SIZE = 250;
@@ -71,17 +72,6 @@ function getScanCoordinator(): GlobalScanCoordinator {
   return globalThis.__comfyhelperScanCoordinator;
 }
 
-function nowMs(): number {
-  return Date.now();
-}
-
-function toIso(value?: number | null): string | undefined {
-  if (!value || !Number.isFinite(value)) {
-    return undefined;
-  }
-  return new Date(value).toISOString();
-}
-
 function parseWarnings(raw: string): string[] {
   const parsed = tryParseJson(raw);
   if (!Array.isArray(parsed)) {
@@ -100,9 +90,9 @@ function toScanJobInfo(row: ScanJobRow): ScanJobInfo {
     cachedImages: row.cachedImages,
     warnings: parseWarnings(row.warningsJson),
     error: row.error ?? undefined,
-    createdAt: new Date(row.createdAtMs).toISOString(),
-    startedAt: toIso(row.startedAtMs),
-    finishedAt: toIso(row.finishedAtMs),
+    createdAt: toIsoDateTime(row.createdAtMs),
+    startedAt: toOptionalIsoDateTime(row.startedAtMs),
+    finishedAt: toOptionalIsoDateTime(row.finishedAtMs),
   };
 }
 
@@ -373,7 +363,7 @@ async function runLibraryScanJob(
   let newFiles = 0;
   let activeRootPath = roots[0]?.path;
 
-  console.info(`[scan:${jobId}] started roots=${roots.length} at=${new Date(startedAtMs).toISOString()}`);
+  console.info(`[scan:${jobId}] started roots=${roots.length} at=${toIsoDateTime(startedAtMs)}`);
 
   const publishProgress = async (status: ScanJobStatus, error?: string) => {
     await updateJob(jobId, {

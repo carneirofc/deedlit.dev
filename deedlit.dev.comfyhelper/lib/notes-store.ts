@@ -2,29 +2,19 @@ import { randomUUID } from "node:crypto";
 
 import { prisma, ensureDatabase } from "@/lib/db/client";
 import { PromptNoteSchema, PromptNoteSummarySchema } from "@/lib/contracts/notes";
+import { StoreError } from "@/lib/http/errors";
 import type { PromptNote, PromptNoteSummary, EditorJsData } from "@/lib/notes-types";
+import { nowMs, toIsoDateTime } from "@/lib/time-utils";
 
 // ---------------------------------------------------------------------------
 // Error class
 // ---------------------------------------------------------------------------
 
-export class NoteStoreError extends Error {
-  status: number;
-
-  constructor(message: string, status = 400) {
-    super(message);
-    this.status = status;
-    this.name = "NoteStoreError";
-  }
-}
+export class NoteStoreError extends StoreError {}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function nowMs(): number {
-  return Date.now();
-}
 
 const EMPTY_EDITOR_DATA = JSON.stringify({ blocks: [] });
 
@@ -70,13 +60,13 @@ function toPromptNote(row: NoteRow): PromptNote {
     negativePrompt: safeParseJson(row.negativePromptJson),
     notes: safeParseJson(row.notesJson),
     sortOrder: row.sortOrder,
-    createdAt: new Date(row.createdAtMs).toISOString(),
-    updatedAt: new Date(row.updatedAtMs).toISOString(),
+    createdAt: toIsoDateTime(row.createdAtMs),
+    updatedAt: toIsoDateTime(row.updatedAtMs),
     images: row.images.map((img) => ({
       id: img.id,
       imageCacheId: img.imageCacheId,
       sortOrder: img.sortOrder,
-      addedAt: new Date(img.addedAtMs).toISOString(),
+      addedAt: toIsoDateTime(img.addedAtMs),
     })),
   });
 }
@@ -86,8 +76,8 @@ function toPromptNoteSummary(row: NoteSummaryRow): PromptNoteSummary {
     id: row.id,
     title: row.title,
     sortOrder: row.sortOrder,
-    createdAt: new Date(row.createdAtMs).toISOString(),
-    updatedAt: new Date(row.updatedAtMs).toISOString(),
+    createdAt: toIsoDateTime(row.createdAtMs),
+    updatedAt: toIsoDateTime(row.updatedAtMs),
     imageCount: row._count.images,
   });
 }

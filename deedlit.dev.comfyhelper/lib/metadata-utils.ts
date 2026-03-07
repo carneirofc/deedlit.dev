@@ -1,7 +1,6 @@
 import type { ImageRecord } from "./library-types";
+import { resolvePromptMetadata } from "./metadata-insights";
 import {
-  extractFromComfyPromptGraph,
-  extractPromptTextFromMetadata,
   findFirstValueByKeys,
   getSearchableMetadata,
   isRecord,
@@ -86,44 +85,20 @@ function parseNodeSize(value: unknown): { width: number; height: number } {
 export function buildGenerationDetails(image: ImageRecord): GenerationDetails {
   const metadata = image.metadata;
   const promptSummary = image.promptSummary;
-  const searchableMetadata = getSearchableMetadata(metadata);
-
+  const resolvedPromptMetadata = resolvePromptMetadata(metadata);
+  const searchableMetadata = resolvedPromptMetadata.searchableMetadata;
   const parametersValue = findFirstValueByKeys(searchableMetadata, ["parameters"]);
   const parametersText = toDisplayValue(parametersValue);
   const parsedParameters = parametersText
     ? parseAutomatic1111Parameters(parametersText, { includeFirstLineAsPositive: true })
     : {};
-
-  const comfyPromptValue = findFirstValueByKeys(searchableMetadata, ["prompt"]);
-  const parsedComfy = extractFromComfyPromptGraph(comfyPromptValue);
-  const rawPromptText = toDisplayValue(comfyPromptValue);
-
-  const fallbackPositive = extractPromptTextFromMetadata(searchableMetadata, [
-    "positive",
-    "positive_prompt",
-    "prompt",
-    "text",
-    "prompt_text",
-    "text_g",
-    "text_l",
-  ]);
-  const fallbackNegative = extractPromptTextFromMetadata(searchableMetadata, [
-    "negative",
-    "negative_prompt",
-    "negative_text",
-    "uc",
-    "uncond",
-  ]);
-
-  const fallbackModel = toDisplayValue(
-    findFirstValueByKeys(searchableMetadata, ["model", "model_name", "ckpt_name", "checkpoint"]),
-  );
-  const fallbackCfg = toDisplayValue(
-    findFirstValueByKeys(searchableMetadata, ["cfg_scale", "cfg"]),
-  );
-  const fallbackSampler = toDisplayValue(
-    findFirstValueByKeys(searchableMetadata, ["sampler", "sampler_name"]),
-  );
+  const parsedComfy = resolvedPromptMetadata.parsedComfy;
+  const rawPromptText = resolvedPromptMetadata.rawPromptText;
+  const fallbackPositive = resolvedPromptMetadata.fallbackPositive;
+  const fallbackNegative = resolvedPromptMetadata.fallbackNegative;
+  const fallbackModel = resolvedPromptMetadata.fallbackModel;
+  const fallbackSampler = resolvedPromptMetadata.fallbackSampler;
+  const fallbackCfg = toDisplayValue(findFirstValueByKeys(searchableMetadata, ["cfg_scale", "cfg"]));
   const fallbackSummaryPositive = toDisplayValue(promptSummary?.positivePrompt);
   const fallbackSummaryNegative = toDisplayValue(promptSummary?.negativePrompt);
   const fallbackSummaryModel = toDisplayValue(promptSummary?.model);

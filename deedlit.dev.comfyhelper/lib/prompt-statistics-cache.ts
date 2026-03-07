@@ -1,4 +1,5 @@
 import type { PromptStatistics } from "@/lib/library-types";
+import { nowMs } from "@/lib/time-utils";
 
 const DEFAULT_STATS_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -74,7 +75,7 @@ export async function getCachedPromptStatistics(
 
 export function getPromptStatisticsSnapshot(): PromptStatisticsCacheSnapshot {
   const store = getStore();
-  const now = Date.now();
+  const now = nowMs();
   const hasValue = Boolean(store.value);
   const isFresh = hasValue && now < store.expiresAtMs;
 
@@ -111,7 +112,7 @@ export function triggerPromptStatisticsRefresh(
     // Ignore stale completions if cache was invalidated while loading.
     if (store.epoch === epochAtStart) {
       store.value = stats;
-      store.expiresAtMs = Date.now() + ttlMs;
+      store.expiresAtMs = nowMs() + ttlMs;
     }
 
     return stats;

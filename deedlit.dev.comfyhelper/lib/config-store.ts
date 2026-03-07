@@ -4,10 +4,12 @@ import path from "node:path";
 
 import type { AppSettings, RootDirectory, TagFilterPreset } from "@/lib/library-types";
 import { prisma, ensureDatabase } from "@/lib/db/client";
+import { StoreError } from "@/lib/http/errors";
 import { removeCachedImagesForRoot } from "@/lib/image-cache-store";
 import { tryParseJson } from "@/lib/json-utils";
 import { normalizeExcludedTags } from "@/lib/prompt-tags";
 import { AppSettingsSchema, RootDirectorySchema } from "@/lib/schemas";
+import { nowIsoDateTime, nowMs, toIsoDateTime } from "@/lib/time-utils";
 
 const DEFAULT_GALLERY_COLUMNS = 7;
 const DEFAULT_GALLERY_IMAGE_LIMIT = 10000;
@@ -18,15 +20,7 @@ const EXCLUDED_TAGS_SETTING_KEY = "excluded_tags";
 const TAG_FILTER_PRESETS_SETTING_KEY = "tag_filter_presets";
 const TRASHCAN_DIRECTORY_SETTING_KEY = "trashcan_directory";
 
-export class ConfigStoreError extends Error {
-  status: number;
-
-  constructor(message: string, status = 400) {
-    super(message);
-    this.status = status;
-    this.name = "ConfigStoreError";
-  }
-}
+export class ConfigStoreError extends StoreError {}
 
 function sanitizeInputPath(rawPath: string): string {
   return rawPath.trim().replace(/^["']|["']$/g, "");
@@ -35,10 +29,6 @@ function sanitizeInputPath(rawPath: string): string {
 function normalizeForComparison(rawPath: string): string {
   const resolved = path.resolve(rawPath);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function nowMs(): number {
-  return Date.now();
 }
 
 function toRootDirectory(row: {
@@ -50,7 +40,7 @@ function toRootDirectory(row: {
   return RootDirectorySchema.parse({
     id: row.id,
     path: row.path,
-    createdAt: new Date(row.createdAtMs).toISOString(),
+    createdAt: toIsoDateTime(row.createdAtMs),
     isVisible: Boolean(row.isVisible),
   });
 }
@@ -118,7 +108,7 @@ function parseTagFilterPresetsSetting(rawValue: string | undefined): TagFilterPr
       const createdAt =
         typeof record.createdAt === "string" && record.createdAt.trim()
           ? record.createdAt
-          : new Date().toISOString();
+          : nowIsoDateTime();
       const positiveTags = normalizePresetTags(record.positiveTags);
       const negativeTags = normalizePresetTags(record.negativeTags);
 
