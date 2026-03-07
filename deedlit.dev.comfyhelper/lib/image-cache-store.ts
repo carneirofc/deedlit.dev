@@ -53,8 +53,12 @@ type ExistingImageSnapshot = {
   absolutePath: string;
   size: number;
   modifiedAtMs: number;
-  metadataJson: string | null;
   promptSummaryJson: string | null;
+};
+
+type MissingPromptSummarySnapshot = {
+  id: string;
+  metadataJson: string | null;
 };
 
 type GlobalScanCoordinator = {
@@ -64,6 +68,25 @@ type GlobalScanCoordinator = {
 declare global {
   var __comfyhelperScanCoordinator: GlobalScanCoordinator | undefined;
 }
+
+const imageListSelect = {
+  id: true,
+  rootId: true,
+  rootPath: true,
+  absolutePath: true,
+  relativePath: true,
+  fileName: true,
+  size: true,
+  modifiedAt: true,
+  metadataPath: true,
+  metadataError: true,
+  promptSummaryJson: true,
+} satisfies Prisma.ImageCacheSelect;
+
+const imageDetailSelect = {
+  ...imageListSelect,
+  metadataJson: true,
+} satisfies Prisma.ImageCacheSelect;
 
 function getScanCoordinator(): GlobalScanCoordinator {
   if (!globalThis.__comfyhelperScanCoordinator) {
@@ -455,12 +478,23 @@ async function runLibraryScanJob(
           absolutePath: true,
           size: true,
           modifiedAtMs: true,
-          metadataJson: true,
           promptSummaryJson: true,
         },
       });
       const existingById = new Map<string, ExistingImageSnapshot>(
         existingRows.map((row) => [row.id, row as ExistingImageSnapshot]),
+      );
+      const missingPromptSummaryIds = existingRows
+        .filter((row) => !row.promptSummaryJson)
+        .map((row) => row.id);
+      const missingPromptSummaryRows = missingPromptSummaryIds.length
+        ? await prisma.imageCache.findMany({
+            where: { id: { in: missingPromptSummaryIds } },
+            select: { id: true, metadataJson: true },
+          })
+        : [];
+      const missingPromptSummaryById = new Map<string, MissingPromptSummarySnapshot>(
+        missingPromptSummaryRows.map((row) => [row.id, row as MissingPromptSummarySnapshot]),
       );
 
       console.info(
@@ -498,9 +532,12 @@ async function runLibraryScanJob(
 
           if (isUnchanged) {
             if (!existing.promptSummaryJson) {
+              const missingPromptSummary = missingPromptSummaryById.get(id);
               promptSummaryBackfillRows.push({
                 id,
-                promptSummaryJson: toPromptSummaryJson(parseMetadata(existing.metadataJson)),
+                promptSummaryJson: toPromptSummaryJson(
+                  parseMetadata(missingPromptSummary?.metadataJson ?? null),
+                ),
               });
             } else {
               touchedIds.push(id);
@@ -848,24 +885,9 @@ export async function listCachedImagesByRootIds(rootIds: string[], limit?: numbe
     return [];
   }
 
-  const selectFields = {
-    id: true,
-    rootId: true,
-    rootPath: true,
-    absolutePath: true,
-    relativePath: true,
-    fileName: true,
-    size: true,
-    modifiedAt: true,
-    metadataPath: true,
-    metadataJson: true,
-    metadataError: true,
-    promptSummaryJson: true,
-  } satisfies Prisma.ImageCacheSelect;
-
   const rows = await prisma.imageCache.findMany({
     where: { rootId: { in: rootIds } },
-    select: selectFields,
+    select: imageListSelect,
     orderBy: { modifiedAtMs: "desc" },
     ...(typeof limit === "number" && limit > 0 ? { take: limit } : {}),
   });
@@ -876,7 +898,10 @@ export async function listCachedImagesByRootIds(rootIds: string[], limit?: numbe
 export async function getCachedImageById(imageId: string): Promise<ImageRecord | null> {
   await ensureDatabase();
 
-  const row = await prisma.imageCache.findUnique({ where: { id: imageId } });
+  const row = await prisma.imageCache.findUnique({
+    where: { id: imageId },
+    select: imageDetailSelect,
+  });
   if (!row) {
     return null;
   }
@@ -1210,25 +1235,10 @@ export async function queryCachedImagesByRootIds(
   const safePage = Math.max(1, options.page);
   const safePageSize = Math.max(1, Math.min(200, options.pageSize));
   const offset = (safePage - 1) * safePageSize;
-  const selectFields = {
-    id: true,
-    rootId: true,
-    rootPath: true,
-    absolutePath: true,
-    relativePath: true,
-    fileName: true,
-    size: true,
-    modifiedAt: true,
-    metadataPath: true,
-    metadataJson: true,
-    metadataError: true,
-    promptSummaryJson: true,
-  } satisfies Prisma.ImageCacheSelect;
-
   const [rows, total] = await Promise.all([
     prisma.imageCache.findMany({
       where: whereClause,
-      select: selectFields,
+      select: imageListSelect,
       orderBy: { modifiedAtMs: "desc" },
       take: safePageSize,
       skip: offset,
