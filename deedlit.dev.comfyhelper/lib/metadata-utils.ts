@@ -1,4 +1,14 @@
 import type { ImageRecord } from "./library-types";
+import {
+  extractFromComfyPromptGraph,
+  extractPromptTextFromMetadata,
+  findFirstValueByKeys,
+  getSearchableMetadata,
+  isRecord,
+  maybeParseJsonString,
+  parseAutomatic1111Parameters,
+  toDisplayValue,
+} from "./metadata-parsing";
 import type {
   GenerationDetails,
   WorkflowDetails,
@@ -7,52 +17,6 @@ import type {
   WorkflowNodeEntry,
   WorkflowNodePalette,
 } from "./gallery-types";
-
-// Cache for metadata searches to avoid repeated recursive lookups
-const metadataSearchCache = new WeakMap<object, Map<string, unknown>>();
-
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function normalizeKey(key: string): string {
-  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function maybeParseJsonString(value: unknown): unknown {
-  if (typeof value !== "string") {
-    return value;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed || !(trimmed.startsWith("{") || trimmed.startsWith("["))) {
-    return value;
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return value;
-  }
-}
-
-function toDisplayValue(value: unknown): string | undefined {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed ? trimmed : undefined;
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  return undefined;
-}
 
 function toInlineValue(value: unknown): string | undefined {
   if (value === undefined || value === null) {
@@ -64,84 +28,6 @@ function toInlineValue(value: unknown): string | undefined {
     return trimmed || undefined;
   }
 
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return undefined;
-  }
-}
-
-function findFirstValueByKeys(root: unknown, keys: string[]): unknown {
-  // Check cache first to avoid repeated recursive searches
-  if (isRecord(root) && metadataSearchCache.has(root)) {
-    const cache = metadataSearchCache.get(root)!;
-    const cacheKey = keys.join("|");
-    if (cache.has(cacheKey)) {
-      return cache.get(cacheKey);
-    }
-  }
-
-  const keySet = new Set(keys.map((key) => normalizeKey(key)));
-  const seen = new WeakSet<object>();
-
-  function visit(value: unknown): unknown {
-    const parsed = maybeParseJsonString(value);
-
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        const found = visit(item);
-        if (found !== undefined) {
-          return found;
-        }
-      }
-      return undefined;
-    }
-
-    if (!isRecord(parsed)) {
-      return undefined;
-    }
-
-    if (seen.has(parsed)) {
-      return undefined;
-    }
-    seen.add(parsed);
-
-    for (const [key, nestedValue] of Object.entries(parsed)) {
-      if (keySet.has(normalizeKey(key))) {
-        return nestedValue;
-      }
-    }
-
-    for (const nestedValue of Object.values(parsed)) {
-      const found = visit(nestedValue);
-      if (found !== undefined) {
-        return found;
-      }
-    }
-
-    return undefined;
-  }
-
-  const result = visit(root);
-
-  // Cache the result for future lookups
-  if (isRecord(root)) {
-    if (!metadataSearchCache.has(root)) {
-      metadataSearchCache.set(root, new Map());
-    }
-    metadataSearchCache.get(root)!.set(keys.join("|"), result);
-  }
-
-  return result;
-}
-
-function extractPromptTextFromMetadata(metadata: unknown, keys: string[]): string | undefined {
-  const value = findFirstValueByKeys(metadata, keys);
-  const text = toDisplayValue(value);
   if (text) {
     return text;
   }
@@ -222,186 +108,16 @@ function resolveNodeReference(value: unknown): string | null {
   return null;
 }
 
-function extractTextFromPromptNode(
-  nodeId: string | null,
-  nodes: Record<string, { class_type?: string; inputs?: Record<string, unknown> }>,
-): string | undefined {
-  if (!nodeId) {
-    return undefined;
-  }
-
-  const node = nodes[nodeId];
-  if (!node?.inputs) {
-    return undefined;
-  }
-
-  const textParts = [
-    toDisplayValue(node.inputs.text),
-    toDisplayValue(node.inputs.text_g),
-    toDisplayValue(node.inputs.text_l),
-  ].filter((value): value is string => Boolean(value));
-
-  if (textParts.length === 0) {
-    return undefined;
-  }
-
-  return textParts.join("\n");
-}
-
-function extractFromComfyPromptGraph(promptValue: unknown): Partial<GenerationDetails> {
-  const parsedPrompt = maybeParseJsonString(promptValue);
-  if (!isRecord(parsedPrompt)) {
-    return {};
-  }
-
-  const nodes: Record<string, { class_type?: string; inputs?: Record<string, unknown> }> = {};
-
-  // Parse nodes once
-  for (const [nodeId, nodeValue] of Object.entries(parsedPrompt)) {
-    if (!isRecord(nodeValue)) {
-      continue;
-    }
-
-    const classType = toDisplayValue(nodeValue.class_type);
-    const inputs = isRecord(nodeValue.inputs) ? nodeValue.inputs : undefined;
-    if (!classType || !inputs) {
-      continue;
-    }
-
-    nodes[nodeId] = {
-      class_type: classType,
-      inputs,
-    };
-  }
-
-  // Single pass: find both kSampler and loader with early exit optimization
-  let kSamplerEntry: [string, { class_type?: string; inputs?: Record<string, unknown> }] | undefined;
-  let loaderNode: { class_type?: string; inputs?: Record<string, unknown> } | undefined;
-
-  for (const [nodeId, node] of Object.entries(nodes)) {
-    const classType = (node.class_type ?? "").toLowerCase();
-
-    if (!kSamplerEntry && classType.includes("ksampler")) {
-      kSamplerEntry = [nodeId, node];
-    }
-
-    if (!loaderNode && (classType.includes("checkpointloader") || classType.includes("unetloader"))) {
-      loaderNode = node;
-    }
-
-    // Early exit if we found both
-    if (kSamplerEntry && loaderNode) {
-      break;
-    }
-  }
-
-  if (!kSamplerEntry) {
-    return {};
-  }
-
-  const [, kSamplerNode] = kSamplerEntry;
-  const inputs = kSamplerNode.inputs ?? {};
-
-  const positiveRef = resolveNodeReference(inputs.positive);
-  const negativeRef = resolveNodeReference(inputs.negative);
-  const modelRef = resolveNodeReference(inputs.model);
-
-  let modelName = undefined as string | undefined;
-  if (modelRef && nodes[modelRef]?.inputs) {
-    const modelInputs = nodes[modelRef].inputs ?? {};
-    modelName =
-      toDisplayValue(modelInputs.ckpt_name) ??
-      toDisplayValue(modelInputs.model_name) ??
-      toDisplayValue(modelInputs.unet_name);
-  }
-
-  // Only search for loader if we don't have model name and haven't found loader yet
-  if (!modelName && !loaderNode) {
-    loaderNode = Object.values(nodes).find((node) => {
-      const classType = (node.class_type ?? "").toLowerCase();
-      return classType.includes("checkpointloader") || classType.includes("unetloader");
-    });
-  }
-
-  if (!modelName && loaderNode?.inputs) {
-    modelName =
-      toDisplayValue(loaderNode.inputs.ckpt_name) ??
-      toDisplayValue(loaderNode.inputs.model_name) ??
-      toDisplayValue(loaderNode.inputs.unet_name);
-  }
-
-  return {
-    positivePrompt: extractTextFromPromptNode(positiveRef, nodes),
-    negativePrompt: extractTextFromPromptNode(negativeRef, nodes),
-    cfgScale: toDisplayValue(inputs.cfg),
-    steps: toDisplayValue(inputs.steps),
-    seed: toDisplayValue(inputs.seed),
-    sampler: toDisplayValue(inputs.sampler_name),
-    scheduler: toDisplayValue(inputs.scheduler),
-    model: modelName,
-  };
-}
-
-function parseAutomatic1111Parameters(parameters: string): Partial<GenerationDetails> {
-  const result: Partial<GenerationDetails> = {};
-  const text = parameters.trim();
-
-  if (!text) {
-    return result;
-  }
-
-  const negativeLabel = "Negative prompt:";
-  const negativeIndex = text.indexOf(negativeLabel);
-  if (negativeIndex >= 0) {
-    const positivePart = text.slice(0, negativeIndex).trim();
-    if (positivePart) {
-      result.positivePrompt = positivePart;
-    }
-
-    const afterNegative = text.slice(negativeIndex + negativeLabel.length);
-    const settingsStart = afterNegative.search(/\n(?:Steps|Sampler|CFG scale|Seed|Size|Model):/i);
-    if (settingsStart >= 0) {
-      const negativePart = afterNegative.slice(0, settingsStart).trim();
-      if (negativePart) {
-        result.negativePrompt = negativePart;
-      }
-    } else {
-      const negativePart = afterNegative.trim();
-      if (negativePart) {
-        result.negativePrompt = negativePart;
-      }
-    }
-  } else {
-    const firstLine = text.split("\n")[0]?.trim();
-    if (firstLine) {
-      result.positivePrompt = firstLine;
-    }
-  }
-
-  const capture = (pattern: RegExp): string | undefined => {
-    const match = text.match(pattern);
-    return match?.[1]?.trim();
-  };
-
-  result.steps = capture(/Steps:\s*([^,\n]+)/i);
-  result.sampler = capture(/Sampler:\s*([^,\n]+)/i);
-  result.cfgScale = capture(/CFG scale:\s*([^,\n]+)/i);
-  result.seed = capture(/Seed:\s*([^,\n]+)/i);
-  result.size = capture(/Size:\s*([^,\n]+)/i);
-  result.model = capture(/Model:\s*([^,\n]+)/i);
-
-  return result;
-}
-
 export function buildGenerationDetails(image: ImageRecord): GenerationDetails {
   const metadata = image.metadata;
   const promptSummary = image.promptSummary;
-  const searchableMetadata =
-    isRecord(metadata) && isRecord(metadata.fields) ? metadata.fields : metadata;
+  const searchableMetadata = getSearchableMetadata(metadata);
 
   const parametersValue = findFirstValueByKeys(searchableMetadata, ["parameters"]);
   const parametersText = toDisplayValue(parametersValue);
-  const parsedParameters = parametersText ? parseAutomatic1111Parameters(parametersText) : {};
+  const parsedParameters = parametersText
+    ? parseAutomatic1111Parameters(parametersText, { includeFirstLineAsPositive: true })
+    : {};
 
   const comfyPromptValue = findFirstValueByKeys(searchableMetadata, ["prompt"]);
   const parsedComfy = extractFromComfyPromptGraph(comfyPromptValue);
@@ -495,8 +211,7 @@ export function buildGenerationDetails(image: ImageRecord): GenerationDetails {
 }
 
 export function extractWorkflowDetails(metadata: unknown): WorkflowDetails | null {
-  const searchableMetadata =
-    isRecord(metadata) && isRecord(metadata.fields) ? metadata.fields : metadata;
+  const searchableMetadata = getSearchableMetadata(metadata);
   const workflowValue = findFirstValueByKeys(searchableMetadata, ["workflow"]);
   const workflow = maybeParseJsonString(workflowValue);
 
