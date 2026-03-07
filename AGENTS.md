@@ -6,21 +6,21 @@
 - Read the nearest package-local `.github/copilot-instructions.md` before editing code.
 
 ## Package Ownership
-- `deedlitdev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
-- `deedlitdev.comfyhelper/`: ComfyUI image management, metadata parsing, Prisma/SQLite persistence, scans, SSE, admin tools, notes, and stats.
-- `deedlitdev.ui/`: shared UI components, icons, tokens, CSS variables, and app-agnostic presentation primitives.
+- `deedlit.dev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
+- `deedlit.dev.comfyhelper/`: ComfyUI image management, metadata parsing, Prisma/SQLite persistence, scans, SSE, admin tools, notes, and stats.
+- `deedlit.dev.ui/`: shared UI components, icons, tokens, CSS variables, and app-agnostic presentation primitives.
 
 ## Working Rules
 - Make the smallest package-local change that solves the task.
-- Do not duplicate shared UI between apps; promote reusable pieces into `deedlitdev.ui`.
-- Do not move app-specific domain behavior into `deedlitdev.ui`.
+- Do not duplicate shared UI between apps; promote reusable pieces into `deedlit.dev.ui`.
+- Do not move app-specific domain behavior into `deedlit.dev.ui`.
 - Treat package-level docs and source layout as more trustworthy than old summary docs when they disagree.
-- When a task spans packages, keep ownership clear: shared primitive in `deedlitdev.ui`, integration in the consuming app.
+- When a task spans packages, keep ownership clear: shared primitive in `deedlit.dev.ui`, integration in the consuming app.
 
 ## Package Entry Points
-- `deedlitdev/`: start from `src/app/`, `src/features/`, and `scripts/`.
-- `deedlitdev.comfyhelper/`: start from `app/`, `lib/`, `prisma/`, and `.github/instructions/`.
-- `deedlitdev.ui/`: start from `src/`, `styles/`, and the package exports in `package.json`.
+- `deedlit.dev/`: start from `src/app/`, `src/features/`, and `scripts/`.
+- `deedlit.dev.comfyhelper/`: start from `app/`, `lib/`, `prisma/`, and `.github/instructions/`.
+- `deedlit.dev.ui/`: start from `src/`, `styles/`, and the package exports in `package.json`.
 
 ## Command Reference
 - Build shared UI: `npm run build:ui`

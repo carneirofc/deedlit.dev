@@ -1,8 +1,7 @@
-.playwright-mcp/console-2026-02-19T02-53-55-444Z.log
-.playwright-mcp/console-2026-02-19T02-54-05-301Z.log
-.playwright-mcp/console-2026-02-19T02-57-05-342Z.log
-.playwright-mcp/console-2026-02-19T02-57-57-558Z.log
-.playwright-mcp/console-2026-02-19T02-58-30-583Z.log
+node_modules/
+.vscode/
+dist/
+.playwright-mcp/
 .playwright-mcp/console-2026-02-19T03-02-07-776Z.log
 .playwright-mcp/console-2026-02-19T03-23-00-713Z.log
 .playwright-mcp/console-2026-02-19T03-25-35-519Z.log

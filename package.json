@@ -1,18 +1,19 @@
 {
-  "name": "deedlit-workspace",
+  "name": "deedlit.dev-workspace",
   "version": "1.0.0",
   "private": true,
   "workspaces": [
-    "deedlitdev.ui",
-    "deedlitdev",
-    "deedlitdev.comfyhelper"
+    "deedlit.dev.ui",
+    "deedlit.dev",
+    "deedlit.dev.comfyhelper"
   ],
   "scripts": {
-    "build:ui": "npm run build -w @deedlit/ui",
-    "build:dev": "npm run build:ui && npm run build -w deedlit-dev",
-    "build:comfyhelper": "npm run build:ui && npm run build -w my-app",
-    "build": "npm run build:ui && npm run build -w deedlit-dev && npm run build -w my-app",
-    "dev:dev": "npm run build:ui && npm run dev -w deedlit-dev",
-    "dev:comfyhelper": "npm run build:ui && npm run dev -w my-app"
+    "build:ui": "npm run build -w @deedlit.dev/ui",
+    "build:dev": "npm run build:ui && npm run build -w deedlit.dev",
+    "build:comfyhelper": "npm run build:ui && npm run build -w deedlit.dev.comfyhelper",
+    "build": "npm run build:ui && npm run build -w deedlit.dev && npm run build -w deedlit.dev.comfyhelper",
+    "dev:dev": "npm run build:ui && npm run dev -w deedlit.dev",
+    "dev:comfyhelper": "npm run build:ui && npm run dev -w deedlit.dev.comfyhelper"
   }
 }
+

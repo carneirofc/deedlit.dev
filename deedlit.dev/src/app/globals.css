@@ -1,0 +1,187 @@
+@import "tailwindcss";
+/* Tailwind v4 source registration (replaces classic content globs). */
+@source "./**/*.{ts,tsx,js,jsx,mdx}";
+@source "../components/**/*.{ts,tsx,js,jsx,mdx}";
+@source "../features/**/*.{ts,tsx,js,jsx,mdx}";
+@source "../lib/**/*.{ts,tsx,js,jsx}";
+@source "@deedlit.dev/ui";
+@source "../../../deedlit.dev.ui/src/**/*.{ts,tsx,js,jsx}";
+/* Shared visual system. Keep app-level globals thin for reuse. */
+@import "@deedlit.dev/ui/styles.css";
+
+/* Legacy app token aliases used by existing feature components. */
+:root {
+  --base: 247 247 250;
+  --surface: 255 255 255;
+  --line: 210 214 229;
+  --text: 21 24 37;
+  --muted: 93 100 124;
+  --accent: 124 99 255;
+  --accent-soft: 223 216 255;
+}
+
+html[data-theme="dark"],
+.dark {
+  --base: 10 12 19;
+  --surface: 16 19 31;
+  --line: 57 63 94;
+  --text: 232 236 255;
+  --muted: 160 168 206;
+  --accent: 176 154 255;
+  --accent-soft: 54 44 90;
+}
+
+@theme inline {
+  --color-base: rgb(var(--base));
+  --color-surface: rgb(var(--surface));
+  --color-line: rgb(var(--line));
+  --color-text: rgb(var(--text));
+  --color-muted: rgb(var(--muted));
+  --color-accent: rgb(var(--accent));
+  --color-accent-soft: rgb(var(--accent-soft));
+  --shadow-soft: 0 10px 30px rgba(6, 8, 18, 0.24);
+  --radius-xl2: 1.25rem;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 6rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+.section-anchor {
+  scroll-margin-top: 6.5rem;
+}
+
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px rgb(var(--base)),
+    0 0 0 4px rgb(var(--accent));
+}
+
+.chip {
+  border: 1px solid rgb(var(--line) / 0.8);
+  border-radius: 9999px;
+  background: rgb(var(--surface) / 0.8);
+  color: rgb(var(--muted));
+  padding: 0.25rem 0.75rem;
+  font-size: 0.75rem;
+  backdrop-filter: blur(8px);
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background-color 0.2s ease;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-from-top {
+  from {
+    transform: translateY(-0.5rem);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slide-in-from-right {
+  from {
+    transform: translateX(0.5rem);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation-duration: 300ms;
+  animation-fill-mode: both;
+}
+
+.fade-in {
+  animation-name: fade-in;
+}
+
+.slide-in-from-top-2 {
+  animation-name: slide-in-from-top;
+}
+
+.slide-in-from-right-2 {
+  animation-name: slide-in-from-right;
+}
+
+.duration-300 {
+  animation-duration: 300ms;
+}
+
+select {
+  background-image: none;
+}
+
+select option {
+  background-color: rgb(var(--surface));
+  color: rgb(var(--text));
+  padding: 0.5rem;
+}
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: none;
+  background: rgb(var(--accent));
+  cursor: pointer;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 1rem;
+  height: 1rem;
+  border: none;
+  border-radius: 50%;
+  background: rgb(var(--accent));
+  cursor: pointer;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+input[type="range"]::-moz-range-thumb:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+

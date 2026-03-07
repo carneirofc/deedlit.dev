@@ -1,0 +1,167 @@
+# Project Context for AI Assistants
+
+## Tech Stack
+- Next.js 15.1.6 (App Router) on port 3001
+- React 19 with TypeScript 5.7.3 (strict mode)
+- Playwright 1.58.2 for E2E testing
+- Tailwind CSS for styling
+- Path alias: @/* → src/*
+
+## Project Overview
+A Next.js portfolio/showcase site with:
+- Book collection with Goodreads metadata scraping
+- Image gallery with filtering
+- Local services directory
+- PWA capabilities (service worker + manifest)
+
+## Architecture Principles
+- **Server Components by default** - Only add "use client" when needed for interactivity
+- **Feature-based organization** - Each feature in `src/features/` with components, hooks, lib, data
+- **Type safety** - Strict TypeScript, explicit types, no `any`
+- **Testing-first** - Write/update tests before implementation
+- **File collocation** - Keep related files together in feature folders
+
+## Key Conventions
+
+### Component Patterns
+- Server Components for static content and data fetching
+- Client Components ("use client") only for:
+  - Interactive state (useState, useReducer)
+  - Browser APIs (localStorage, window)
+  - Event handlers
+  - Custom hooks that use client-side features
+
+### File Structure
+```
+src/features/[feature]/
+  ├── components/     # UI components
+  ├── hooks/         # Custom React hooks
+  ├── lib/           # Business logic & utilities
+  ├── data/          # Static data & config
+  ├── types.ts       # TypeScript definitions
+  └── README.md      # Feature documentation
+```
+
+### Import Patterns
+- Use `@/` alias for absolute imports from src/
+- Group imports: React/Next → external → internal → types
+- Use named exports (avoid default exports except for pages)
+
+### Naming Conventions
+- Components: PascalCase (e.g., `BookFilters.tsx`)
+- Hooks: camelCase with "use" prefix (e.g., `useBookFilters.ts`)
+- Utils/Lib: camelCase (e.g., `filtering.ts`)
+- Types: PascalCase (e.g., `type Book = {...}`)
+- Constants: UPPER_SNAKE_CASE
+
+## Before Making Changes
+
+1. **Read relevant docs:**
+   - `docs/AGENTS.md` - Setup and testing guide
+   - `docs/ARCHITECTURE.md` - System design
+   - Feature-specific `README.md` files
+   
+2. **Check existing tests:**
+   - Run `npm run test:e2e` to verify baseline
+   - Review test files in `e2e/` for affected features
+   
+3. **Understand dependencies:**
+   - Check imports and exports
+   - Review type definitions
+   - Verify Server vs Client Component requirements
+
+## Common Commands
+
+```powershell
+# Development
+npm run dev                    # Start dev server on port 3001
+npm run build                  # Production build
+npm run start                  # Start production server
+
+# Testing
+npm run test:e2e              # Run all Playwright tests
+npx playwright test --headed  # Run tests with browser visible
+npx playwright test --debug   # Debug mode with step-through
+npx playwright test e2e/books.spec.ts  # Run specific test file
+
+# Book Scraping
+npm run scrape-goodreads      # Scrape Goodreads metadata
+```
+
+## Testing Philosophy
+- Write tests before implementation (TDD)
+- Test user interactions, not implementation details
+- Use descriptive test names: "should display book cards with cover images"
+- Ensure tests pass before committing changes
+- Check `e2e/*.spec.ts` for existing test patterns
+
+## Code Quality Standards
+- No console.log in production code (use logger from `@/lib/logger`)
+- Handle errors gracefully with user-friendly messages
+- Add JSDoc comments for public APIs and complex logic
+- Use TypeScript discriminated unions for variants
+- Prefer composition over inheritance
+- Keep components small and focused (< 200 lines)
+
+## Common Patterns
+
+### Data Fetching
+```typescript
+// Server Component - fetch directly
+export default async function Page() {
+  const data = await fetchData();
+  return <Component data={data} />;
+}
+```
+
+### Client Interactivity
+```typescript
+"use client";
+import { useState } from "react";
+
+export function InteractiveComponent() {
+  const [state, setState] = useState(initial);
+  // ... interactive logic
+}
+```
+
+### Feature Hooks
+```typescript
+// Custom hook for reusable logic
+export function useFeatureLogic() {
+  const [state, setState] = useState();
+  // Return state and actions
+  return { state, actions };
+}
+```
+
+## Known Issues & Gotchas
+- Dev server runs on port 3001 (not default 3000)
+- Playwright browsers must be installed: `npx playwright install`
+- Service worker at `/public/sw.js` for PWA functionality
+- Scraper requires networkidle state for reliable data extraction
+- Image optimization uses Next.js Image component with custom loader
+
+## Documentation Files
+- `docs/AGENTS.md` - Comprehensive setup and testing guide for AI agents
+- `docs/ARCHITECTURE.md` - System architecture and design patterns
+- `docs/TESTING.md` - Quick testing reference
+- `docs/LOGGING.md` - Logging system documentation
+- `docs/GLOSSARY.md` - Project terminology
+- Feature `README.md` files - Feature-specific documentation
+
+## When Adding New Features
+1. Create feature directory in `src/features/`
+2. Add README.md explaining the feature
+3. Write E2E tests in `e2e/`
+4. Implement components and logic
+5. Update this file if new patterns emerge
+6. Document in ARCHITECTURE.md if significant
+
+## Success Criteria
+- ✅ All tests pass
+- ✅ TypeScript compiles without errors
+- ✅ No console errors in browser
+- ✅ Responsive design works on mobile/tablet/desktop
+- ✅ Accessible (keyboard navigation, screen readers)
+- ✅ Code follows established patterns

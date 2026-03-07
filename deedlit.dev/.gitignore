@@ -1,0 +1,11 @@
+.next
+node_modules
+out
+dist
+.DS_Store
+*.log
+test-results/
+.ui-local
+playwright-report
+.playwright-mcp
+playwright-report/index.html

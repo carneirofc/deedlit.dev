@@ -1,0 +1,72 @@
+output/playwright/dock-1366-before.png
+output/playwright/filter-dock-after-1366x900.png
+output/playwright/filters-before.png
+output/playwright/gallery-active-filters-after.png
+output/playwright/gallery-active-strip-after.png
+output/playwright/gallery-baseline-dock-open.png
+output/playwright/gallery-baseline-dock-open.snapshot.md
+output/playwright/gallery-dock-1366x900.png
+output/playwright/gallery-dock-1440.png
+output/playwright/gallery-dock-baseline-narrow.png
+output/playwright/gallery-dock-baseline.png
+output/playwright/gallery-dock-before.png
+output/playwright/gallery-dock-desktop-before.png
+output/playwright/gallery-dock-initial-1280x720.png
+output/playwright/gallery-dock-open-after-narrow-final.png
+output/playwright/gallery-dock-open-after-narrow.png
+output/playwright/gallery-dock-open-baseline-narrow.png
+output/playwright/gallery-dock-wide.png
+output/playwright/gallery-ultrawide-2560x1080.png
+
+.playwright-mcp/*.log
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/playwright-report
+/test-results
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+data/*.db
+data/*.db-*
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/lib/generated/prisma
+packages/ui/dist/
+screenshots/*
+tmpclaude-*-cwd
+test-output.log

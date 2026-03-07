@@ -1,0 +1,199 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { GalleryCard } from "@/features/gallery/components/GalleryCard";
+import { GalleryFilters } from "@/features/gallery/components/GalleryFilters";
+import { ImageModal } from "@/features/gallery/components/ImageModal";
+import { useGalleryFilters } from "@/features/gallery/hooks/useGalleryFilters";
+import { isTextInputTarget } from "@/features/gallery/lib/filtering";
+import type { GalleryStats, ImageAsset } from "@/features/gallery/types";
+
+interface GallerySectionProps {
+  assets: ImageAsset[];
+  tags?: string[];
+  stats?: GalleryStats;
+}
+
+interface GalleryApiResponse {
+  assets: ImageAsset[];
+}
+
+function hasAssetListChanged(current: ImageAsset[], next: ImageAsset[]) {
+  if (current.length !== next.length) return true;
+  for (let index = 0; index < current.length; index += 1) {
+    if (
+      current[index]?.id !== next[index]?.id ||
+      current[index]?.createdAt !== next[index]?.createdAt
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function GallerySection({ assets }: GallerySectionProps) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [liveAssets, setLiveAssets] = useState<ImageAsset[]>(assets);
+  const [modalIndex, setModalIndex] = useState<number | null>(null);
+  const { filters, filteredAssets, setQuery, setSort } = useGalleryFilters(liveAssets);
+
+  useEffect(() => {
+    setLiveAssets(assets);
+  }, [assets]);
+
+  const refreshAssets = useCallback(async () => {
+    try {
+      const response = await fetch("/api/gallery", { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = (await response.json()) as GalleryApiResponse;
+      if (!payload.assets) return;
+      setLiveAssets((current) => (hasAssetListChanged(current, payload.assets) ? payload.assets : current));
+    } catch {
+      // Ignore transient errors and keep current list.
+    }
+  }, []);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void refreshAssets();
+    }, 12000);
+
+    const onFocus = () => {
+      void refreshAssets();
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void refreshAssets();
+      }
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshAssets]);
+
+  useEffect(() => {
+    const syncFromUrl = () => {
+      const params = new URLSearchParams(window.location.search);
+      const imageId = params.get("image");
+      if (!imageId) {
+        setModalIndex(null);
+        return;
+      }
+      const index = filteredAssets.findIndex((asset) => asset.id === imageId);
+      if (index >= 0) {
+        setModalIndex(index);
+      }
+    };
+
+    syncFromUrl();
+    window.addEventListener("popstate", syncFromUrl);
+    return () => window.removeEventListener("popstate", syncFromUrl);
+  }, [filteredAssets]);
+
+  useEffect(() => {
+    if (modalIndex === null) return;
+    if (filteredAssets.length === 0) {
+      setModalIndex(null);
+      return;
+    }
+    if (modalIndex > filteredAssets.length - 1) {
+      setModalIndex(filteredAssets.length - 1);
+    }
+  }, [filteredAssets, modalIndex]);
+
+  const closeModal = useCallback(() => {
+    setModalIndex(null);
+    const params = new URLSearchParams(window.location.search);
+    params.delete("image");
+    const query = params.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  }, [pathname, router]);
+  const openModal = useCallback(
+    (index: number) => {
+      setModalIndex(index);
+      const asset = filteredAssets[index];
+      if (!asset) return;
+      const params = new URLSearchParams(window.location.search);
+      params.set("image", asset.id);
+      router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    },
+    [filteredAssets, pathname, router]
+  );
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "/" && !isTextInputTarget(event.target)) {
+        event.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+
+      if (modalIndex === null) return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeModal();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closeModal, modalIndex]);
+
+  const activeAsset = modalIndex !== null ? filteredAssets[modalIndex] ?? null : null;
+  return (
+    <section id="gallery" className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8">
+      <div className="mb-5">
+        <p className="text-xs uppercase tracking-[0.18em] text-muted">Gallery</p>
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">Image archive</h2>
+          <p className="text-xs text-muted">Press `/` to search</p>
+        </div>
+        <p className="mt-2 max-w-3xl text-sm text-muted">
+          Browse generated images and open them in the viewer.
+        </p>
+      </div>
+
+      <GalleryFilters
+        query={filters.query}
+        onQueryChange={setQuery}
+        sort={filters.sort}
+        onSortChange={setSort}
+        searchRef={searchRef}
+        filteredCount={filteredAssets.length}
+        totalCount={liveAssets.length}
+      />
+
+      {filteredAssets.length === 0 ? (
+        <div className="rounded-xl2 border border-dashed border-line/80 bg-surface/70 p-10 text-center text-sm text-muted">
+          No matches.
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {filteredAssets.map((asset, index) => (
+            <GalleryCard
+              key={asset.id}
+              asset={asset}
+              onView={() => openModal(index)}
+            />
+          ))}
+        </div>
+      )}
+
+      <ImageModal
+        asset={activeAsset}
+        isOpen={modalIndex !== null}
+        onClose={closeModal}
+      />
+    </section>
+  );
+}

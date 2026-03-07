@@ -1,0 +1,61 @@
+@import "tailwindcss";
+/* Tailwind v4 source registration (replaces classic content globs). */
+@source "./**/*.{ts,tsx,js,jsx,mdx}";
+@source "../components/**/*.{ts,tsx,js,jsx,mdx}";
+@source "../lib/**/*.{ts,tsx,js,jsx}";
+@source "../../deedlit.dev.ui/src/**/*.{ts,tsx}";
+@source "@deedlit.dev/ui";
+/* Shared visual system. Keep app-level globals thin for reuse. */
+@import "@deedlit.dev/ui/styles.css";
+
+/* ---- Editor.js theme overrides ---- */
+.editorjs-container .codex-editor__redactor {
+  padding-bottom: 0 !important;
+}
+.editorjs-container .ce-block__content,
+.editorjs-container .ce-toolbar__content {
+  max-width: 100%;
+}
+.editorjs-container .ce-paragraph,
+.editorjs-container .ce-header,
+.editorjs-container .cdx-list {
+  color: var(--ui-ink);
+}
+.editorjs-container .ce-paragraph[data-placeholder-active]::before {
+  color: var(--ui-ink-subtle);
+  opacity: 0.6;
+}
+.editorjs-container .ce-toolbar__plus,
+.editorjs-container .ce-toolbar__settings-btn {
+  color: var(--ui-ink-subtle);
+  background: var(--ui-bg-soft);
+}
+.editorjs-container .ce-toolbar__plus:hover,
+.editorjs-container .ce-toolbar__settings-btn:hover {
+  background: var(--ui-bg-muted);
+}
+.editorjs-container .ce-inline-toolbar,
+.editorjs-container .ce-conversion-toolbar,
+.editorjs-container .ce-settings {
+  background: var(--ui-bg-card);
+  border-color: var(--ui-border);
+  color: var(--ui-ink);
+}
+.editorjs-container .ce-inline-toolbar__dropdown,
+.editorjs-container .ce-inline-tool,
+.editorjs-container .ce-conversion-tool,
+.editorjs-container .ce-settings__button {
+  color: var(--ui-ink);
+}
+.editorjs-container .ce-inline-tool:hover,
+.editorjs-container .ce-conversion-tool:hover,
+.editorjs-container .ce-settings__button:hover {
+  background: var(--ui-bg-soft);
+}
+.editorjs-container .ce-code__textarea,
+.editorjs-container .cdx-input {
+  background: var(--ui-bg-soft);
+  color: var(--ui-ink);
+  border-color: var(--ui-border);
+}
+
