@@ -5,7 +5,6 @@ import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import GalleryHeaderControls from "./components/GalleryHeaderControls";
 import GalleryImageGrid from "./components/GalleryImageGrid";
 import GalleryActiveFiltersBar from "./components/GalleryActiveFiltersBar";
 import GalleryControlsDock from "./components/GalleryControlsDock";
@@ -24,6 +23,7 @@ import {
   InfoChip,
   Modal,
   OutlineButton,
+  PageHeader,
   ScanProgress,
   SegmentedControl,
   SelectInput,
@@ -39,6 +39,8 @@ const GalleryPathFilterPanel = dynamic(() => import("./components/GalleryPathFil
 const GalleryTagPresetPanel = dynamic(() => import("./components/GalleryTagPresetPanel"));
 const ImageDetailsModal = dynamic(() => import("./components/ImageDetailsModal"));
 const GalleryCollectionsDock = dynamic(() => import("./components/GalleryCollectionsDock"));
+
+const COLLECTION_PREVIEW_QUALITY = 95;
 
 function HomeContent() {
   const [hasMounted, setHasMounted] = useState(false);
@@ -328,7 +330,14 @@ function HomeContent() {
         data-testid="gallery-page"
         className="cyber-panel rounded-[20px] p-2 sm:rounded-[28px] sm:p-5 xl:p-6"
       >
-        <GalleryHeaderControls className="mb-5" />
+        <PageHeader
+          testId="gallery-header"
+          subtitle="deedlit.dev // gallery"
+          title="Image Results"
+          titleTag="h2"
+          description="Browse, filter, and inspect generated images with metadata."
+          className="mb-5"
+        />
 
         {errorMessage && (
           <p
@@ -824,7 +833,7 @@ function HomeContent() {
                       className="relative aspect-square overflow-hidden rounded-lg border border-ui-border bg-ui-bg-table"
                       title={img.fileName}
                     >
-                      <Image src={img.url} alt={img.fileName} fill className="object-contain" sizes="80px" />
+                      <Image src={img.url} alt={img.fileName} fill className="object-contain" sizes="80px" quality={COLLECTION_PREVIEW_QUALITY} />
                     </button>
                   ))}
                   {collections.favourites.length > 12 && (
@@ -864,7 +873,7 @@ function HomeContent() {
                               className="relative aspect-square overflow-hidden rounded-md border border-ui-border bg-ui-bg-table"
                               title={img.fileName}
                             >
-                              <Image src={img.url} alt={img.fileName} fill className="object-contain" sizes="80px" />
+                              <Image src={img.url} alt={img.fileName} fill className="object-contain" sizes="80px" quality={COLLECTION_PREVIEW_QUALITY} />
                             </button>
                           ))}
                         </div>

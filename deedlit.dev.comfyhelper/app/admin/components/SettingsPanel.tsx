@@ -2,7 +2,7 @@
 
 import type { FormEvent } from "react";
 
-import { InfoChip, OutlineButton, SurfacePanel, TextAreaInput, TextInput } from "@deedlit.dev/ui";
+import { InfoChip, OutlineButton, PanelSectionHeader, SurfacePanel, TextAreaInput, TextInput } from "@deedlit.dev/ui";
 import type { RootDirectory } from "@/lib/library-types";
 import { toFriendlySize } from "@/lib/format-utils";
 
@@ -47,6 +47,15 @@ type SettingsPanelProps = {
   onAddRoot: (event: FormEvent<HTMLFormElement>) => void;
 };
 
+function DetailRow({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="flex items-start justify-between gap-3 text-(--admin-muted) text-ui-xs">
+      <span className="text-ui-ink-subtle">{label}</span>
+      <span className="text-right text-ui-ink">{value}</span>
+    </div>
+  );
+}
+
 export default function SettingsPanel({
   sqliteInfo,
   databaseInfo,
@@ -76,183 +85,208 @@ export default function SettingsPanel({
     <aside
       id="admin-settings-panel"
       data-testid="admin-settings-panel"
-      className="cyber-panel min-w-0 rounded-[28px] p-5"
+      className="cyber-panel min-w-0 rounded-[28px] p-4 sm:p-5 xl:p-6"
     >
-      <h2 className="text-ui-lg font-semibold text-[color:var(--ui-ink-strong)]">Settings</h2>
-      <p className="mt-1 text-ui-sm text-[color:var(--ui-ink-muted)]">Configuration is persisted in SQLite.</p>
+      <PanelSectionHeader title="Settings" description="Tune gallery defaults, storage paths, and parsing exclusions. Configuration is persisted in SQLite." />
 
-      <SurfacePanel className="mt-4 text-ui-xs text-[color:var(--admin-muted)]">
-        <p className="font-semibold uppercase tracking-[0.08em] text-[color:var(--ui-ink-accent)]">
-          SQLite Database File
-        </p>
-        <p className="mt-2">
-          Relative: <code>{sqliteInfo?.relativePath ?? "data/comfyhelper.db"}</code>
-        </p>
-        <p className="mt-1 min-w-0 break-all">
-          Absolute: <code className="break-all">{sqliteInfo?.absolutePath ?? "Unavailable"}</code>
-        </p>
-        <p className="mt-1">Size: {toFriendlySize(sqliteInfo?.fileSizeBytes ?? null)}</p>
-      </SurfacePanel>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <InfoChip>Visible roots: {visibleRootCount}</InfoChip>
+        <InfoChip>Hidden roots: {hiddenRootCount}</InfoChip>
+        <InfoChip>Cached images: {libraryInfo?.visibleCachedImages ?? "Unknown"}</InfoChip>
+        <InfoChip>DB size: {toFriendlySize(sqliteInfo?.fileSizeBytes ?? null)}</InfoChip>
+      </div>
 
-      <SurfacePanel className="mt-4 text-ui-xs text-[color:var(--admin-muted)]">
-        <p className="font-semibold uppercase tracking-[0.08em] text-[color:var(--ui-ink-accent)]">
-          Database Contents
-        </p>
-        <p className="mt-2">`root_directories` rows: {databaseInfo?.tableRows.rootDirectories ?? roots.length}</p>
-        <p className="mt-1">`app_settings` rows: {databaseInfo?.tableRows.appSettings ?? "Unknown"}</p>
-        <p className="mt-1">`image_cache` rows: {databaseInfo?.tableRows.imageCache ?? "Unknown"}</p>
-        <p className="mt-1">`scan_jobs` rows: {databaseInfo?.tableRows.scanJobs ?? "Unknown"}</p>
-        <p className="mt-2">Configured roots (all): {databaseInfo?.roots.total ?? roots.length}</p>
-        <p className="mt-1">Configured roots (visible): {databaseInfo?.roots.visible ?? visibleRootCount}</p>
-        <p className="mt-1">Configured roots (hidden): {databaseInfo?.roots.hidden ?? hiddenRootCount}</p>
-        <p className="mt-2">Cached images in visible roots: {libraryInfo?.visibleCachedImages ?? "Unknown"}</p>
-      </SurfacePanel>
-
-      <SurfacePanel
-        id="admin-settings-form"
-        data-testid="admin-settings-form"
-        className="mt-4"
-      >
-        <label className="mt-3 block text-ui-sm font-medium text-[color:var(--ui-ink)]" htmlFor="galleryColumns">
-          Gallery columns (desktop+)
-        </label>
-        <TextInput
-          id="galleryColumns"
-          data-testid="gallery-columns-input"
-          name="galleryColumns"
-          value={galleryColumnsInput}
-          onChange={(event) => onGalleryColumnsInputChange(event.target.value)}
-          inputMode="numeric"
-          className="mt-2 w-full"
-        />
-        <label className="mt-3 block text-ui-sm font-medium text-[color:var(--ui-ink)]" htmlFor="galleryImageLimit">
-          Gallery image limit
-        </label>
-        <TextInput
-          id="galleryImageLimit"
-          data-testid="gallery-image-limit-input"
-          name="galleryImageLimit"
-          value={galleryImageLimitInput}
-          onChange={(event) => onGalleryImageLimitInputChange(event.target.value)}
-          inputMode="numeric"
-          className="mt-2 w-full"
-        />
-        <p className="mt-1 text-ui-xs text-[color:var(--ui-ink-subtle)]">
-          Maximum number of images to load in the gallery (1000-50000). Higher values use more memory.
-        </p>
-        <label className="mt-3 block text-ui-sm font-medium text-[color:var(--ui-ink)]" htmlFor="trashcanDirectory">
-          Trashcan directory
-        </label>
-        <TextInput
-          id="trashcanDirectory"
-          data-testid="trashcan-directory-input"
-          name="trashcanDirectory"
-          value={trashcanDirectoryInput}
-          onChange={(event) => onTrashcanDirectoryInputChange(event.target.value)}
-          placeholder="C:\\ComfyUI\\output\\_trash"
-          className="mt-2 w-full"
-        />
-        <p className="mt-1 text-ui-xs text-[color:var(--ui-ink-subtle)]">
-          Move-to-trash uses this folder. Leave blank to disable trash operations.
-        </p>
-        <label className="mt-3 block text-ui-sm font-medium text-[color:var(--ui-ink)]" htmlFor="excludedTags">
-          Statistics and parsing excluded tags
-        </label>
-        <TextAreaInput
-          id="excludedTags"
-          data-testid="stats-parsing-excluded-tags-input"
-          name="excludedTags"
-          value={excludedTagsInput}
-          onChange={(event) => onExcludedTagsInputChange(event.target.value)}
-          rows={6}
-          placeholder={"unknown\nlow quality\nbroken_tag_example"}
-          className="mt-2 w-full"
-        />
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <TextInput
-            id="excludedTagDraft"
-            data-testid="stats-parsing-excluded-tag-draft-input"
-            name="excludedTagDraft"
-            value={excludedTagDraft}
-            onChange={(event) => onExcludedTagDraftChange(event.target.value)}
-            placeholder="Add a noisy tag"
-            className="min-w-[180px] flex-1"
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Storage"
+            description="Where admin state is stored and how much persisted data is currently tracked."
           />
-          <OutlineButton
-            data-testid="add-excluded-tag-button"
-            onClick={onAddExcludedTag}
-          >
-            Add tag
-          </OutlineButton>
-        </div>
-        <p className="mt-1 text-ui-xs text-[color:var(--ui-ink-subtle)]">
-          Tags in this list are ignored during statistics generation and overall prompt-tag parsing.
-        </p>
-        <div
-          id="excluded-tags-preview"
-          data-testid="excluded-tags-preview"
-          className="mt-2 rounded-lg border border-[color:var(--ui-border-soft)] bg-panel/80 p-2"
-        >
-          <p className="ui-text-label-compact text-[color:var(--ui-ink-subtle)]">
-            Active exclusions ({normalizedExcludedTags.length})
-          </p>
-          {normalizedExcludedTags.length === 0 ? (
-            <p className="mt-1 text-ui-xs text-[color:var(--ui-ink-subtle)]">No exclusions configured.</p>
-          ) : (
-            <div className="mt-2 flex max-h-24 flex-wrap gap-1 overflow-auto">
-              {normalizedExcludedTags.slice(0, 40).map((tag) => (
-                <InfoChip
-                  key={tag}
-                  data-testid="excluded-tag-chip"
-                  className="border border-[color:var(--ui-border-muted)] bg-[color:var(--ui-bg-soft)] px-2 py-0.5 text-ui-2xs text-[color:var(--ui-ink-accent)]"
-                >
-                  {tag}
-                </InfoChip>
-              ))}
+          <div className="mt-3 space-y-2">
+            <DetailRow label="Relative path" value={sqliteInfo?.relativePath ?? "data/comfyhelper.db"} />
+            <div className="space-y-1 text-(--admin-muted) text-ui-xs">
+              <p className="text-ui-ink-subtle">Absolute path</p>
+              <p className="min-w-0 break-all text-ui-ink">{sqliteInfo?.absolutePath ?? "Unavailable"}</p>
             </div>
-          )}
-        </div>
+            <DetailRow label="root_directories rows" value={databaseInfo?.tableRows.rootDirectories ?? roots.length} />
+            <DetailRow label="app_settings rows" value={databaseInfo?.tableRows.appSettings ?? "Unknown"} />
+            <DetailRow label="image_cache rows" value={databaseInfo?.tableRows.imageCache ?? "Unknown"} />
+            <DetailRow label="scan_jobs rows" value={databaseInfo?.tableRows.scanJobs ?? "Unknown"} />
+          </div>
+        </SurfacePanel>
+
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Library Snapshot"
+            description="A compact view of how many roots and cached images the app can currently see."
+          />
+          <div className="mt-3 space-y-2">
+            <DetailRow label="Configured roots" value={databaseInfo?.roots.total ?? roots.length} />
+            <DetailRow label="Visible roots" value={databaseInfo?.roots.visible ?? visibleRootCount} />
+            <DetailRow label="Hidden roots" value={databaseInfo?.roots.hidden ?? hiddenRootCount} />
+            <DetailRow label="Cached images in visible roots" value={libraryInfo?.visibleCachedImages ?? "Unknown"} />
+          </div>
+        </SurfacePanel>
+      </div>
+
+      <div id="admin-settings-form" data-testid="admin-settings-form" className="mt-4 space-y-4">
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Gallery Defaults"
+            description="Adjust the default desktop density and how many images the gallery can load at once."
+          />
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="block text-ui-sm font-medium text-ui-ink" htmlFor="galleryColumns">
+                Gallery columns (desktop+)
+              </label>
+              <TextInput
+                id="galleryColumns"
+                data-testid="gallery-columns-input"
+                name="galleryColumns"
+                value={galleryColumnsInput}
+                onChange={(event) => onGalleryColumnsInputChange(event.target.value)}
+                inputMode="numeric"
+                className="mt-2 w-full"
+              />
+            </div>
+            <div>
+              <label className="block text-ui-sm font-medium text-ui-ink" htmlFor="galleryImageLimit">
+                Gallery image limit
+              </label>
+              <TextInput
+                id="galleryImageLimit"
+                data-testid="gallery-image-limit-input"
+                name="galleryImageLimit"
+                value={galleryImageLimitInput}
+                onChange={(event) => onGalleryImageLimitInputChange(event.target.value)}
+                inputMode="numeric"
+                className="mt-2 w-full"
+              />
+            </div>
+          </div>
+          <p className="mt-2 text-ui-xs text-ui-ink-subtle">
+            Maximum gallery load range is 1000-50000. Higher limits increase memory use and first-load time.
+          </p>
+        </SurfacePanel>
+
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Trash Handling"
+            description="Set the folder used by move-to-trash actions. Leave it empty to disable trash operations."
+          />
+          <label className="mt-3 block text-ui-sm font-medium text-ui-ink" htmlFor="trashcanDirectory">
+            Trashcan directory
+          </label>
+          <TextInput
+            id="trashcanDirectory"
+            data-testid="trashcan-directory-input"
+            name="trashcanDirectory"
+            value={trashcanDirectoryInput}
+            onChange={(event) => onTrashcanDirectoryInputChange(event.target.value)}
+            placeholder="C:\\ComfyUI\\output\\_trash"
+            className="mt-2 w-full"
+          />
+        </SurfacePanel>
+
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Parsing Exclusions"
+            description="Keep noisy prompt tags out of statistics and overall metadata parsing."
+            actions={<InfoChip>Active: {normalizedExcludedTags.length}</InfoChip>}
+          />
+          <label className="mt-3 block text-ui-sm font-medium text-ui-ink" htmlFor="excludedTags">
+            Statistics and parsing excluded tags
+          </label>
+          <TextAreaInput
+            id="excludedTags"
+            data-testid="stats-parsing-excluded-tags-input"
+            name="excludedTags"
+            value={excludedTagsInput}
+            onChange={(event) => onExcludedTagsInputChange(event.target.value)}
+            rows={6}
+            placeholder={"unknown\nlow quality\nbroken_tag_example"}
+            className="mt-2 w-full"
+          />
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <TextInput
+              id="excludedTagDraft"
+              data-testid="stats-parsing-excluded-tag-draft-input"
+              name="excludedTagDraft"
+              value={excludedTagDraft}
+              onChange={(event) => onExcludedTagDraftChange(event.target.value)}
+              placeholder="Add a noisy tag"
+              className="min-w-45 flex-1"
+            />
+            <OutlineButton data-testid="add-excluded-tag-button" onClick={onAddExcludedTag}>
+              Add tag
+            </OutlineButton>
+          </div>
+          <div
+            id="excluded-tags-preview"
+            data-testid="excluded-tags-preview"
+            className="mt-3 rounded-lg border border-ui-border-soft bg-panel/80 p-2"
+          >
+            <p className="ui-text-label-compact text-ui-ink-subtle">
+              Active exclusions ({normalizedExcludedTags.length})
+            </p>
+            {normalizedExcludedTags.length === 0 ? (
+              <p className="mt-1 text-ui-xs text-ui-ink-subtle">No exclusions configured.</p>
+            ) : (
+              <div className="mt-2 flex max-h-24 flex-wrap gap-1 overflow-auto">
+                {normalizedExcludedTags.slice(0, 40).map((tag) => (
+                  <InfoChip
+                    key={tag}
+                    data-testid="excluded-tag-chip"
+                    className="border border-ui-border-muted bg-ui-bg-soft px-2 py-0.5 text-ui-2xs text-ui-ink-accent"
+                  >
+                    {tag}
+                  </InfoChip>
+                ))}
+              </div>
+            )}
+          </div>
+        </SurfacePanel>
+
+        <SurfacePanel className="min-w-0" padding="lg">
+          <PanelSectionHeader
+            title="Add Root Directory"
+            description="Register another library path for future scans and gallery visibility."
+          />
+          <form id="add-root-form" data-testid="add-root-form" className="mt-3 flex flex-col gap-3" onSubmit={onAddRoot}>
+            <TextInput
+              id="rootPath"
+              data-testid="root-path-input"
+              name="rootPath"
+              value={newRootPath}
+              onChange={(event) => onNewRootPathChange(event.target.value)}
+              placeholder="C:\\ComfyUI\\output"
+              className="w-full"
+            />
+            <OutlineButton
+              type="submit"
+              id="add-root-button"
+              data-testid="add-root-button"
+              disabled={busyAction === "add-root"}
+              variant="accent"
+              controlSize="lg"
+            >
+              {busyAction === "add-root" ? "Adding..." : "Add root"}
+            </OutlineButton>
+          </form>
+        </SurfacePanel>
+
         <OutlineButton
           id="save-settings-button"
           data-testid="save-settings-button"
           onClick={onSaveSettings}
           disabled={busyAction === "save-settings"}
           controlSize="lg"
-          className="mt-3 w-full"
+          className="w-full"
         >
           {busyAction === "save-settings" ? "Saving..." : "Save settings"}
         </OutlineButton>
-      </SurfacePanel>
-
-      <form
-        id="add-root-form"
-        data-testid="add-root-form"
-        className="mt-4 flex flex-col gap-3"
-        onSubmit={onAddRoot}
-      >
-        <label className="text-ui-sm font-medium text-[color:var(--ui-ink)]" htmlFor="rootPath">
-          Add root directory
-        </label>
-        <TextInput
-          id="rootPath"
-          data-testid="root-path-input"
-          name="rootPath"
-          value={newRootPath}
-          onChange={(event) => onNewRootPathChange(event.target.value)}
-          placeholder="C:\\ComfyUI\\output"
-          className="w-full"
-        />
-        <OutlineButton
-          type="submit"
-          id="add-root-button"
-          data-testid="add-root-button"
-          disabled={busyAction === "add-root"}
-          variant="accent"
-          controlSize="lg"
-        >
-          {busyAction === "add-root" ? "Adding..." : "Add root"}
-        </OutlineButton>
-      </form>
+      </div>
     </aside>
   );
 }

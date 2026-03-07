@@ -1,10 +1,12 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   CollapsiblePanel,
   DownloadIcon,
+  MediaStage,
   MetadataTabBar,
   OutlineButton,
   XIcon,
@@ -15,7 +17,6 @@ import { useImageDetailQuery } from "@/lib/queries/use-image-detail";
 import { useNotesByImageQuery } from "@/lib/queries/use-notes";
 import { useWorkflowViewer } from "@/app/(gallery)/hooks/use-workflow-viewer";
 import {
-  ImagePreviewPanel,
   DetailsTabContent,
   RawMetadataTabContent,
   WorkflowTabContent,
@@ -209,11 +210,16 @@ export default function StandaloneImageModal({ image, onClose }: StandaloneImage
               : "lg:grid-cols-[minmax(0,0.85fr)_minmax(320px,1.15fr)]"
           }`}
         >
-          <ImagePreviewPanel
-            imageUrl={imageUrl}
-            fileName={image.fileName}
-            hidden={isWorkflowTab}
-          />
+          <MediaStage hidden={isWorkflowTab} previousLabel="Previous image" nextLabel="Next image">
+            <Image
+              src={imageUrl}
+              alt={image.fileName}
+              fill
+              sizes="(min-width: 1280px) 62vw, (min-width: 1024px) 58vw, 100vw"
+              quality={95}
+              className="object-contain object-center"
+            />
+          </MediaStage>
 
           <div
             className={
@@ -259,12 +265,16 @@ export default function StandaloneImageModal({ image, onClose }: StandaloneImage
 
         {/* Mobile layout: image on top, collapsible details below */}
         <div className="flex min-h-0 flex-1 flex-col lg:hidden">
-          <ImagePreviewPanel
-            imageUrl={imageUrl}
-            fileName={image.fileName}
-            hidden={false}
-            className="flex-1 min-h-[40vh]"
-          />
+          <MediaStage hidden={false} previousLabel="Previous image" nextLabel="Next image" className="min-h-[40vh] flex-1">
+            <Image
+              src={imageUrl}
+              alt={image.fileName}
+              fill
+              sizes="(min-width: 1280px) 62vw, (min-width: 1024px) 58vw, 100vw"
+              quality={95}
+              className="object-contain object-center"
+            />
+          </MediaStage>
 
           <CollapsiblePanel
             label={mobileTabLabel}

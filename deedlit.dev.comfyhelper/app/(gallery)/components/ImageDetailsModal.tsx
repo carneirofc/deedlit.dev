@@ -1,13 +1,13 @@
 "use client";
 
+import Image from "next/image";
 import type { ImageModalState, WorkflowViewerState, CollectionsHook } from "../hooks";
 import type { ImageRecord } from "@/lib/library-types";
-import { CollapsiblePanel, MetadataTabBar, Modal, OutlineButton } from "@deedlit.dev/ui";
+import { CollapsiblePanel, MediaStage, MetadataTabBar, Modal, OutlineButton } from "@deedlit.dev/ui";
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ModalHeader,
-  ImagePreviewPanel,
   DetailsTabContent,
   RawMetadataTabContent,
   WorkflowTabContent,
@@ -123,13 +123,22 @@ export default function ImageDetailsModal({
               : "lg:grid-cols-[minmax(0,0.85fr)_minmax(320px,1.15fr)]"
               }`}
           >
-            <ImagePreviewPanel
-              imageUrl={selectedImageUrl}
-              fileName={selectedImage.fileName}
+            <MediaStage
               hidden={isWorkflowTab}
-              onNavigate={navigateSelectedImage}
               canNavigate={filteredImages.length >= 2 && selectedImageIndex >= 0}
-            />
+              onNavigate={navigateSelectedImage}
+              previousLabel="Previous image"
+              nextLabel="Next image"
+            >
+              <Image
+                src={selectedImageUrl}
+                alt={selectedImage.fileName}
+                fill
+                sizes="(min-width: 1280px) 62vw, (min-width: 1024px) 58vw, 100vw"
+                quality={95}
+                className="object-contain object-center"
+              />
+            </MediaStage>
 
             <div
               className={
@@ -175,14 +184,23 @@ export default function ImageDetailsModal({
 
           {/* Mobile layout: image on top, collapsible details below */}
           <div className="flex min-h-0 flex-1 flex-col lg:hidden">
-            <ImagePreviewPanel
-              imageUrl={selectedImageUrl}
-              fileName={selectedImage.fileName}
+            <MediaStage
               hidden={false}
-              onNavigate={navigateSelectedImage}
               canNavigate={filteredImages.length >= 2 && selectedImageIndex >= 0}
-              className="flex-1 min-h-[40vh]"
-            />
+              onNavigate={navigateSelectedImage}
+              previousLabel="Previous image"
+              nextLabel="Next image"
+              className="min-h-[40vh] flex-1"
+            >
+              <Image
+                src={selectedImageUrl}
+                alt={selectedImage.fileName}
+                fill
+                sizes="(min-width: 1280px) 62vw, (min-width: 1024px) 58vw, 100vw"
+                quality={95}
+                className="object-contain object-center"
+              />
+            </MediaStage>
 
             <CollapsiblePanel
               label={selectedModalTab === "raw" ? "Raw Metadata" : selectedModalTab === "workflow" ? "Workflow" : "Details"}

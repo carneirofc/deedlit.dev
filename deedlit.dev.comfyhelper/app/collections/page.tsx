@@ -48,6 +48,19 @@ type Tab = "favourites" | "groups";
 
 type SortMode = "newest" | "oldest" | "name";
 
+const COLLECTION_PREVIEW_QUALITY = 95;
+
+type CollectionThumbnailProps = {
+  image: CollectionImage;
+  sizes: string;
+  onOpen: (imageId: string) => void;
+  onRemove: (imageId: string) => void;
+  removeLabel: string;
+  footer?: string;
+  className?: string;
+  removeButtonClassName?: string;
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -74,6 +87,68 @@ function formatDate(ts: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function CollectionThumbnail({
+  image,
+  sizes,
+  onOpen,
+  onRemove,
+  removeLabel,
+  footer,
+  className,
+  removeButtonClassName,
+}: CollectionThumbnailProps) {
+  return (
+    <div
+      className={[
+        "group relative overflow-hidden rounded-xl border border-ui-border bg-ui-bg-table",
+        className,
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <button
+        type="button"
+        onClick={() => onOpen(image.id)}
+        className="relative block aspect-square w-full cursor-pointer bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.18),transparent_62%),linear-gradient(180deg,rgba(255,255,255,0.04),rgba(0,0,0,0.12))] p-2"
+        aria-label={`View ${image.fileName}`}
+        title={image.fileName}
+      >
+        <div className="relative h-full w-full overflow-hidden rounded-lg border border-white/8 bg-black/10 shadow-inner">
+          <Image
+            src={image.url}
+            alt={image.fileName}
+            fill
+            sizes={sizes}
+            quality={COLLECTION_PREVIEW_QUALITY}
+            unoptimized
+            loading="lazy"
+            decoding="async"
+            className="object-contain"
+          />
+        </div>
+      </button>
+      <button
+        type="button"
+        onClick={() => onRemove(image.id)}
+        className={[
+          "absolute right-1.5 top-1.5 z-10 grid h-7 w-7 place-items-center rounded-full bg-(--ui-bg-card)/90 text-ui-ink-subtle opacity-0 shadow-sm transition group-hover:opacity-100",
+          removeButtonClassName,
+        ]
+          .filter(Boolean)
+          .join(" ")}
+        aria-label={removeLabel}
+        title={removeLabel}
+      >
+        <LuX className="h-3.5 w-3.5" />
+      </button>
+      <div className="px-2 py-1.5">
+        <p className="truncate text-ui-xs font-medium text-ui-ink-title">{image.fileName}</p>
+        {footer ? <p className="text-ui-2xs text-ui-ink-note">{footer}</p> : null}
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -155,44 +230,17 @@ function FavouritesSection({
       ) : (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {filtered.map((img) => (
-            <div
+            <CollectionThumbnail
               key={img.id}
-              className="group relative overflow-hidden rounded-2xl border border-ui-border bg-ui-bg-table transition hover:shadow-panel-sm"
-            >
-              <button
-                type="button"
-                onClick={() => onImageClick(img.id)}
-                className="relative block aspect-square w-full cursor-pointer"
-                aria-label={`View ${img.fileName}`}
-                title={img.fileName}
-              >
-                <Image
-                  src={img.url}
-                  alt={img.fileName}
-                  fill
-                  sizes="(max-width: 640px) 45vw, (max-width: 1024px) 25vw, 180px"
-                  quality={60}
-                  className="object-contain"
-                />
-              </button>
-              <button
-                type="button"
-                onClick={() => onRemove(img.id)}
-                className="absolute right-1.5 top-1.5 z-10 grid h-7 w-7 place-items-center rounded-full bg-(--ui-bg-card)/90 text-rose-500 opacity-0 shadow-sm transition group-hover:opacity-100"
-                aria-label={`Remove ${img.fileName} from favourites`}
-                title="Remove from favourites"
-              >
-                <LuX className="h-3.5 w-3.5" />
-              </button>
-              <div className="px-2 py-1.5">
-                <p className="truncate text-ui-xs font-medium text-ui-ink-title">
-                  {img.fileName}
-                </p>
-                <p className="text-ui-2xs text-ui-ink-note">
-                  {formatDate(img.addedAt)}
-                </p>
-              </div>
-            </div>
+              image={img}
+              sizes="(max-width: 640px) 45vw, (max-width: 1024px) 25vw, 180px"
+              onOpen={onImageClick}
+              onRemove={onRemove}
+              removeLabel={`Remove ${img.fileName} from favourites`}
+              footer={formatDate(img.addedAt)}
+              className="rounded-2xl transition hover:shadow-panel-sm"
+              removeButtonClassName="text-rose-500"
+            />
           ))}
         </div>
       )}
@@ -312,39 +360,15 @@ function GroupCard({
           ) : (
             <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6">
               {group.images.map((img) => (
-                <div
+                <CollectionThumbnail
                   key={img.id}
-                  className="group/img relative overflow-hidden rounded-xl border border-ui-border bg-ui-bg-table"
-                >
-                  <button
-                    type="button"
-                    onClick={() => onImageClick(img.id)}
-                    className="relative block aspect-square w-full cursor-pointer"
-                    aria-label={`View ${img.fileName}`}
-                    title={img.fileName}
-                  >
-                    <Image
-                      src={img.url}
-                      alt={img.fileName}
-                      fill
-                      sizes="(max-width: 640px) 30vw, 120px"
-                      quality={50}
-                      className="object-contain"
-                    />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onRemoveImage(img.id)}
-                    className="absolute right-1 top-1 z-10 grid h-6 w-6 place-items-center rounded-full bg-(--ui-bg-card)/90 text-ui-ink-subtle opacity-0 shadow-sm transition group-hover/img:opacity-100"
-                    aria-label={`Remove ${img.fileName} from group`}
-                    title="Remove from group"
-                  >
-                    <LuX className="h-3 w-3" />
-                  </button>
-                  <p className="truncate px-1.5 py-1 text-ui-2xs text-ui-ink-note">
-                    {img.fileName}
-                  </p>
-                </div>
+                  image={img}
+                  sizes="(max-width: 640px) 30vw, 120px"
+                  onOpen={onImageClick}
+                  onRemove={onRemoveImage}
+                  removeLabel={`Remove ${img.fileName} from group`}
+                  removeButtonClassName="right-1 top-1 h-6 w-6 group-hover:opacity-100"
+                />
               ))}
             </div>
           )}
