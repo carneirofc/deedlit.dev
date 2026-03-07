@@ -4,6 +4,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -77,7 +78,23 @@ type GalleryImageGridProps = {
   collections?: CollectionsHook;
 };
 
-const GalleryImageCardMemo = memo(GalleryImageCard);
+const GalleryImageCardMemo = memo(
+  GalleryImageCard,
+  (previousProps, nextProps) =>
+    previousProps.image === nextProps.image &&
+    previousProps.index === nextProps.index &&
+    previousProps.isSelected === nextProps.isSelected &&
+    previousProps.isKeyboardActive === nextProps.isKeyboardActive &&
+    previousProps.isFavourite === nextProps.isFavourite &&
+    previousProps.imageSizes === nextProps.imageSizes &&
+    previousProps.setCardRef === nextProps.setCardRef &&
+    previousProps.onCardFocus === nextProps.onCardFocus &&
+    previousProps.onImageClick === nextProps.onImageClick &&
+    previousProps.onToggleImageSelection === nextProps.onToggleImageSelection &&
+    previousProps.onToggleFavourite === nextProps.onToggleFavourite &&
+    previousProps.focusAndScrollImageAtIndex === nextProps.focusAndScrollImageAtIndex &&
+    previousProps.onHoverPrefetch === nextProps.onHoverPrefetch,
+);
 
 export default function GalleryImageGrid({
   isLoading,
@@ -105,9 +122,14 @@ export default function GalleryImageGrid({
   const prefetchedImageUrlsRef = useRef<Set<string>>(new Set());
   const imageCardRefs = useRef<Array<HTMLElement | null>>([]);
   const [activeImageIndex, setActiveImageIndex] = useState<number>(0);
+  const selectedImageCount = selectedImageIds.size;
   // With MIN_GALLERY_CARD_WIDTH = 256px: phones (<560px) → 1 col, up to 640px → 2 cols, etc.
   const imageSizes = "(max-width: 560px) 100vw, (max-width: 640px) 50vw, (max-width: 1024px) 33vw, 20vw";
   const shouldPrefetch = shouldPrefetchImages();
+  const favouriteImageIds = useMemo(
+    () => new Set(collections?.favourites.map((image) => image.id) ?? []),
+    [collections?.favourites],
+  );
 
   useEffect(() => {
     if (!shouldPrefetch) return;
@@ -371,6 +393,12 @@ export default function GalleryImageGrid({
         </EmptyState>
       ) : !isLoading && filteredImages.length > 0 ? (
         <>
+          <div className="sticky top-2 z-20 mt-4 flex justify-end sm:top-3">
+            <div className="rounded-full border border-ui-border bg-ui-bg-card/95 px-3 py-1.5 text-ui-xs text-ui-ink-muted shadow-sm backdrop-blur">
+              Selected: <span className="font-semibold text-ui-ink-title">{selectedImageCount}</span>{" "}
+              image{selectedImageCount === 1 ? "" : "s"}
+            </div>
+          </div>
           {topSpacerHeight > 0 && (
             <div style={{ height: `${topSpacerHeight}px` }} aria-hidden="true" />
           )}
@@ -404,8 +432,7 @@ export default function GalleryImageGrid({
             {visibleImages.map((image, index) => {
               const isSelected = selectedImageIds.has(image.id);
               const isKeyboardActive = index === clampedActiveImageIndex;
-              const imageIsFav = collections?.isFavourite(image.id) ?? false;
-              const imageGroups = collections?.getGroupsForImage(image.id) ?? [];
+              const imageIsFav = favouriteImageIds.has(image.id);
               return (
                 <GalleryImageCardMemo
                   key={image.id}
@@ -414,7 +441,6 @@ export default function GalleryImageGrid({
                   isSelected={isSelected}
                   isKeyboardActive={isKeyboardActive}
                   isFavourite={imageIsFav}
-                  groupsForImage={imageGroups}
                   imageSizes={imageSizes}
                   setCardRef={setCardRef}
                   onCardFocus={handleCardFocus}

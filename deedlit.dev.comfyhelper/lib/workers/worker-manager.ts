@@ -10,8 +10,10 @@ import {
   subscribeWorkerChannel,
   subscribeWorkerKind,
 } from "@/lib/messaging/worker";
+import { getLogger } from "../logger";
 
 const MANAGER_CHANNEL = "worker-manager" as const;
+const logger = getLogger({ scope: "worker-manager" });
 
 type ManagedService = {
   service: BackgroundService;
@@ -48,13 +50,38 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function logWithArgs(
+  method: (object: object, message?: string) => void,
+  message: string,
+  args: unknown[],
+): void {
+  if (args.length === 0) {
+    method({}, message);
+    return;
+  }
+
+  if (args.length === 1) {
+    const [first] = args;
+    if (first instanceof Error) {
+      method({ err: first }, message);
+      return;
+    }
+    if (typeof first === "object" && first !== null) {
+      method(first as object, message);
+      return;
+    }
+  }
+
+  method({ args }, message);
+}
+
 function createServiceLogger(serviceName: string): ServiceLogger {
-  const prefix = `[worker:${serviceName}]`;
+  const serviceLogger = getLogger({ scope: "worker", service: serviceName });
   return {
-    info: (msg, ...args) => console.log(prefix, msg, ...args),
-    warn: (msg, ...args) => console.warn(prefix, msg, ...args),
-    error: (msg, ...args) => console.error(prefix, msg, ...args),
-    debug: (msg, ...args) => console.debug(prefix, msg, ...args),
+    info: (msg, ...args) => logWithArgs(serviceLogger.info.bind(serviceLogger), msg, args),
+    warn: (msg, ...args) => logWithArgs(serviceLogger.warn.bind(serviceLogger), msg, args),
+    error: (msg, ...args) => logWithArgs(serviceLogger.error.bind(serviceLogger), msg, args),
+    debug: (msg, ...args) => logWithArgs(serviceLogger.debug.bind(serviceLogger), msg, args),
   };
 }
 
@@ -118,7 +145,7 @@ export function registerService(service: BackgroundService): void {
   const manager = getManager();
 
   if (manager.services.has(service.name)) {
-    console.warn(`[worker-manager] service "${service.name}" is already registered`);
+    logger.warn({ service: service.name }, "Service is already registered");
     return;
   }
 
@@ -143,7 +170,7 @@ export function unregisterService(name: string): boolean {
   }
 
   if (managed.status === "running" || managed.status === "starting") {
-    console.warn(`[worker-manager] cannot unregister "${name}" while status=${managed.status}`);
+    logger.warn({ service: name, status: managed.status }, "Cannot unregister service while active");
     return false;
   }
 
@@ -158,12 +185,12 @@ export async function startService(name: string): Promise<boolean> {
   const managed = manager.services.get(name);
 
   if (!managed) {
-    console.error(`[worker-manager] service "${name}" is not registered`);
+    logger.error({ service: name }, "Service is not registered");
     return false;
   }
 
   if (managed.status === "running" || managed.status === "starting") {
-    console.warn(`[worker-manager] service "${name}" is already ${managed.status}`);
+    logger.warn({ service: name, status: managed.status }, "Service is already active");
     return false;
   }
 
@@ -193,7 +220,7 @@ export async function startService(name: string): Promise<boolean> {
     managed.controller = null;
 
     emitWorkerEvent(MANAGER_CHANNEL, "service.error", { name, error: managed.error });
-    console.error(`[worker-manager] failed to start "${name}"`, err);
+    logger.error({ service: name, err }, "Failed to start service");
     return false;
   }
 }
@@ -203,12 +230,12 @@ export async function stopService(name: string): Promise<boolean> {
   const managed = manager.services.get(name);
 
   if (!managed) {
-    console.error(`[worker-manager] service "${name}" is not registered`);
+    logger.error({ service: name }, "Service is not registered");
     return false;
   }
 
   if (managed.status !== "running" && managed.status !== "starting" && managed.status !== "error") {
-    console.warn(`[worker-manager] service "${name}" is not running (status=${managed.status})`);
+    logger.warn({ service: name, status: managed.status }, "Service is not running");
     return false;
   }
 
@@ -220,7 +247,7 @@ export async function stopService(name: string): Promise<boolean> {
   try {
     await managed.service.stop();
   } catch (err) {
-    console.error(`[worker-manager] failed to stop "${name}"`, err);
+    logger.error({ service: name, err }, "Failed to stop service");
   }
 
   managed.status = "stopped";

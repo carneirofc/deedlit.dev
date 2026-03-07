@@ -1,4 +1,3 @@
-import { ImageGroup } from "@/lib/collections-store";
 import {
   type MouseEvent,
 } from "react";
@@ -14,7 +13,6 @@ type GalleryImageCardProps = {
   isSelected: boolean;
   isKeyboardActive: boolean;
   isFavourite: boolean;
-  groupsForImage: ImageGroup[];
   imageSizes: string;
   setCardRef: (index: number, node: HTMLElement | null) => void;
   onCardFocus: (index: number) => void;
@@ -36,7 +34,6 @@ export function GalleryImageCard({
   isSelected,
   isKeyboardActive,
   isFavourite,
-  groupsForImage,
   imageSizes,
   setCardRef,
   onCardFocus,

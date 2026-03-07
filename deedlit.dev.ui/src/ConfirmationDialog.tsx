@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef } from "react";
+import { forwardRef, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 
 import OutlineButton from "./OutlineButton";
@@ -29,6 +29,16 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
   overlayClassName,
   testIdPrefix = "confirmation-dialog",
 }, ref) {
+  const acceptButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      acceptButtonRef.current?.focus();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [dialog]);
+
   if (typeof document === "undefined") return null;
 
   return createPortal(
@@ -36,7 +46,7 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
       id={`${testIdPrefix}-overlay`}
       data-testid={`${testIdPrefix}-overlay`}
       className={cn(
-        "fixed inset-0 z-[120] flex items-center justify-center overflow-y-auto bg-[color:var(--ui-overlay-soft)] p-4",
+        "fixed inset-0 z-120 flex items-center justify-center overflow-y-auto bg-ui-overlay-soft p-4",
         overlayClassName,
       )}
       role="dialog"
@@ -49,26 +59,26 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
         id={testIdPrefix}
         data-testid={testIdPrefix}
         className={cn(
-          "w-full max-w-[720px] overflow-hidden rounded-2xl border-ui-modal bg-[color:var(--ui-bg-card)] shadow-[var(--ui-shadow-strong)]",
+          "w-full max-w-180 overflow-hidden rounded-2xl border-ui-modal bg-ui-bg-card shadow-ui-strong",
           className,
         )}
         onClick={(event) => event.stopPropagation()}
       >
         <div className={cn(BORDER_PATTERNS.bottomFaint, SPACING_PATTERNS.dialogSection)}>
-          <p className="text-ui-sm font-semibold uppercase tracking-[0.08em] text-[color:var(--ui-ink-subtle)]">
+          <p className="text-ui-sm font-semibold uppercase tracking-[0.08em] text-ui-ink-subtle">
             Confirm Action
           </p>
-          <h3 className="mt-1 text-ui-lg font-semibold text-[color:var(--ui-ink-strong)]">
+          <h3 className="mt-1 text-ui-lg font-semibold text-ui-ink-strong">
             {dialog.title}
           </h3>
         </div>
 
-        <div className={cn("max-h-[min(62dvh,36rem)] space-y-4 overflow-y-auto text-ui-sm text-[color:var(--ui-ink-accent)]", SPACING_PATTERNS.dialogSection)}>
+        <div className={cn("max-h-[min(62dvh,36rem)] space-y-4 overflow-y-auto text-ui-sm text-ui-ink-accent", SPACING_PATTERNS.dialogSection)}>
           <section>
-            <p className="ui-text-label-sm text-[color:var(--ui-ink-subtle)]">Details</p>
+            <p className="ui-text-label-sm text-ui-ink-subtle">Details</p>
             <ul className="mt-2 space-y-1">
               {dialog.details.map((line, index) => (
-                <li key={`detail:${index}`} className={cn("rounded-md bg-[color:var(--ui-bg-muted)]", SPACING_PATTERNS.controlXs)}>
+                <li key={`detail:${index}`} className={cn("rounded-md bg-ui-bg-muted", SPACING_PATTERNS.controlXs)}>
                   {line}
                 </li>
               ))}
@@ -76,10 +86,10 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
           </section>
 
           <section>
-            <p className="ui-text-label-sm text-[color:var(--ui-ink-subtle)]">If You Accept</p>
+            <p className="ui-text-label-sm text-ui-ink-subtle">If You Accept</p>
             <ul className="mt-2 space-y-1">
               {dialog.outcomes.map((line, index) => (
-                <li key={`outcome:${index}`} className={cn("rounded-md bg-[color:var(--ui-bg-info)]", SPACING_PATTERNS.controlXs)}>
+                <li key={`outcome:${index}`} className={cn("rounded-md bg-ui-bg-info", SPACING_PATTERNS.controlXs)}>
                   {line}
                 </li>
               ))}
@@ -96,6 +106,7 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
             {dialog.cancelLabel ?? "Cancel"}
           </OutlineButton>
           <OutlineButton
+            ref={acceptButtonRef}
             data-testid={`${testIdPrefix}-accept-button`}
             onClick={() => onClose(true)}
             variant="accent"

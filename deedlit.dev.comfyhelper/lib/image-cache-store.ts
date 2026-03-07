@@ -9,6 +9,7 @@ import { readMetadataForImage, walkPngFiles } from "@/lib/library-scanner";
 import { tryParseJson, tryParseJsonWithSchema } from "@/lib/json-utils";
 import type { ImageRecord, PromptSummary, RootDirectory, ScanJobInfo, ScanJobStatus } from "@/lib/library-types";
 import { emitGalleryImagesChanged, emitGalleryImagesRemoved } from "@/lib/messaging/gallery";
+import { getLogger } from "./logger";
 import { emitScanEvent } from "@/lib/messaging/scan";
 import { extractPromptInsightsFromMetadata } from "@/lib/metadata-insights";
 import { invalidatePromptStatisticsCache } from "@/lib/prompt-statistics-cache";
@@ -21,6 +22,7 @@ const PROGRESS_UPDATE_EVERY = 20;
 const MAX_WARNINGS = 200;
 const STATS_METADATA_BATCH_SIZE = 500;
 const STATS_VISITOR_YIELD_EVERY = 80;
+const logger = getLogger({ scope: "image-cache-store" });
 
 /**
  * Maximum duration a scan job is allowed to run before it is considered stuck.
@@ -386,7 +388,7 @@ async function runLibraryScanJob(
   let newFiles = 0;
   let activeRootPath = roots[0]?.path;
 
-  console.info(`[scan:${jobId}] started roots=${roots.length} at=${toIsoDateTime(startedAtMs)}`);
+  logger.info({ jobId, rootCount: roots.length, startedAt: toIsoDateTime(startedAtMs) }, "Scan started");
 
   const publishProgress = async (status: ScanJobStatus, error?: string) => {
     await updateJob(jobId, {
@@ -458,7 +460,7 @@ async function runLibraryScanJob(
         message: "No visible roots to scan",
       });
       invalidatePromptStatisticsCache();
-      console.info(`[scan:${jobId}] completed with no roots`);
+      logger.info({ jobId }, "Scan completed with no roots");
       return;
     }
 
@@ -497,8 +499,15 @@ async function runLibraryScanJob(
         missingPromptSummaryRows.map((row) => [row.id, row as MissingPromptSummarySnapshot]),
       );
 
-      console.info(
-        `[scan:${jobId}] root="${root.path}" cachedSnapshots=${existingRows.length} discovered=${discoveredFiles} processed=${processedFiles}`,
+      logger.info(
+        {
+          jobId,
+          rootPath: root.path,
+          cachedSnapshots: existingRows.length,
+          discoveredFiles,
+          processedFiles,
+        },
+        "Scanning root",
       );
 
       const shouldStop = await walkPngFiles(
@@ -626,9 +635,7 @@ async function runLibraryScanJob(
         jobId,
         count: staleRows.length,
       });
-      console.info(
-        `[scan:${jobId}] emitted gallery images.removed count=${staleRows.length}`,
-      );
+      logger.info({ jobId, removedCount: staleRows.length }, "Emitted gallery removal event");
     }
 
     const cachedImages = await prisma.imageCache.count({
@@ -657,12 +664,21 @@ async function runLibraryScanJob(
       message: "Scan completed",
     });
     invalidatePromptStatisticsCache();
-    console.info(
-      `[scan:${jobId}] completed discovered=${discoveredFiles} processed=${processedFiles} reused=${reusedFiles} rescanned=${rescannedFiles} new=${newFiles} cached=${cachedImages}`,
+    logger.info(
+      {
+        jobId,
+        discoveredFiles,
+        processedFiles,
+        reusedFiles,
+        rescannedFiles,
+        newFiles,
+        cachedImages,
+      },
+      "Scan completed",
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown scan failure";
-    console.error(`[scan:${jobId}] failed`, error);
+    logger.error({ jobId, err: error }, "Scan failed");
 
     try {
       await updateJob(jobId, {
@@ -675,10 +691,7 @@ async function runLibraryScanJob(
         error: message,
       });
     } catch (dbError) {
-      console.error(
-        `[scan:${jobId}] CRITICAL — failed to mark job as failed in database (job will be recovered as stale)`,
-        dbError,
-      );
+      logger.error({ jobId, err: dbError }, "Failed to mark scan job as failed in database");
     }
 
     emitScanEvent({
@@ -740,8 +753,9 @@ async function recoverStaleJobs(): Promise<number> {
       }
       // Timed out — clear in-memory reference and fall through to force-fail
       coordinator.runningJobId = null;
-      console.warn(
-        `[scan-recovery] job ${row.id} timed out after ${Math.round(elapsed / 1000)}s — force-failing`,
+      logger.warn(
+        { jobId: row.id, elapsedSeconds: Math.round(elapsed / 1000) },
+        "Timed out scan job recovered as failed",
       );
     } else {
       // Not tracked in-memory — this is an orphan from a previous process or crash
@@ -751,8 +765,9 @@ async function recoverStaleJobs(): Promise<number> {
         // Recently created, give it a chance (might be starting up)
         continue;
       }
-      console.warn(
-        `[scan-recovery] orphaned ${row.status} job ${row.id} (age=${Math.round(age / 1000)}s) — force-failing`,
+      logger.warn(
+        { jobId: row.id, status: row.status, ageSeconds: Math.round(age / 1000) },
+        "Orphaned scan job recovered as failed",
       );
     }
 
@@ -764,12 +779,12 @@ async function recoverStaleJobs(): Promise<number> {
       });
       recovered += 1;
     } catch (dbError) {
-      console.error(`[scan-recovery] failed to update stale job ${row.id}`, dbError);
+      logger.error({ jobId: row.id, err: dbError }, "Failed to update stale scan job");
     }
   }
 
   if (recovered > 0) {
-    console.info(`[scan-recovery] recovered ${recovered} stale job(s)`);
+    logger.info({ recovered }, "Recovered stale scan jobs");
   }
 
   return recovered;
@@ -820,10 +835,7 @@ export async function startAsyncLibraryScan(
   coordinator.runningJobId = jobId;
   queueMicrotask(() => {
     runLibraryScanJob(jobId, roots, options).catch((error) => {
-      console.error(
-        `[scan:${jobId}] UNHANDLED — scan promise rejected outside try/catch`,
-        error,
-      );
+      logger.error({ jobId, err: error }, "Unhandled scan promise rejection");
       // Ensure in-memory state is always cleared even on unexpected failures
       if (coordinator.runningJobId === jobId) {
         coordinator.runningJobId = null;
@@ -1041,9 +1053,7 @@ export async function* streamCachedImageMetadataByRootIds(
   let globalProcessed = 0;
   const startMs = Date.now();
 
-  console.info(
-    `[streamMetadata] starting stream roots=${rootIds.length} batchSize=${batchSize} concurrency=${concurrency}`,
-  );
+  logger.info({ rootCount: rootIds.length, batchSize, concurrency }, "Starting metadata stream");
 
   // Generator for a single root – yields MetadataBatch items.
   async function* streamRoot(rootId: string): AsyncGenerator<MetadataBatch> {
@@ -1063,8 +1073,14 @@ export async function* streamCachedImageMetadataByRootIds(
 
       const queryMs = Date.now() - queryStartMs;
       if (rows.length === 0) {
-        console.info(
-          `[streamMetadata] root=${rootId} done totalRows=${rootProcessed} queryMs=${queryMs} rootElapsedMs=${Date.now() - rootStartMs}`,
+        logger.info(
+          {
+            rootId,
+            totalRows: rootProcessed,
+            queryMs,
+            rootElapsedMs: Date.now() - rootStartMs,
+          },
+          "Metadata root stream complete",
         );
         break;
       }
@@ -1074,8 +1090,9 @@ export async function* streamCachedImageMetadataByRootIds(
       globalProcessed += rows.length;
       const isLastForRoot = rows.length < batchSize;
 
-      console.info(
-        `[streamMetadata] root=${rootId} batch offset=${offset} rows=${rows.length} rootProcessed=${rootProcessed} globalProcessed=${globalProcessed} queryMs=${queryMs}`,
+      logger.info(
+        { rootId, offset, rows: rows.length, rootProcessed, globalProcessed, queryMs },
+        "Metadata batch loaded",
       );
 
       yield {
@@ -1110,9 +1127,7 @@ export async function* streamCachedImageMetadataByRootIds(
     if (lastBatch) {
       yield { ...lastBatch, isLast: true };
     }
-    console.info(
-      `[streamMetadata] stream complete totalProcessed=${globalProcessed} elapsedMs=${Date.now() - startMs}`,
-    );
+    logger.info({ totalProcessed: globalProcessed, elapsedMs: Date.now() - startMs }, "Metadata stream complete");
     return;
   }
 
@@ -1140,7 +1155,7 @@ export async function* streamCachedImageMetadataByRootIds(
         notifyQueue();
       }
     } catch (error) {
-      console.error(`[streamMetadata] root=${rootId} error`, error);
+      logger.error({ rootId, err: error }, "Metadata root stream failed");
     } finally {
       activeGenerators -= 1;
       if (activeGenerators === 0 && allSpawned) {
@@ -1198,9 +1213,7 @@ export async function* streamCachedImageMetadataByRootIds(
     yield { ...lastBatch, isLast: true };
   }
 
-  console.info(
-    `[streamMetadata] stream complete totalProcessed=${globalProcessed} elapsedMs=${Date.now() - startMs}`,
-  );
+  logger.info({ totalProcessed: globalProcessed, elapsedMs: Date.now() - startMs }, "Metadata stream complete");
 }
 
 export async function queryCachedImagesByRootIds(

@@ -12,8 +12,10 @@ import {
   triggerPromptStatisticsRefresh,
 } from "@/lib/prompt-statistics-cache";
 import type { BackgroundService, ServiceContext, ServiceHealth } from "@/lib/workers/worker-types";
+import { getLogger } from "../../logger";
 
 const SERVICE_NAME = "stats-worker";
+const logger = getLogger({ service: SERVICE_NAME });
 
 // How long to wait after a scan completes before recomputing stats.
 const RECOMPUTE_DEBOUNCE_MS = 3_000;
@@ -56,8 +58,9 @@ export async function computePromptStatistics(requestId: string): Promise<Prompt
     );
   }
 
-  console.info(
-    `[stats-worker] ${requestId} computed in ${Date.now() - loaderStartedAt}ms (totalImages=${finalized.totalImages})`,
+  logger.info(
+    { requestId, elapsedMs: Date.now() - loaderStartedAt, totalImages: finalized.totalImages },
+    "Prompt statistics computed",
   );
 
   return finalized;
@@ -101,7 +104,7 @@ export class StatsWorkerService implements BackgroundService {
     this.stoppedAt = nowIso();
     this.clearDebounceTimer();
     this.ctx = null;
-    console.info(`[stats-worker] stopped`);
+    logger.info("Stats worker stopped");
   }
 
   health(): ServiceHealth {
@@ -148,17 +151,17 @@ export class StatsWorkerService implements BackgroundService {
 
     // Skip if already computing or if cache is still fresh.
     if (snapshot.isProcessing) {
-      console.info(`[stats-worker] recompute skipped (reason=${reason}): already processing`);
+      logger.info({ reason }, "Recompute skipped because a run is already in progress");
       return;
     }
 
     if (snapshot.isFresh && reason !== "startup") {
-      console.info(`[stats-worker] recompute skipped (reason=${reason}): cache still fresh`);
+      logger.info({ reason }, "Recompute skipped because cache is still fresh");
       return;
     }
 
     const requestId = `sw:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 7)}`;
-    console.info(`[stats-worker] starting recompute (reason=${reason}, requestId=${requestId})`);
+    logger.info({ reason, requestId }, "Starting recompute");
 
     const refresh = triggerPromptStatisticsRefresh(
       () => computePromptStatistics(requestId),
@@ -170,10 +173,10 @@ export class StatsWorkerService implements BackgroundService {
       void refresh.promise
         .then(() => {
           this.lastComputedAt = nowIso();
-          console.info(`[stats-worker] recompute complete (requestId=${requestId})`);
+          logger.info({ requestId }, "Recompute complete");
         })
         .catch((error) => {
-          console.error(`[stats-worker] recompute failed (requestId=${requestId})`, error);
+          logger.error({ requestId, err: error }, "Recompute failed");
         });
     }
   }

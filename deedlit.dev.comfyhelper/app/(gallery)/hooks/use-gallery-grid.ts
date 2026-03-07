@@ -6,6 +6,8 @@ import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState }
 const MIN_GALLERY_CARD_WIDTH_REM = 16; // 256px at the default 16px root font size — keeps phones at 1 column
 /** Approximate row height in rem used to size the top spacer when items are trimmed off the top. */
 const ESTIMATED_ROW_HEIGHT_REM = 18.75; // ~300px at the default 16px root font size
+/** Below this width, prefer automatic clamping so phones and narrow tablets do not get unusably tiny tiles. */
+const NARROW_LAYOUT_BREAKPOINT_PX = 768;
 
 function remToPx(rem: number): number {
   if (typeof document === "undefined") return rem * 16;
@@ -47,6 +49,14 @@ export function useGalleryGrid(
   const effectiveGalleryColumns = useMemo(() => {
     const configured = Math.max(1, Math.min(galleryColumns, 12));
     if (galleryContainerWidth <= 0) return configured;
+
+    // The configured column count is intended to control the desktop gallery layout.
+    // Only clamp aggressively on narrower layouts where fixed desktop counts would
+    // collapse tiles into unreadably small cells.
+    if (galleryContainerWidth >= NARROW_LAYOUT_BREAKPOINT_PX) {
+      return configured;
+    }
+
     const minCardWidthPx = remToPx(MIN_GALLERY_CARD_WIDTH_REM);
     const maxByWidth = Math.max(1, Math.floor(galleryContainerWidth / minCardWidthPx));
     return Math.min(configured, maxByWidth);

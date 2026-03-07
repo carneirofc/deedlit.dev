@@ -10,9 +10,12 @@ import {
   triggerPromptStatisticsRefresh,
 } from "@/lib/prompt-statistics-cache";
 import { computePromptStatistics } from "@/lib/workers/services/stats-worker-service";
+import { getLogger } from "../../../lib/logger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const logger = getLogger({ route: "api/stats" });
 
 // ---------------------------------------------------------------------------
 // Shared helper: resolve the current (or freshly computed) statistics.
@@ -94,7 +97,7 @@ export async function GET(request: Request) {
             );
           }
         } catch (err) {
-          console.error("[api/stats] streaming error", err);
+          logger.error({ err }, "Streaming request failed");
           if (!closed) {
             sendMessage(
               StatsErrorMessageSchema.parse({
@@ -150,7 +153,7 @@ export async function GET(request: Request) {
       { status: statusCode },
     );
   } catch (error) {
-    console.error("[api/stats] request failed", error);
+    logger.error({ err: error }, "Snapshot request failed");
     return errorJson("Failed to load prompt statistics.", 500);
   }
 }

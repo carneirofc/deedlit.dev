@@ -9,7 +9,6 @@ import {
   StartScanResponseSchema,
 } from "@/lib/contracts/api";
 import { errorJson, jsonWithSchema, zodErrorMessage } from "@/lib/http/route-response";
-import { getSettings, listRoots } from "@/lib/config-store";
 import {
   countCachedImagesByRootIds,
   getLatestCompletedScanTime,
@@ -20,9 +19,12 @@ import {
 } from "@/lib/image-cache-store";
 import { loadVisibleImagesRouteContext, loadVisibleRootsContext } from "@/lib/http/route-context";
 import type { ScanResult } from "@/lib/library-types";
+import { getLogger } from "../../../lib/logger";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const logger = getLogger({ route: "api/images" });
 
 function withoutMetadata(images: ScanResult["images"]): ScanResult["images"] {
   return images.map((image) => ({
@@ -94,7 +96,7 @@ export async function GET(request: Request) {
 
     return jsonWithSchema(ImagesResponseSchema, response);
   } catch (error) {
-    console.error("[api/images] GET failed", error);
+    logger.error({ err: error }, "GET failed");
     if (error instanceof ZodError) {
       return errorJson(zodErrorMessage(error, "Invalid query string."), 400);
     }
@@ -112,7 +114,7 @@ export async function POST(request: Request) {
     const { job, started } = await startAsyncLibraryScan(roots, { force: body?.force === true });
     return jsonWithSchema(StartScanResponseSchema, { job, started }, { status: started ? 202 : 200 });
   } catch (error) {
-    console.error("[api/images] POST failed", error);
+    logger.error({ err: error }, "POST failed");
     if (error instanceof ZodError) {
       return errorJson(zodErrorMessage(error, "Invalid request body."), 400);
     }
@@ -133,7 +135,7 @@ export async function DELETE(request: Request) {
 
     return jsonWithSchema(DeleteCachedImageResponseSchema, { deleted: true });
   } catch (error) {
-    console.error("[api/images] DELETE failed", error);
+    logger.error({ err: error }, "DELETE failed");
     if (error instanceof ZodError) {
       return errorJson(zodErrorMessage(error, "Invalid request body."), 400);
     }

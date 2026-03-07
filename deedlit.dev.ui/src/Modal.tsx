@@ -1,6 +1,15 @@
 "use client";
 
-import { forwardRef, type MouseEvent, type ReactNode, useEffect, useId } from "react";
+import {
+  forwardRef,
+  type ForwardedRef,
+  type MouseEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+} from "react";
 import { createPortal } from "react-dom";
 
 import { cn, SPACING_PATTERNS, BORDER_PATTERNS } from "./utils";
@@ -34,6 +43,17 @@ const SIZE_CLASS_NAMES: Record<ModalSize, string> = {
   full: "max-w-[96vw]",
 };
 
+function assignForwardedRef<T>(ref: ForwardedRef<T>, value: T | null): void {
+  if (typeof ref === "function") {
+    ref(value);
+    return;
+  }
+
+  if (ref) {
+    (ref as { current: T | null }).current = value;
+  }
+}
+
 const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
   open,
   onClose,
@@ -54,6 +74,15 @@ const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
 }, ref) {
   const titleId = useId();
   const descriptionId = useId();
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const setPanelRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      panelRef.current = node;
+      assignForwardedRef(ref, node);
+    },
+    [ref],
+  );
 
   useEffect(() => {
     if (!open || !closeOnEscape) return;
@@ -89,6 +118,33 @@ const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
     };
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      const panelNode = panelRef.current;
+      if (!panelNode) return;
+
+      const explicitPrimaryAction = panelNode.querySelector<HTMLElement>(
+        "[data-modal-primary-action='true']:not([disabled])",
+      );
+      const explicitAutofocus = panelNode.querySelector<HTMLElement>("[autofocus]:not([disabled])");
+      const footerButtons = Array.from(
+        panelNode.querySelectorAll<HTMLButtonElement>("[data-modal-footer] button:not([disabled])"),
+      );
+      const bodyButtons = Array.from(panelNode.querySelectorAll<HTMLButtonElement>("button:not([disabled])")).filter(
+        (button) => !button.closest("[data-modal-header]"),
+      );
+
+      const focusTarget =
+        explicitPrimaryAction ?? explicitAutofocus ?? footerButtons.at(-1) ?? bodyButtons.at(-1) ?? null;
+
+      focusTarget?.focus();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [open]);
+
   if (!open) return null;
   if (typeof document === "undefined") return null;
 
@@ -108,30 +164,33 @@ const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
       aria-labelledby={title ? titleId : undefined}
       aria-describedby={description ? descriptionId : undefined}
       className={cn(
-        "fixed inset-0 z-[130] flex items-center justify-center bg-[color:var(--ui-overlay-strong)] p-4",
+        "fixed inset-0 z-130 flex items-center justify-center bg-ui-overlay-strong p-4",
         overlayClassName,
       )}
       onClick={handleOverlayClick}
     >
       <div
-        ref={ref}
+        ref={setPanelRef}
         className={cn(
-          "flex max-h-full w-full flex-col overflow-hidden rounded-2xl border-ui-modal bg-[color:var(--ui-bg-card)] shadow-[var(--ui-shadow-strong)]",
+          "flex max-h-full w-full flex-col overflow-hidden rounded-2xl border-ui-modal bg-ui-bg-card shadow-ui-strong",
           SIZE_CLASS_NAMES[size],
           className,
         )}
         onClick={(event) => event.stopPropagation()}
       >
         {title || description || showCloseButton ? (
-          <div className={cn("flex items-start justify-between gap-3", BORDER_PATTERNS.bottomFaint, SPACING_PATTERNS.dialogSectionResponsive)}>
+          <div
+            data-modal-header="true"
+            className={cn("flex items-start justify-between gap-3", BORDER_PATTERNS.bottomFaint, SPACING_PATTERNS.dialogSectionResponsive)}
+          >
             <div>
               {title ? (
-                <h2 id={titleId} className="text-ui-lg font-semibold text-[color:var(--ui-ink-strong)]">
+                <h2 id={titleId} className="text-ui-lg font-semibold text-ui-ink-strong">
                   {title}
                 </h2>
               ) : null}
               {description ? (
-                <p id={descriptionId} className="mt-1 text-ui-sm text-[color:var(--ui-ink-subtle)]">
+                <p id={descriptionId} className="mt-1 text-ui-sm text-ui-ink-subtle">
                   {description}
                 </p>
               ) : null}
@@ -142,7 +201,7 @@ const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
                 aria-label={closeLabel}
                 title={closeLabel}
                 onClick={onClose}
-                className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-ui-soft text-[color:var(--ui-ink-subtle)] transition hover:bg-[color:var(--ui-bg-soft)] hover:text-[color:var(--ui-ink-strong)] active:scale-95"
+                className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-ui-soft text-ui-ink-subtle transition hover:bg-ui-bg-soft hover:text-ui-ink-strong active:scale-95"
               >
                 <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M18 6L6 18" />
@@ -157,7 +216,9 @@ const Modal = forwardRef<HTMLDivElement, ModalProps>(function Modal({
         <div className={cn("min-h-0 flex-1 overflow-auto p-4 sm:p-5", contentClassName)}>{children}</div>
 
         {footer ? (
-          <div className={cn(BORDER_PATTERNS.topFaint, SPACING_PATTERNS.dialogSectionResponsive)}>{footer}</div>
+          <div data-modal-footer="true" className={cn(BORDER_PATTERNS.topFaint, SPACING_PATTERNS.dialogSectionResponsive)}>
+            {footer}
+          </div>
         ) : null}
       </div>
     </div>,

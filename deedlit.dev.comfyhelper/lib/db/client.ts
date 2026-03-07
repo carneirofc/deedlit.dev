@@ -4,11 +4,13 @@ import path from "node:path";
 
 import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
 import { PrismaClient } from "@/lib/generated/prisma/client";
+import { getLogger } from "../logger";
 
 const DATA_DIRECTORY = path.join(process.cwd(), "data");
 const DATABASE_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db");
 const DATABASE_BACKUP_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db.migrate-backup");
 const DATABASE_RELATIVE_PATH = path.join("data", "comfyhelper.db");
+const logger = getLogger({ scope: "prisma" });
 
 mkdirSync(DATA_DIRECTORY, { recursive: true });
 
@@ -83,7 +85,7 @@ function enableWalOnConnect(client: PrismaClient): void {
         await client.$executeRawUnsafe("PRAGMA wal_autocheckpoint = 1000");
       } catch (err) {
         // Non-fatal — the database will still work, just without the optimizations.
-        console.warn("[prisma] failed to set SQLite pragmas:", err instanceof Error ? err.message : err);
+        logger.warn({ err }, "Failed to set SQLite pragmas");
       }
     })
     .catch(() => {
@@ -96,7 +98,7 @@ function enableWalOnConnect(client: PrismaClient): void {
 // client opens the database file.
 export const prisma = new Proxy({} as PrismaClient, {
   get(_target, property, receiver) {
-    const client = getOrCreatePrismaClient() as Record<PropertyKey, unknown>;
+    const client = getOrCreatePrismaClient() as unknown as Record<PropertyKey, unknown>;
     const value = Reflect.get(client, property, receiver);
     return typeof value === "function" ? value.bind(getOrCreatePrismaClient()) : value;
   },
@@ -132,12 +134,9 @@ async function runDatabaseMigration(): Promise<void> {
   if (dbExists) {
     try {
       copyFileSync(DATABASE_PATH, DATABASE_BACKUP_PATH);
-      console.info("[prisma] database backup created:", DATABASE_BACKUP_PATH);
+      logger.info({ backupPath: DATABASE_BACKUP_PATH }, "Database backup created");
     } catch (backupErr) {
-      console.warn(
-        "[prisma] could not create pre-migration backup (proceeding anyway):",
-        backupErr instanceof Error ? backupErr.message : backupErr,
-      );
+      logger.warn({ err: backupErr }, "Could not create pre-migration backup");
     }
   }
 
@@ -162,12 +161,11 @@ async function runDatabaseMigration(): Promise<void> {
     if (dbExists && existsSync(DATABASE_BACKUP_PATH)) {
       try {
         renameSync(DATABASE_BACKUP_PATH, DATABASE_PATH);
-        console.error("[prisma] migration failed — database restored from backup.");
+        logger.error("Migration failed; database restored from backup");
       } catch (restoreErr) {
-        console.error(
-          "[prisma] migration failed AND restore failed — manual recovery may be needed.",
-          "Backup is at:", DATABASE_BACKUP_PATH,
-          restoreErr instanceof Error ? restoreErr.message : restoreErr,
+        logger.error(
+          { err: restoreErr, backupPath: DATABASE_BACKUP_PATH },
+          "Migration failed and restore failed; manual recovery may be needed",
         );
       }
     }

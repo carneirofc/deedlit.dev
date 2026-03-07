@@ -75,7 +75,7 @@ export function useEventHub() {
     // Instead of patching the query cache on every event (triggering full UI re-renders
     // including tag enrichment, path tree rebuilds, and tag count recomputation),
     // we buffer incoming images and flush them in a single cache update.
-    const GALLERY_FLUSH_INTERVAL_MS = 1500;
+    const GALLERY_FLUSH_INTERVAL_MS = 500;
     let pendingChangedImages: ImageRecord[] = [];
     let pendingRemovedIds: string[] = [];
     let galleryFlushTimer: ReturnType<typeof setTimeout> | null = null;

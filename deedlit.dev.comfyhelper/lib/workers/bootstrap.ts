@@ -6,7 +6,7 @@ declare global {
 }
 
 const WORKER_DEFAULTS = {
-  fileWatcherPollIntervalMs: 30_000,
+  fileWatcherPollIntervalMs: 5_000,
   scanDebounceMs: 5_000,
   scanCooldownMs: 15_000,
 } as const;

@@ -93,3 +93,5 @@ Prompt templates are included in `prompts/`:
 - Image file access is restricted to configured roots via the API layer.
 - Metadata parsing errors are shown per image card rather than breaking the scan.
 - SQLite database file is created at `data/comfyhelper.db` on first run.
+- Server-side logs use `pino`, with `pino-pretty` enabled automatically outside production.
+- Override verbosity with `LOG_LEVEL` when starting the app.

@@ -2,6 +2,7 @@ import type { ImageRecord, PromptStatistics, TagMetric } from "@/lib/library-typ
 import { type PromptInsights, extractPromptInsightsFromMetadata } from "@/lib/metadata-insights";
 import { extractTagsFromPrompt } from "@/lib/prompt-tags";
 import { nowIsoDateTime } from "@/lib/time-utils";
+import { getLogger } from "./logger";
 
 export { extractPromptInsightsFromMetadata };
 
@@ -219,10 +220,9 @@ export async function* streamPromptStatistics(
     excludedTags: options?.excludedTags,
   });
   const startMs = Date.now();
+  const logger = getLogger({ scope: "streamStats" });
 
-  console.info(
-    `[streamStats] starting streaming statistics accumulation`,
-  );
+  logger.info("Starting streaming statistics accumulation");
 
   for await (const batch of metadataStream) {
     const batchStartMs = Date.now();
@@ -230,15 +230,29 @@ export async function* streamPromptStatistics(
     const accMs = Date.now() - batchStartMs;
     const elapsedMs = Date.now() - startMs;
 
-    console.info(
-      `[streamStats] batch accumulated root=${batch.rootId} batchRows=${count} totalImages=${accumulator.totalImages} uniquePosTags=${accumulator.positiveTagCounts.size} accMs=${accMs} elapsedMs=${elapsedMs}`,
+    logger.info(
+      {
+        rootId: batch.rootId,
+        batchRows: count,
+        totalImages: accumulator.totalImages,
+        uniquePosTags: accumulator.positiveTagCounts.size,
+        accMs,
+        elapsedMs,
+      },
+      "Statistics batch accumulated",
     );
 
     const snapshot = finalizePromptStatistics(accumulator);
 
     if (batch.isLast) {
-      console.info(
-        `[streamStats] stream complete totalImages=${snapshot.totalImages} uniquePosTags=${snapshot.uniquePositiveTags} uniqueNegTags=${snapshot.uniqueNegativeTags} elapsedMs=${elapsedMs}`,
+      logger.info(
+        {
+          totalImages: snapshot.totalImages,
+          uniquePosTags: snapshot.uniquePositiveTags,
+          uniqueNegTags: snapshot.uniqueNegativeTags,
+          elapsedMs,
+        },
+        "Statistics stream complete",
       );
       yield {
         type: "complete",
@@ -264,7 +278,7 @@ export async function* streamPromptStatistics(
 
   // Edge case: empty stream
   if (accumulator.totalImages === 0) {
-    console.info(`[streamStats] stream was empty, yielding zero-image stats`);
+    logger.info("Statistics stream was empty; yielding zero-image stats");
     yield {
       type: "complete",
       stats: finalizePromptStatistics(accumulator),
