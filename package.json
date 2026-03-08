@@ -13,7 +13,9 @@
     "build:comfyhelper": "npm run build:ui && npm run build -w deedlit.dev.comfyhelper",
     "build": "npm run build:ui && npm run build -w deedlit.dev && npm run build -w deedlit.dev.comfyhelper",
     "dev:dev": "npm run dev -w deedlit.dev",
-    "dev:comfyhelper": "npm run dev -w deedlit.dev.comfyhelper"
+    "dev:comfyhelper": "npm run dev -w deedlit.dev.comfyhelper",
+    "start:dev": "npm run start -w deedlit.dev",
+    "start:comfyhelper": "npm run start -w deedlit.dev.comfyhelper"
   }
 }
 
