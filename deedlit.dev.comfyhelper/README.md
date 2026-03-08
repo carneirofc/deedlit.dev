@@ -47,6 +47,16 @@ npm install
 npm run dev
 ```
 
+Runtime storage defaults to `H:\local-apps\deedlit.dev.comfyhelper\dev` during development and
+`H:\local-apps\deedlit.dev.comfyhelper\live` in production.
+
+Override the storage layout with environment variables:
+
+```bash
+$env:COMFYHELPER_STORAGE_BASE_DIR = 'H:\local-apps'
+$env:COMFYHELPER_STORAGE_PROFILE = 'dev'
+```
+
 Then open `http://localhost:3000`.
 - Gallery: `http://localhost:3000`
 - Admin panel: `http://localhost:3000/admin`
@@ -92,6 +102,7 @@ Prompt templates are included in `prompts/`:
 - This app is intended for local/self-hosted use.
 - Image file access is restricted to configured roots via the API layer.
 - Metadata parsing errors are shown per image card rather than breaking the scan.
-- SQLite database file is created at `data/comfyhelper.db` on first run.
+- SQLite database file is created under `H:\local-apps\deedlit.dev.comfyhelper\dev|live\data\comfyhelper.db` by default.
+- App-owned trash storage defaults to `H:\local-apps\deedlit.dev.comfyhelper\dev|live\trash` unless overridden in settings or via `COMFYHELPER_TRASHCAN_DIR`.
 - Server-side logs use `pino`, with `pino-pretty` enabled automatically outside production.
 - Override verbosity with `LOG_LEVEL` when starting the app.

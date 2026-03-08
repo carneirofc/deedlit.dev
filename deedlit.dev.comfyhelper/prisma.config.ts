@@ -1,7 +1,9 @@
 import path from "node:path";
 import { defineConfig } from "prisma/config";
+import { getStorageConfig } from "./lib/storage-paths";
 
-const DATABASE_PATH = path.join("data", "comfyhelper.db");
+const storageConfig = getStorageConfig();
+const DATABASE_PATH = storageConfig.databasePath;
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -9,6 +11,6 @@ export default defineConfig({
     path: "prisma/migrations",
   },
   datasource: {
-    url: `file:${DATABASE_PATH}`,
+    url: `file:${path.resolve(DATABASE_PATH)}`,
   },
 });

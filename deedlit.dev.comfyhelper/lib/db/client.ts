@@ -5,11 +5,13 @@ import path from "node:path";
 import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
 import { PrismaClient } from "@/lib/generated/prisma/client";
 import { getLogger } from "../logger";
+import { getStorageConfig } from "@/lib/storage-paths";
 
-const DATA_DIRECTORY = path.join(process.cwd(), "data");
-const DATABASE_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db");
-const DATABASE_BACKUP_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db.migrate-backup");
-const DATABASE_RELATIVE_PATH = path.join("data", "comfyhelper.db");
+const storageConfig = getStorageConfig();
+const DATA_DIRECTORY = storageConfig.dataDirectory;
+const DATABASE_PATH = storageConfig.databasePath;
+const DATABASE_BACKUP_PATH = storageConfig.databaseBackupPath;
+const DATABASE_RELATIVE_PATH = storageConfig.databaseDisplayPath;
 const PRISMA_CONFIG_RELATIVE_PATH = "prisma.config.ts";
 const logger = getLogger({ scope: "prisma" });
 
@@ -112,6 +114,8 @@ export function getDatabasePathInfo() {
   return {
     absolutePath: DATABASE_PATH,
     relativePath: DATABASE_RELATIVE_PATH,
+    baseDirectory: storageConfig.baseDirectory,
+    profile: storageConfig.profile,
   };
 }
 

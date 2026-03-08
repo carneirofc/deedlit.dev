@@ -10,7 +10,6 @@
     "build:ui": "npm run build --prefix ../deedlit.dev.ui",
     "dev": "next dev",
     "build": "npm run build:ui && prisma generate && next build",
-    "postbuild": "node ./scripts/prepare-standalone.mjs",
     "start": "next start",
     "lint": "eslint",
     "test:unit": "playwright test -c playwright.unit.config.ts",

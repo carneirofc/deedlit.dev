@@ -10,6 +10,7 @@ import { tryParseJson } from "@/lib/json-utils";
 import { normalizeExcludedTags } from "@/lib/prompt-tags";
 import { AppSettingsSchema, RootDirectorySchema } from "@/lib/schemas";
 import { nowIsoDateTime, nowMs, toIsoDateTime } from "@/lib/time-utils";
+import { getStorageConfig } from "@/lib/storage-paths";
 
 const DEFAULT_GALLERY_COLUMNS = 7;
 const DEFAULT_GALLERY_IMAGE_LIMIT = 10000;
@@ -310,17 +311,19 @@ export async function getTrashcanDirectory(): Promise<string | null> {
     return path.resolve(envConfiguredPath);
   }
 
+  const storageConfig = getStorageConfig();
+
   const row = await prisma.appSetting.findUnique({
     where: { key: TRASHCAN_DIRECTORY_SETTING_KEY },
     select: { value: true },
   });
   if (!row) {
-    return null;
+    return storageConfig.trashDirectory;
   }
 
   const configuredPath = row.value.trim();
   if (!configuredPath) {
-    return null;
+    return storageConfig.trashDirectory;
   }
 
   return path.resolve(configuredPath);

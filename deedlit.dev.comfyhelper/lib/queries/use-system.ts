@@ -12,6 +12,8 @@ export type SystemInfo = {
     relativePath: string;
     absolutePath: string;
     fileSizeBytes: number | null;
+    baseDirectory: string;
+    profile: "dev" | "live";
   } | null;
   database: {
     tableRows: { rootDirectories: number; appSettings: number; imageCache: number; scanJobs: number };

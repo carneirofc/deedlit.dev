@@ -155,6 +155,8 @@ export const SystemInfoResponseSchema = z.object({
     relativePath: z.string(),
     absolutePath: z.string(),
     fileSizeBytes: z.number().int().nonnegative().nullable(),
+    baseDirectory: z.string(),
+    profile: z.enum(["dev", "live"]),
   }),
   database: z.object({
     tableRows: z.object({

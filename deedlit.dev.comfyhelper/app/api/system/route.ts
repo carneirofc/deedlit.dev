@@ -40,6 +40,8 @@ export async function GET() {
         relativePath: pathInfo.relativePath,
         absolutePath: pathInfo.absolutePath,
         fileSizeBytes,
+        baseDirectory: pathInfo.baseDirectory,
+        profile: pathInfo.profile,
       },
       database: {
         tableRows: {

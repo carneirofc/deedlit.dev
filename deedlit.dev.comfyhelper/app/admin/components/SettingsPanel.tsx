@@ -10,6 +10,8 @@ type SqliteInfo = {
   relativePath: string;
   absolutePath: string;
   fileSizeBytes: number | null;
+  baseDirectory: string;
+  profile: "dev" | "live";
 } | null;
 
 type DatabaseInfo = {
@@ -100,10 +102,12 @@ export default function SettingsPanel({
         <SurfacePanel className="min-w-0" padding="lg">
           <PanelSectionHeader
             title="Storage"
-            description="Where admin state is stored and how much persisted data is currently tracked."
+            description="Where app-owned runtime data is stored and how much persisted data is currently tracked."
           />
           <div className="mt-3 space-y-2">
-            <DetailRow label="Relative path" value={sqliteInfo?.relativePath ?? "data/comfyhelper.db"} />
+            <DetailRow label="Storage base" value={sqliteInfo?.baseDirectory ?? "H:\\local-apps"} />
+            <DetailRow label="Storage profile" value={sqliteInfo?.profile ?? "dev"} />
+            <DetailRow label="Database path" value={sqliteInfo?.relativePath ?? "deedlit.dev.comfyhelper\\dev\\data\\comfyhelper.db"} />
             <div className="space-y-1 text-(--admin-muted) text-ui-xs">
               <p className="text-ui-ink-subtle">Absolute path</p>
               <p className="min-w-0 break-all text-ui-ink">{sqliteInfo?.absolutePath ?? "Unavailable"}</p>
@@ -184,9 +188,12 @@ export default function SettingsPanel({
             name="trashcanDirectory"
             value={trashcanDirectoryInput}
             onChange={(event) => onTrashcanDirectoryInputChange(event.target.value)}
-            placeholder="C:\\ComfyUI\\output\\_trash"
+            placeholder="Uses storage profile trash directory by default"
             className="mt-2 w-full"
           />
+          <p className="mt-2 text-ui-xs text-ui-ink-subtle">
+            Leave empty to use the default profile trash folder under the configured storage base directory.
+          </p>
         </SurfacePanel>
 
         <SurfacePanel className="min-w-0" padding="lg">
