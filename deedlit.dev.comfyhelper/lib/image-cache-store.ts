@@ -90,6 +90,16 @@ const imageDetailSelect = {
   metadataJson: true,
 } satisfies Prisma.ImageCacheSelect;
 
+const metadataBatchOrderBy = [
+  { modifiedAtMs: "desc" },
+  { id: "desc" },
+] satisfies Prisma.ImageCacheOrderByWithRelationInput[];
+
+type ImageCacheMetadataCursor = {
+  modifiedAtMs: number;
+  id: string;
+};
+
 function getScanCoordinator(): GlobalScanCoordinator {
   if (!globalThis.__comfyhelperScanCoordinator) {
     globalThis.__comfyhelperScanCoordinator = { runningJobId: null };
@@ -127,6 +137,29 @@ function parseMetadata(raw: string | null): unknown {
 
 function parsePromptSummary(raw: string | null | undefined): PromptSummary | undefined {
   return tryParseJsonWithSchema(raw, PromptSummarySchema);
+}
+
+function buildMetadataCursorWhere(
+  baseWhere: Prisma.ImageCacheWhereInput,
+  cursor?: ImageCacheMetadataCursor,
+): Prisma.ImageCacheWhereInput {
+  if (!cursor) {
+    return baseWhere;
+  }
+
+  return {
+    AND: [
+      baseWhere,
+      {
+        OR: [
+          { modifiedAtMs: { lt: cursor.modifiedAtMs } },
+          {
+            AND: [{ modifiedAtMs: cursor.modifiedAtMs }, { id: { lt: cursor.id } }],
+          },
+        ],
+      },
+    ],
+  };
 }
 
 function toPromptSummaryJson(metadata: unknown): string {
@@ -964,21 +997,22 @@ export async function forEachCachedImageMetadataByRootIds(
 
   const batchSize = clampBatchSize(options?.batchSize);
   const yieldEveryRows = clampYieldEveryRows(options?.yieldEveryRows);
-  let offset = 0;
   let processed = 0;
+  let cursor: ImageCacheMetadataCursor | undefined;
 
   while (true) {
     const rows = await prisma.imageCache.findMany({
-      where: { rootId: { in: rootIds } },
-      select: { metadataJson: true },
-      orderBy: { modifiedAtMs: "desc" },
+      where: buildMetadataCursorWhere({ rootId: { in: rootIds } }, cursor),
+      select: { id: true, modifiedAtMs: true, metadataJson: true },
+      orderBy: metadataBatchOrderBy,
       take: batchSize,
-      skip: offset,
     });
 
     if (rows.length === 0) {
       break;
     }
+
+    const batchOffset = processed;
 
     for (const row of rows) {
       await visitor(parseMetadata(row.metadataJson ?? null));
@@ -993,14 +1027,16 @@ export async function forEachCachedImageMetadataByRootIds(
       await options.onBatchProcessed({
         rowsInBatch: rows.length,
         processedTotal: processed,
-        offset,
+        offset: batchOffset,
       });
     }
 
     if (rows.length < batchSize) {
       break;
     }
-    offset += rows.length;
+
+    const lastRow = rows[rows.length - 1];
+    cursor = { id: lastRow.id, modifiedAtMs: lastRow.modifiedAtMs };
   }
 
   return processed;
@@ -1057,18 +1093,17 @@ export async function* streamCachedImageMetadataByRootIds(
 
   // Generator for a single root – yields MetadataBatch items.
   async function* streamRoot(rootId: string): AsyncGenerator<MetadataBatch> {
-    let offset = 0;
     let rootProcessed = 0;
+    let cursor: ImageCacheMetadataCursor | undefined;
     const rootStartMs = Date.now();
 
     while (true) {
       const queryStartMs = Date.now();
       const rows = await prisma.imageCache.findMany({
-        where: { rootId },
-        select: { metadataJson: true },
-        orderBy: { modifiedAtMs: "desc" },
+        where: buildMetadataCursorWhere({ rootId }, cursor),
+        select: { id: true, modifiedAtMs: true, metadataJson: true },
+        orderBy: metadataBatchOrderBy,
         take: batchSize,
-        skip: offset,
       });
 
       const queryMs = Date.now() - queryStartMs;
@@ -1086,6 +1121,7 @@ export async function* streamCachedImageMetadataByRootIds(
       }
 
       const items = rows.map((row) => parseMetadata(row.metadataJson ?? null));
+  const offset = rootProcessed;
       rootProcessed += rows.length;
       globalProcessed += rows.length;
       const isLastForRoot = rows.length < batchSize;
@@ -1108,7 +1144,9 @@ export async function* streamCachedImageMetadataByRootIds(
       if (isLastForRoot) {
         break;
       }
-      offset += rows.length;
+
+      const lastRow = rows[rows.length - 1];
+      cursor = { id: lastRow.id, modifiedAtMs: lastRow.modifiedAtMs };
 
       // Yield to event loop between batches
       await yieldToEventLoop();

@@ -86,6 +86,8 @@ function enableWalOnConnect(client: PrismaClient): void {
         await client.$executeRawUnsafe("PRAGMA mmap_size = 268435456");
         // Coalesce small writes into a single fsync (safe with WAL)
         await client.$executeRawUnsafe("PRAGMA wal_autocheckpoint = 1000");
+        // Ask SQLite to refresh planner statistics opportunistically.
+        await client.$executeRawUnsafe("PRAGMA optimize");
       } catch (err) {
         // Non-fatal — the database will still work, just without the optimizations.
         logger.warn({ err }, "Failed to set SQLite pragmas");
