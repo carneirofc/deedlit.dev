@@ -40,6 +40,16 @@ async function main() {
     path.join(projectRoot, "public"),
     path.join(standaloneAppRoot, "public"),
   );
+
+  await copyIfPresent(
+    path.join(projectRoot, "prisma"),
+    path.join(standaloneAppRoot, "prisma"),
+  );
+
+  await copyIfPresent(
+    path.join(projectRoot, "prisma.config.ts"),
+    path.join(standaloneAppRoot, "prisma.config.ts"),
+  );
 }
 
 main().catch((error) => {

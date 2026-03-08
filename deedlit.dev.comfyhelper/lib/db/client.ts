@@ -10,6 +10,7 @@ const DATA_DIRECTORY = path.join(process.cwd(), "data");
 const DATABASE_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db");
 const DATABASE_BACKUP_PATH = path.join(DATA_DIRECTORY, "comfyhelper.db.migrate-backup");
 const DATABASE_RELATIVE_PATH = path.join("data", "comfyhelper.db");
+const PRISMA_CONFIG_RELATIVE_PATH = "prisma.config.ts";
 const logger = getLogger({ scope: "prisma" });
 
 mkdirSync(DATA_DIRECTORY, { recursive: true });
@@ -141,7 +142,7 @@ async function runDatabaseMigration(): Promise<void> {
   }
 
   try {
-    execSync("npx prisma migrate deploy", {
+    execSync(`npx prisma migrate deploy --config ${PRISMA_CONFIG_RELATIVE_PATH}`, {
       cwd: process.cwd(),
       stdio: "pipe",
       env: {
