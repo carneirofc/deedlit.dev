@@ -28,6 +28,16 @@
 - Run comfyhelper: `npm run dev:comfyhelper`
 - Build all workspaces: `npm run build`
 
+## Commit Convention
+
+All commits must follow **[Conventional Commits](https://www.conventionalcommits.org/)**:
+
+```
+<type>(optional scope): <description>
+```
+
+Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `style`, `perf`.
+
 ## Instruction Layout
 - Root `.github/copilot-instructions.md` contains shared monorepo rules.
 - Each package has its own `.github/copilot-instructions.md` for local architecture.
