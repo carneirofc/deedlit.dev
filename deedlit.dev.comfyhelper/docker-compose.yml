@@ -99,6 +99,24 @@ services:
       timeout: 5s
       retries: 20
 
+  # deedlit.metadata: stateless PNG metadata extraction (A1111 / ComfyUI).
+  # No DB, no GPU. Ingest sends image bytes to POST /extract instead of parsing
+  # metadata in-process. Listens on 8000 in-container; mapped to host 8005 so the
+  # local-dev default (METADATA_API_URL=http://localhost:8005) works unchanged.
+  metadata:
+    profiles: ["metadata", "vision", "app", "full"]
+    build:
+      context: ../deedlit.metadata
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8005:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # deedlit.vision: CLIP embedding API (ViT-H-14 / ViT-bigG-14).
   # Requires NVIDIA GPU + nvidia-container-toolkit.
   # Set COMFYUI_ROOT_HOST to the absolute path of your ComfyUI installation so
@@ -168,9 +186,11 @@ services:
       OBJECT_STORE_ACCESS_KEY: rustfsadmin
       OBJECT_STORE_SECRET_KEY: rustfsadmin
       OBJECT_STORE_BUCKET: comfyhelper
+      # deedlit.metadata extraction API (in-network hostname).
+      METADATA_API_URL: http://metadata:8000
       # deedlit.vision CLIP embedding API.
       # When vision profile is active, point to the vision service.
-      # Remove or leave empty to use the local pixel-histogram fallback.
+      # REQUIRED — there is no local fallback; ingest/search error if unset.
       CLIP_VISION_API_URL: http://vision:8000
       # Must match the CLIP model dimension: 1024 (vit_h) or 1280 (big_g).
       # Changing this after indexing requires a Qdrant rebuild.
@@ -191,6 +211,8 @@ services:
       qdrant:
         condition: service_healthy
       rustfs:
+        condition: service_healthy
+      metadata:
         condition: service_healthy
 
   # --- Observability ------------------------------------------------------

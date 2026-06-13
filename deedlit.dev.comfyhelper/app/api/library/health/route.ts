@@ -31,11 +31,11 @@ export async function GET() {
     const warnings: string[] = [];
     if (!embedder.hasExternalImageEmbeddings) {
       warnings.push(
-        "CLIP not configured — similarity ranks by local color/layout, not content. Set CLIP_VISION_API_URL and rebuild Qdrant.",
+        "CLIP_VISION_API_URL not set — deedlit.vision is required for embeddings (no local fallback). Ingest/search will error until it is configured.",
       );
     } else if (!vision.reachable) {
       warnings.push(
-        `CLIP_VISION_API_URL is set (${vision.url}) but the vision API is unreachable${vision.detail ? ` — ${vision.detail}` : ""}. Ingests fall back / fail until it is up.`,
+        `CLIP_VISION_API_URL is set (${vision.url}) but the vision API is unreachable${vision.detail ? ` — ${vision.detail}` : ""}. Ingests fail until it is up (no local fallback).`,
       );
     }
     if (collection.exists && !dimMatch) {

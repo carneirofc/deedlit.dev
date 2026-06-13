@@ -92,9 +92,9 @@ export async function debugSimilarImages(
 }
 
 /**
- * Reverse-image search against an external (pasted/uploaded) image.  Works even
- * without a CLIP provider because the local pixel embedding is aligned
- * image-to-image; see {@link generateImageEmbeddingFromBuffer}.
+ * Reverse-image search against an external (pasted/uploaded) image.  Requires
+ * deedlit.vision (CLIP) — there is no local fallback, so this errors if
+ * CLIP_VISION_API_URL is unset; see {@link generateImageEmbeddingFromBuffer}.
  */
 export async function searchByExternalImage(
   buffer: Buffer,
@@ -111,10 +111,10 @@ export async function searchByExternalImage(
 }
 
 /**
- * Semantic search.  When a real image/text embedding provider is configured the
- * text query is embedded into the same space as images and matched in Qdrant.
- * Without one, the local text vector is not aligned with image vectors, so we
- * fall back to PostgreSQL metadata search to keep results meaningful.
+ * Semantic search.  When deedlit.vision (CLIP) is configured the text query is
+ * embedded into the same space as images and matched in Qdrant.  When it is not
+ * configured we skip vector search entirely and fall back to PostgreSQL metadata
+ * search (there is no local text-embedding fallback to misuse here).
  */
 export async function semanticImageSearch(
   query: string,
