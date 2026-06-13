@@ -5,9 +5,30 @@
 - Check `package.json` at the repo root for workspace-level commands, then move into the package that owns the task.
 - Read the nearest package-local `.github/copilot-instructions.md` before editing code.
 
+## Toolchain & Environment (Windows / PowerShell)
+Don't go hunting for these every session — they are version-managed, not on the bare PATH.
+
+### Node — managed by **fnm**
+- `fnm.exe`: `C:\Users\claud\AppData\Local\Microsoft\WinGet\Links\fnm.exe` (already on PATH).
+- `FNM_DIR`: `C:\Users\claud\AppData\Roaming\fnm`; installed versions live under `…\fnm\node-versions\`.
+- Default/active version: **v24.13.1** (`node` resolves into an fnm multishell, not a fixed path).
+- Activate in a PowerShell session (the Bash/PowerShell tool does NOT auto-load fnm):
+  ```powershell
+  fnm env --use-on-cd | Out-String | Invoke-Expression
+  ```
+  After that, `node`, `npm`, `npx` work. `--use-on-cd` makes fnm honor a repo's `.node-version`/`.nvmrc` on entry. Use `npm` for workspace scripts (see Command Reference).
+
+### Python — managed by **uv**, per-package venvs
+- `uv.exe`: `C:\Users\claud\.local\bin\uv.exe` (on PATH).
+- ⚠️ Bare `python` on PATH is the **Windows Store stub** (`…\WindowsApps\python.exe`) — do not use it.
+- `deedlit.vision/` has its own venv: `deedlit.vision\.venv` (**Python 3.14.5**).
+  - Activate: `deedlit.vision\.venv\Scripts\Activate.ps1`
+  - Or run without activating: `uv run --project deedlit.vision <cmd>` (or `cd deedlit.vision; uv run <cmd>`).
+- To get a python without a venv: `uv run python …` or `uv python find`.
+
 ## Package Ownership
 - `deedlit.dev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
-- `deedlit.dev.comfyhelper/`: ComfyUI image management, metadata parsing, Prisma/SQLite persistence, scans, SSE, admin tools, notes, and stats.
+- `deedlit.dev.comfyhelper/`: generated-image library — metadata extraction, PostgreSQL (canonical) + Neo4j (graph) + Qdrant (vectors), RustFS/S3 object storage, REST APIs, and MCP tools. See `deedlit.dev.comfyhelper/IMAGE_LIBRARY.md`.
 - `deedlit.dev.ui/`: shared UI components, icons, tokens, CSS variables, and app-agnostic presentation primitives.
 
 ## Working Rules
