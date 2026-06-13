@@ -105,6 +105,7 @@ const DropdownMenu = forwardRef<HTMLDivElement, DropdownMenuProps>(function Drop
                 type="button"
                 onClick={() => {
                   item.onClick();
+                  handleClose();
                 }}
                 className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-ui-xs transition hover:bg-ui-bg-soft"
               >
