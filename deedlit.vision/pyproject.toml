@@ -21,6 +21,18 @@ dependencies = [
 [tool.uv]
 package = false
 
+# RTX 50-series (Blackwell, sm_120) needs CUDA 12.8 wheels. Pull torch/torchvision
+# from the cu128 index so local dev runs CLIP on the GPU. The Dockerfile installs
+# its own CUDA wheels separately.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
 [dependency-groups]
 dev = ["pytest>=8.0.0"]
 

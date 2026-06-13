@@ -15,6 +15,18 @@
     "dev:dev": "npm run dev -w deedlit.dev",
     "dev:comfyhelper": "npm run dev -w deedlit.dev.comfyhelper",
     "dev:vision": "uv run --directory deedlit.vision uvicorn app:app --host 127.0.0.1 --port 8000 --reload",
+    "dev:catalog": "uv run --directory deedlit.catalog uvicorn app:app --host 127.0.0.1 --port 8001 --reload",
+    "dev:search": "uv run --directory deedlit.search uvicorn app:app --host 127.0.0.1 --port 8002 --reload",
+    "dev:graph": "uv run --directory deedlit.graph uvicorn app:app --host 127.0.0.1 --port 8003 --reload",
+    "dev:ingest": "uv run --directory deedlit.ingest uvicorn app:app --host 127.0.0.1 --port 8004 --reload",
+    "dev:metadata": "uv run --directory deedlit.metadata uvicorn app:app --host 127.0.0.1 --port 8005 --reload",
+    "dev:api": "uv run --directory deedlit.api uvicorn app:app --host 127.0.0.1 --port 8080 --reload",
+    "infra:up": "docker compose up -d --wait postgres neo4j qdrant rustfs",
+    "infra:down": "docker compose down",
+    "infra:stop": "docker compose stop postgres neo4j qdrant rustfs",
+    "infra:restart": "docker compose restart postgres neo4j qdrant rustfs",
+    "infra:ps": "docker compose ps postgres neo4j qdrant rustfs",
+    "infra:logs": "docker compose logs -f postgres neo4j qdrant rustfs",
     "start:dev": "npm run start -w deedlit.dev",
     "start:comfyhelper": "npm run start -w deedlit.dev.comfyhelper"
   }
