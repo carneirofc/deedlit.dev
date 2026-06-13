@@ -234,7 +234,7 @@ export async function explainSimilarImages(
   const warnings: string[] = [];
   if (!embedding.hasExternalImageEmbeddings) {
     warnings.push(
-      "Local pixel-histogram fallback in use (no CLIP) — ranks by color/layout, not content. Set CLIP_VISION_API_URL and rebuild Qdrant.",
+      "CLIP_VISION_API_URL is not set — deedlit.vision is required for embeddings (no local fallback). Similarity search will error until it is configured.",
     );
   }
   if (collection.exists && collection.vectorSize !== null && collection.vectorSize !== embedding.dimensions) {

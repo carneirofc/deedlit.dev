@@ -1,20 +1,11 @@
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 import sharp from "sharp";
 
-import { readEmbeddedMetadataFromPng } from "@/lib/png-metadata";
-import {
-  extractFromComfyPromptGraph,
-  findFirstValueByKeys,
-  getSearchableMetadata,
-  isRecord,
-  maybeParseJsonString,
-  parseAutomatic1111Parameters,
-  toDisplayValue,
-} from "@/lib/metadata-parsing";
+import { extractMetadataFromBuffer, type ExtractResult } from "@/lib/library/services/metadata-client";
 import { normalizeTag } from "@/lib/prompt-tags";
 
 export const SUPPORTED_EXTENSIONS = new Set([".png", ".webp", ".jpg", ".jpeg"]);
@@ -154,108 +145,74 @@ export function normalizePromptTags(prompt: string | null | undefined): string[]
   return tags;
 }
 
-function toNumber(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  const n = typeof value === "number" ? value : Number.parseFloat(String(value).replace(",", "."));
-  return Number.isFinite(n) ? n : null;
-}
-
-function parseSizeString(size: string | undefined): { width: number | null; height: number | null } {
-  if (!size) return { width: null, height: null };
-  const match = size.match(/(\d+)\s*[x×]\s*(\d+)/);
-  if (!match) return { width: null, height: null };
-  return { width: Number.parseInt(match[1], 10), height: Number.parseInt(match[2], 10) };
-}
-
 // ---------------------------------------------------------------------------
-// Embedded metadata extraction (PNG text chunks + sharp for webp/jpeg)
+// Metadata interpretation (delegated to the deedlit.metadata service)
 // ---------------------------------------------------------------------------
 
-async function extractEmbeddedMetadata(filePath: string, extension: string): Promise<unknown> {
-  if (extension === ".png") {
-    const { metadata } = await readEmbeddedMetadataFromPng(filePath);
-    return metadata ?? null;
-  }
-  // webp/jpeg: surface EXIF/XMP/text if sharp exposes it.
-  try {
-    const meta = await sharp(filePath).metadata();
-    const fields: Record<string, unknown> = {};
-    if (meta.exif) fields.exif = meta.exif.toString("latin1");
-    const extra = meta as unknown as { comments?: Array<{ keyword: string; text: string }> };
-    if (Array.isArray(extra.comments)) {
-      for (const c of extra.comments) fields[c.keyword] = c.text;
-    }
-    return Object.keys(fields).length > 0 ? { source: "embedded-image", fields } : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Pull the canonical prompt/param view out of whatever embedded metadata shape
- * we found.  Handles ComfyUI (`prompt` graph + `workflow`) and Automatic1111
- * (`parameters` string), falling back gracefully.
- */
-function interpretMetadata(metadata: unknown): {
+interface InterpretedMetadata {
   prompt: string | null;
   negativePrompt: string | null;
   model: string | null;
   sourceTool: string | null;
   workflowJson: unknown;
+  /** Tags already normalized by the metadata service. */
+  tags: string[];
   params: Partial<ExtractedGenerationParams>;
-} {
-  const searchable = getSearchableMetadata(metadata);
+}
 
-  // Automatic1111 / Forge style: a `parameters` text blob.
-  const parametersRaw = toDisplayValue(findFirstValueByKeys(searchable, ["parameters"]));
-  let sourceTool: string | null = null;
-  let prompt: string | null = null;
-  let negativePrompt: string | null = null;
-  let model: string | null = null;
-  const params: Partial<ExtractedGenerationParams> = {};
-
-  if (parametersRaw) {
-    const a1111 = parseAutomatic1111Parameters(parametersRaw, { includeFirstLineAsPositive: true });
-    sourceTool = "automatic1111";
-    prompt = a1111.positivePrompt ?? null;
-    negativePrompt = a1111.negativePrompt ?? null;
-    model = a1111.model ?? null;
-    params.seed = toNumber(a1111.seed);
-    params.steps = toNumber(a1111.steps);
-    params.cfgScale = toNumber(a1111.cfgScale);
-    params.sampler = a1111.sampler ?? null;
-    params.scheduler = a1111.scheduler ?? null;
-    const size = parseSizeString(a1111.size);
-    params.width = size.width;
-    params.height = size.height;
-  }
-
-  // ComfyUI style: a `prompt` field containing a node graph.
-  const comfyPrompt = findFirstValueByKeys(searchable, ["prompt"]);
-  const workflow = findFirstValueByKeys(searchable, ["workflow"]);
-  if (comfyPrompt && isRecord(maybeParseJsonString(comfyPrompt))) {
-    const comfy = extractFromComfyPromptGraph(comfyPrompt);
-    if (comfy.positivePrompt || comfy.model) {
-      sourceTool = sourceTool ?? "comfyui";
-      prompt = prompt ?? comfy.positivePrompt ?? null;
-      negativePrompt = negativePrompt ?? comfy.negativePrompt ?? null;
-      model = model ?? comfy.model ?? null;
-      params.seed = params.seed ?? toNumber(comfy.seed);
-      params.steps = params.steps ?? toNumber(comfy.steps);
-      params.cfgScale = params.cfgScale ?? toNumber(comfy.cfgScale);
-      params.sampler = params.sampler ?? comfy.sampler ?? null;
-      params.scheduler = params.scheduler ?? comfy.scheduler ?? null;
-    }
-  }
+/**
+ * Map the deedlit.metadata `ExtractResult` into the monolith's interpreted
+ * shape.  The service owns all metadata parsing (A1111 `parameters` blob +
+ * ComfyUI node graph); this is a pure field-rename / coercion layer.
+ *
+ * Notes:
+ * - `sourceTool` is the contract enum (`a1111` / `comfyui` / `unknown`); the
+ *   `unknown` sentinel is collapsed to `null` to match the prior in-process
+ *   behavior (no recognized tool → null source_tool).
+ * - `model` is resolved from `references.checkpoints[0]` once #7 populates it;
+ *   today references are empty so this stays null until the service fills them.
+ * - `workflow_json` is preferred for the stored workflow; the raw API prompt is
+ *   used as a fallback so ComfyUI images without an embedded UI graph still keep
+ *   their node graph.
+ */
+export function mapExtractResult(extract: ExtractResult): InterpretedMetadata {
+  const sourceTool = extract.sourceTool === "unknown" ? null : extract.sourceTool;
+  const model = extract.references.checkpoints[0]?.name ?? null;
+  const workflowJson = extract.workflow_json ?? extract.api_prompt_json ?? null;
 
   return {
-    prompt,
-    negativePrompt,
+    prompt: extract.prompt ?? null,
+    negativePrompt: extract.negative ?? null,
     model,
     sourceTool,
-    workflowJson: workflow ? maybeParseJsonString(workflow) : null,
-    params,
+    workflowJson,
+    tags: extract.tags ?? [],
+    params: {
+      seed: extract.params.seed ?? null,
+      steps: extract.params.steps ?? null,
+      cfgScale: extract.params.cfg ?? null,
+      sampler: extract.params.sampler ?? null,
+      scheduler: extract.params.scheduler ?? null,
+      denoise: extract.params.denoise ?? null,
+      width: extract.params.width ?? null,
+      height: extract.params.height ?? null,
+      clipSkip: extract.params.clipskip ?? null,
+    },
   };
+}
+
+function mimeForExtension(extension: string): string {
+  switch (extension.toLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".webp":
+      return "image/webp";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,18 +224,26 @@ export async function extractImageMetadata(filePath: string): Promise<ExtractedI
   const filename = path.basename(filePath);
   const fileStat = await stat(filePath);
 
-  const [sha256Hash, perceptualHash, dims, embedded] = await Promise.all([
+  // Pixel work stays local (sha256 / phash / dims); metadata parsing is owned by
+  // the deedlit.metadata service. Read the bytes once and reuse for the upload.
+  const fileBuffer = await readFile(filePath);
+
+  const [sha256Hash, perceptualHash, dims, extract] = await Promise.all([
     computeSha256(filePath),
     computePerceptualHash(filePath),
     sharp(filePath)
       .metadata()
       .then((m) => ({ width: m.width ?? null, height: m.height ?? null }))
       .catch(() => ({ width: null, height: null })),
-    extractEmbeddedMetadata(filePath, extension),
+    extractMetadataFromBuffer(fileBuffer, mimeForExtension(extension), filename),
   ]);
 
-  const interpreted = interpretMetadata(embedded);
-  const tags = normalizePromptTags(interpreted.prompt);
+  const interpreted = mapExtractResult(extract);
+  // Prefer the service's normalized tags; only re-derive locally if the service
+  // returned none but we do have a prompt (defensive — shouldn't happen).
+  const tags =
+    interpreted.tags.length > 0 ? interpreted.tags : normalizePromptTags(interpreted.prompt);
+  // LoRAs are parsed from the prompt until the service populates references.loras (#7).
   const loras = parseLorasFromPrompt(interpreted.prompt);
 
   const generationParams: ExtractedGenerationParams = {
@@ -309,7 +274,9 @@ export async function extractImageMetadata(filePath: string): Promise<ExtractedI
     negativePrompt: interpreted.negativePrompt,
     model: interpreted.model,
     workflowJson: interpreted.workflowJson,
-    metadataJson: embedded,
+    // Store the full parsed ExtractResult as the canonical metadata view (the raw
+    // embedded chunks are no longer parsed in-process).
+    metadataJson: extract,
     tags,
     loras,
     generationParams,

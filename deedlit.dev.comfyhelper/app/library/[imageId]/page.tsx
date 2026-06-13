@@ -408,7 +408,7 @@ export default function ImageDetailPage() {
                 <dd className="text-ui-ink">{debug.embedding.provider}</dd>
                 <dt>Semantic (CLIP)</dt>
                 <dd className={debug.embedding.hasExternalImageEmbeddings ? "text-emerald-400" : "text-amber-400"}>
-                  {debug.embedding.hasExternalImageEmbeddings ? "yes" : "no — color/layout fallback"}
+                  {debug.embedding.hasExternalImageEmbeddings ? "yes" : "no — vision not configured"}
                 </dd>
                 <dt>Embedder dims</dt>
                 <dd className="text-ui-ink">{debug.embedding.dimensions}</dd>

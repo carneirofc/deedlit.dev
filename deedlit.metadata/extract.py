@@ -4,11 +4,12 @@ Ported from ``interpretMetadata`` + ``extractImageMetadata`` in
 ``lib/library/services/metadata-service.ts`` — minus all pixel-derived work
 (sha256/phash/dims/thumbnail), which is the ingest service's job (#6 scope note).
 
-The ``references{}`` field is OUT OF SCOPE for #6 and deferred to #7: this
-module always returns ``EMPTY_REFERENCES`` (all six categories present, empty).
-#7 will resolve checkpoints/loras/embeddings/vae/controlnets/upscalers from the
-ComfyUI node graph (extend ``metadata_parsing.extract_from_comfy_prompt_graph``
-and populate references here from the same ``workflow_json``/``api_prompt_json``).
+The ``references{}`` field resolves the full asset-reference graph (#7):
+checkpoints/loras/embeddings/vae/controlnets/upscalers are resolved by
+``metadata_parsing.resolve_references`` from the ComfyUI api-prompt node graph
+(the same parsed ``api_prompt_json`` used for prompt/param extraction — the PNG
+is never re-parsed). A1111 images carry no node graph, so their references are
+the all-empty skeleton (``EMPTY_REFERENCES``).
 """
 from __future__ import annotations
 
@@ -16,21 +17,19 @@ import re
 from typing import Any
 
 from metadata_parsing import (
+    REFERENCE_CATEGORIES,
     extract_from_comfy_prompt_graph,
     find_first_value_by_keys,
     get_searchable_metadata,
     is_record,
     maybe_parse_json_string,
     parse_automatic1111_parameters,
+    resolve_references,
     to_display_value,
 )
 from prompt_tags import normalize_prompt_tags
 
 __all__ = ["interpret_metadata", "EMPTY_REFERENCES", "REFERENCE_CATEGORIES"]
-
-# References are deferred to #7. Keep all six categories present but empty so the
-# ExtractResult contract is satisfied today and #7 only has to fill the lists.
-REFERENCE_CATEGORIES = ("checkpoints", "loras", "embeddings", "vae", "controlnets", "upscalers")
 
 
 def _empty_references() -> dict[str, list]:
@@ -130,6 +129,7 @@ def interpret_metadata(metadata: Any) -> dict[str, Any]:
 
     api_prompt_json: Any = None
     workflow_json: Any = None
+    references = _empty_references()
 
     if comfy_prompt is not None:
         parsed_comfy_prompt = maybe_parse_json_string(comfy_prompt)
@@ -150,6 +150,10 @@ def interpret_metadata(metadata: Any) -> dict[str, Any]:
                 if params["scheduler"] is None:
                     params["scheduler"] = comfy.get("scheduler")
                 api_prompt_json = parsed_comfy_prompt
+            # #7: resolve the full asset-reference graph from the SAME parsed
+            # node graph (never re-parse the PNG). Done for any ComfyUI graph,
+            # even one that lacks a recognized prompt/model node.
+            references = resolve_references(parsed_comfy_prompt)
 
     if workflow is not None:
         workflow_json = maybe_parse_json_string(workflow)
@@ -162,7 +166,7 @@ def interpret_metadata(metadata: Any) -> dict[str, Any]:
         "negative": negative,
         "tags": tags,
         "params": params,
-        "references": _empty_references(),
+        "references": references,
         "workflow_json": workflow_json,
         "api_prompt_json": api_prompt_json,
     }

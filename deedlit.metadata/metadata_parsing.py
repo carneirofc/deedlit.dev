@@ -25,6 +25,8 @@ __all__ = [
     "extract_prompt_text_from_metadata",
     "parse_automatic1111_parameters",
     "extract_from_comfy_prompt_graph",
+    "resolve_references",
+    "REFERENCE_CATEGORIES",
 ]
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]")
@@ -307,3 +309,152 @@ def extract_from_comfy_prompt_graph(prompt_value: Any) -> dict[str, str | None]:
         "seed": to_display_value(inputs.get("seed")),
         "scheduler": to_display_value(inputs.get("scheduler")),
     }
+
+
+# ---------------------------------------------------------------------------
+# #7: full asset-reference graph resolution
+# ---------------------------------------------------------------------------
+
+# The six contract categories (AssetRef[]). Kept here so callers can build the
+# empty-references skeleton from a single source of truth.
+REFERENCE_CATEGORIES = (
+    "checkpoints",
+    "loras",
+    "embeddings",
+    "vae",
+    "controlnets",
+    "upscalers",
+)
+
+# Map a normalized (lowercased, alnum-only) ComfyUI ``class_type`` substring to
+# (category, [input keys that may carry the asset name]). Matching is substring
+# based so custom-node variants ("Checkpoint Loader with Name (Image Saver)",
+# "Power Lora Loader (rgthree)", ...) still resolve as long as they expose the
+# canonical input key. Order matters: more specific keys are tried first.
+#
+# Note: ``loraloadermodelonly`` is a superset-substring of ``loraloader`` so a
+# single ``loraloader`` rule covers both. ``unetloader`` is treated as a
+# checkpoint (the base model). Embeddings are NOT loader-based in stock ComfyUI;
+# they are resolved separately from CLIPTextEncode ``text`` tokens below.
+_LOADER_RULES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("checkpointloader", "checkpoints", ("ckpt_name", "model_name", "unet_name")),
+    ("unetloader", "checkpoints", ("unet_name", "model_name", "ckpt_name")),
+    ("loraloader", "loras", ("lora_name",)),
+    ("vaeloader", "vae", ("vae_name",)),
+    ("controlnetloader", "controlnets", ("control_net_name", "controlnet_name", "control_net")),
+    ("upscalemodelloader", "upscalers", ("model_name", "upscale_model")),
+)
+
+# ``embedding:NAME`` tokens inside CLIPTextEncode text. Name runs until a
+# weight/closing-paren/comma/whitespace boundary, so "(embedding:foo:1.2)" and
+# "embedding:bar," both resolve to the bare name.
+_EMBEDDING_TOKEN_RE = re.compile(r"embedding:([^\s,:()<>]+)", re.IGNORECASE)
+
+
+def _empty_references() -> dict[str, list[dict[str, Any]]]:
+    return {category: [] for category in REFERENCE_CATEGORIES}
+
+
+def _append_unique(bucket: list[dict[str, Any]], name: str | None) -> None:
+    """Append a ``{name, hash: None}`` ref, deduped by name (order preserved).
+
+    Hashes are virtually never present in ComfyUI graphs, so ``hash`` is always
+    ``None`` here. The field is kept to match the ``AssetRef`` contract shape.
+    """
+    if not name:
+        return
+    if any(existing["name"] == name for existing in bucket):
+        return
+    bucket.append({"name": name, "hash": None})
+
+
+def _node_iter(parsed_prompt: dict) -> Any:
+    """Yield ``(class_type_lower_normalized, inputs)`` for graph nodes."""
+    for node_value in parsed_prompt.values():
+        if not is_record(node_value):
+            continue
+        class_type = to_display_value(node_value.get("class_type"))
+        inputs = node_value.get("inputs")
+        if not class_type or not is_record(inputs):
+            continue
+        normalized = _NON_ALNUM_RE.sub("", class_type.lower())
+        yield normalized, inputs
+
+
+def _resolve_lora_loader_inputs(inputs: dict, bucket: list[dict[str, Any]]) -> None:
+    """Resolve lora names from community lora-loader node input shapes.
+
+    Handles two widespread custom-node layouts (observed in real ComfyUI PNGs):
+      - rgthree "Power Lora Loader": ``lora_1``, ``lora_2``, ... each a record
+        ``{"on": bool, "lora": "<name>", "strength": float}``.
+      - ComfyUI-Lora-Manager "Lora Loader": ``loras = {"__value__": [{"name": ...}]}``.
+    """
+    # rgthree-style: lora_N records carrying a "lora" field.
+    for key, value in inputs.items():
+        if key.lower().startswith("lora_") and is_record(value):
+            _append_unique(bucket, to_display_value(value.get("lora")))
+
+    # LoraManager-style: loras.__value__ list of {name: ...}.
+    loras_field = inputs.get("loras")
+    if is_record(loras_field):
+        entries = loras_field.get("__value__")
+        if isinstance(entries, list):
+            for entry in entries:
+                if is_record(entry):
+                    _append_unique(bucket, to_display_value(entry.get("name")))
+
+
+def resolve_references(prompt_value: Any) -> dict[str, list[dict[str, Any]]]:
+    """Resolve the full asset-reference graph from a ComfyUI api-prompt graph.
+
+    Walks every node's ``class_type`` + ``inputs`` (NOT a regex over the final
+    prompt string) and resolves each of the six categories:
+
+      - checkpoints: CheckpointLoader* / CheckpointLoaderSimple / UNETLoader
+      - loras:       LoraLoader / LoraLoaderModelOnly
+      - vae:         VAELoader
+      - controlnets: ControlNetLoader (+ *Apply consumes its output)
+      - upscalers:   UpscaleModelLoader
+      - embeddings:  ``embedding:NAME`` tokens found in CLIPTextEncode ``text``
+                     inputs (graph-sourced — only literal string inputs, never
+                     node-reference lists).
+
+    Each entry matches the ``AssetRef`` contract shape ``{name, hash}`` with
+    ``hash`` always ``None`` (ComfyUI graphs carry names, not hashes). Returns a
+    dict with all six categories present (possibly empty). A non-graph value
+    (e.g. an A1111 ``parameters`` blob) yields the all-empty skeleton.
+    """
+    refs = _empty_references()
+    parsed_prompt = maybe_parse_json_string(prompt_value)
+    if not is_record(parsed_prompt):
+        return refs
+
+    for normalized, inputs in _node_iter(parsed_prompt):
+        for needle, category, keys in _LOADER_RULES:
+            if needle not in normalized:
+                continue
+            matched = False
+            for key in keys:
+                name = to_display_value(inputs.get(key))
+                if name:
+                    _append_unique(refs[category], name)
+                    matched = True
+                    break
+            # Community lora nodes don't use the canonical ``lora_name`` scalar:
+            # rgthree's "Power Lora Loader" nests ``lora_N: {lora: name}`` and
+            # ComfyUI-Lora-Manager nests ``loras.__value__: [{name: ...}]``.
+            if category == "loras" and not matched:
+                _resolve_lora_loader_inputs(inputs, refs["loras"])
+
+        # Embeddings: scan literal CLIPTextEncode text inputs for tokens. Only
+        # plain string inputs are scanned; node-reference lists (["6", 0]) are
+        # skipped so we never regex over a wired-in value we can't see here.
+        if "cliptextencode" in normalized:
+            for key in ("text", "text_g", "text_l"):
+                raw = inputs.get(key)
+                if not isinstance(raw, str):
+                    continue
+                for match in _EMBEDDING_TOKEN_RE.finditer(raw):
+                    _append_unique(refs["embeddings"], match.group(1))
+
+    return refs

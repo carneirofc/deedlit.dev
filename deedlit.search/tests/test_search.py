@@ -1,0 +1,178 @@
+"""Integration tests against a LIVE Qdrant.
+
+qdrant-client has no in-process mode that reliably supports sparse vectors +
+RRF fusion, so these tests require a running Qdrant (``docker compose up -d
+--wait qdrant`` from the repo root). They use a throwaway collection
+(``conftest.TEST_COLLECTION``) that is dropped in teardown.
+"""
+from __future__ import annotations
+
+import hashlib
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+import app as app_module
+from conftest import TEST_COLLECTION
+from id_scheme import NAMESPACE, point_id_for_sha256
+from search.config import DENSE_DIM, DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
+
+client = TestClient(app_module.app)
+store = app_module.get_store()
+
+
+def _sha(seed: str) -> str:
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _dense(seed: int) -> list[float]:
+    """A simple 1024-dim one-hot-ish vector so neighbors are predictable."""
+    vec = [0.0] * DENSE_DIM
+    vec[seed % DENSE_DIM] = 1.0
+    vec[(seed + 1) % DENSE_DIM] = 0.5
+    return vec
+
+
+def _sparse(indices, values):
+    return {"indices": list(indices), "values": list(values)}
+
+
+# Three deterministic fixtures. A and B share a dense direction (close); C is
+# orthogonal (far). Sparse weights make A/C share lexical terms.
+SHA_A = _sha("image-a")
+SHA_B = _sha("image-b")
+SHA_C = _sha("image-c")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _clean_collection():
+    """Ensure a fresh throwaway collection for the module; drop it after."""
+    store.drop_collection()
+    store.ensure_collection()
+    yield
+    store.drop_collection()
+
+
+def _upsert(sha, dense, sparse=None, payload=None):
+    body = {"sha256": sha, "dense": dense}
+    if sparse is not None:
+        body["sparse"] = sparse
+    if payload is not None:
+        body["payload"] = payload
+    r = client.post("/points", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _seed(_clean_collection):
+    # A and B point the same dense direction; C is orthogonal.
+    _upsert(SHA_A, _dense(0), _sparse([1, 2, 3], [0.9, 0.8, 0.1]), {"name": "a"})
+    _upsert(SHA_B, _dense(0), _sparse([7, 8, 9], [0.4, 0.4, 0.4]), {"name": "b"})
+    _upsert(SHA_C, _dense(500), _sparse([1, 2, 3], [0.9, 0.8, 0.1]), {"name": "c"})
+
+
+# --- (1) collection created with named dense + sparse vectors ---------------
+
+
+def test_collection_has_named_dense_and_sparse_vectors():
+    info = store.client.get_collection(TEST_COLLECTION)
+    vectors = info.config.params.vectors
+    assert DENSE_VECTOR_NAME in vectors
+    assert vectors[DENSE_VECTOR_NAME].size == DENSE_DIM
+    # Cosine distance on the dense named vector.
+    assert vectors[DENSE_VECTOR_NAME].distance.lower() == "cosine"
+    sparse = info.config.params.sparse_vectors
+    assert sparse is not None and SPARSE_VECTOR_NAME in sparse
+
+
+# --- (2) /points upserts and the point id equals uuid5(sha256) --------------
+
+
+def test_point_id_is_uuid5_of_sha256():
+    result = _upsert(_sha("idcheck"), _dense(10))
+    expected = str(uuid.uuid5(NAMESPACE, _sha("idcheck")))
+    assert result["id"] == expected
+    assert result["id"] == point_id_for_sha256(_sha("idcheck"))
+    # The full sha256 is carried in the payload of the stored point.
+    stored = store.client.retrieve(TEST_COLLECTION, ids=[expected], with_payload=True)
+    assert stored[0].payload["sha256"] == _sha("idcheck")
+
+
+# --- (3) /query hybrid dense+sparse returns RRF-fused hits -------------------
+
+
+def test_query_hybrid_uses_rrf_fusion():
+    body = {
+        "dense": _dense(0),
+        "sparse": _sparse([1, 2, 3], [0.9, 0.8, 0.1]),
+        "limit": 10,
+    }
+    r = client.post("/query", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "rrf"
+    shas = {h["sha256"] for h in data["hits"]}
+    # All three are reachable via one of the two prefetches, so RRF surfaces them.
+    assert {SHA_A, SHA_B, SHA_C} <= shas
+    # Hits are ranked (scores descending).
+    scores = [h["score"] for h in data["hits"]]
+    assert scores == sorted(scores, reverse=True)
+
+
+# --- (4) /query with only dense (or only sparse) ----------------------------
+
+
+def test_query_dense_only():
+    r = client.post("/query", json={"dense": _dense(0), "limit": 10})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "dense"
+    # A and B share the dense direction; both rank above orthogonal C.
+    ranked = [h["sha256"] for h in data["hits"]]
+    assert ranked[0] in {SHA_A, SHA_B}
+    assert ranked.index(SHA_C) > ranked.index(SHA_A)
+    assert ranked.index(SHA_C) > ranked.index(SHA_B)
+
+
+def test_query_sparse_only():
+    r = client.post(
+        "/query",
+        json={"sparse": _sparse([1, 2, 3], [0.9, 0.8, 0.1]), "limit": 10},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "sparse"
+    shas = {h["sha256"] for h in data["hits"]}
+    # A and C share the lexical terms; B (terms 7,8,9) does not.
+    assert {SHA_A, SHA_C} <= shas
+    assert SHA_B not in shas
+
+
+def test_query_requires_a_vector():
+    r = client.post("/query", json={"limit": 5})
+    assert r.status_code == 422
+
+
+# --- (5) similar + by-image return expected neighbors -----------------------
+
+
+def test_similar_returns_neighbors_excluding_self():
+    r = client.post("/similar", json={"sha256": SHA_A, "limit": 5})
+    assert r.status_code == 200, r.text
+    hits = r.json()["hits"]
+    shas = [h["sha256"] for h in hits]
+    assert SHA_A not in shas  # excludes the query point itself
+    # B shares A's dense direction so it is the nearest neighbor.
+    assert shas[0] == SHA_B
+
+
+def test_by_image_returns_neighbors():
+    r = client.post("/by-image", json={"sha256": SHA_A, "limit": 5})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "dense"
+    shas = [h["sha256"] for h in data["hits"]]
+    assert SHA_A not in shas
+    assert shas[0] == SHA_B

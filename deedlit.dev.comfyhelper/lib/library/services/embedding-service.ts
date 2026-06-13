@@ -1,8 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import sharp from "sharp";
-
 import { getLogger } from "@/lib/logger";
 import { getLibraryConfig } from "@/lib/library/config";
 import { getObjectBuffer, isObjectStoreEnabled, putObject } from "@/lib/library/storage/object-store";
@@ -10,28 +8,17 @@ import { getObjectBuffer, isObjectStoreEnabled, putObject } from "@/lib/library/
 const logger = getLogger({ scope: "library-embedding" });
 
 export function getEmbeddingProvider(): string {
-  const { clipVisionApiUrl, enrichment } = getLibraryConfig();
-  if (clipVisionApiUrl) return "deedlit-vision";
-  return enrichment.imageEmbeddingProvider;
+  // deedlit.vision is the only embedding provider — there is no local fallback.
+  return getLibraryConfig().clipVisionApiUrl ? "deedlit-vision" : "unconfigured";
 }
 
-/** Whether a real (learned) image-embedding provider is configured. */
+/**
+ * Whether the (mandatory) learned image-embedding provider is configured.
+ * With the local pixel-histogram fallback removed, this is simply "is
+ * deedlit.vision configured" — when false, embeddings throw rather than degrade.
+ */
 export function hasExternalImageEmbeddings(): boolean {
-  const { clipVisionApiUrl } = getLibraryConfig();
-  if (clipVisionApiUrl) return true;
-  const provider = getLibraryConfig().enrichment.imageEmbeddingProvider;
-  return provider !== "" && provider !== "local" && provider !== "none";
-}
-
-function l2normalize(vec: number[]): number[] {
-  let norm = 0;
-  for (const v of vec) norm += v * v;
-  norm = Math.sqrt(norm) || 1;
-  return vec.map((v) => v / norm);
-}
-
-function scaleBlock(vec: number[], weight: number): number[] {
-  return weight === 1 ? vec : vec.map((v) => v * weight);
+  return Boolean(getLibraryConfig().clipVisionApiUrl);
 }
 
 /** A vector with effectively no magnitude — a failed/garbage embedding. */
@@ -118,7 +105,7 @@ export async function pingVisionApi(): Promise<VisionApiHealth> {
       configured: false,
       url: null,
       reachable: false,
-      detail: "CLIP_VISION_API_URL not set — using local pixel-histogram fallback.",
+      detail: "CLIP_VISION_API_URL not set — deedlit.vision is required (no local fallback).",
     };
   }
   try {
@@ -201,67 +188,33 @@ async function callVisionApiText(text: string): Promise<number[]> {
   return json.embedding;
 }
 
-/**
- * Local visual feature vector (pixel-histogram fallback).
- * Used when deedlit.vision is not configured.  Not semantically aligned with
- * text vectors — similarity search falls back to metadata in that case.
- */
-async function localImageEmbedding(input: string | Buffer): Promise<number[]> {
-  const dims = getLibraryConfig().embeddingDimensions;
-  const grid = 12;
-  const { data } = await sharp(input)
-    .removeAlpha()
-    .resize(grid, grid, { fit: "fill" })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  // Downscaled-grid block (432 dims): coarse layout + color positioning.
-  const gridVec: number[] = [];
-  for (const v of data) gridVec.push(v / 255);
-
-  // Color-histogram block (48 dims): palette, independent of position.
-  const bins = 16;
-  const hist = new Array(bins * 3).fill(0);
-  for (let i = 0; i < data.length; i += 3) {
-    for (let c = 0; c < 3; c++) {
-      const bin = Math.min(bins - 1, Math.floor((data[i + c] / 256) * bins));
-      hist[c * bins + bin] += 1;
-    }
+/** Thrown when deedlit.vision is required but not configured. */
+export class VisionServiceNotConfiguredError extends Error {
+  constructor() {
+    super(
+      "CLIP_VISION_API_URL is not set — the deedlit.vision service is required for embeddings. " +
+        "There is no local fallback; start deedlit.vision and set CLIP_VISION_API_URL (e.g. http://localhost:8000).",
+    );
+    this.name = "VisionServiceNotConfiguredError";
   }
-  const pixels = data.length / 3 || 1;
-  const histVec = hist.map((h) => h / pixels);
-
-  // L2-normalize each block independently so the 432-dim grid block does not
-  // numerically swamp the 48-dim histogram block (a single L2 over the raw
-  // concatenation let the grid dominate → similarity collapsed to "same coarse
-  // layout"). Weight the palette block up since the grid is position-sensitive.
-  const gridBlock = scaleBlock(l2normalize(gridVec), 1.0);
-  const histBlock = scaleBlock(l2normalize(histVec), 1.3);
-
-  let vec = [...gridBlock, ...histBlock];
-  if (vec.length < dims) vec = vec.concat(new Array(dims - vec.length).fill(0));
-  else if (vec.length > dims) vec = vec.slice(0, dims);
-
-  return l2normalize(vec);
 }
 
 export async function generateImageEmbedding(imagePath: string): Promise<number[]> {
   const { clipVisionApiUrl } = getLibraryConfig();
-  // Intentionally NOT swallowing errors into a zero vector: a zero vector
-  // pollutes Qdrant (cosine 0 against everything) and, once cached, persists.
-  // Callers (upsert / search routes) handle the throw and skip indexing.
-  if (clipVisionApiUrl) {
-    return callVisionApiImage(imagePath);
+  // deedlit.vision is MANDATORY — there is no in-process fallback. A missing
+  // service throws so callers (upsert / search routes) skip indexing rather than
+  // silently storing a non-semantic vector. (Errors are also never swallowed
+  // into a zero vector, which would poison Qdrant with cosine-0-against-all.)
+  if (!clipVisionApiUrl) {
+    throw new VisionServiceNotConfiguredError();
   }
-  return localImageEmbedding(imagePath);
+  return callVisionApiImage(imagePath);
 }
 
 /**
  * Embed an in-memory image (pasted/uploaded by the user, never persisted) using
  * the same pipeline as indexed images, so its vector lands in the same space and
- * can be matched against the Qdrant collection.  Note: the local pixel-histogram
- * fallback IS aligned image-to-image (unlike text), so reverse-image search works
- * even when deedlit.vision/CLIP is not configured.
+ * can be matched against the Qdrant collection.  Requires deedlit.vision.
  */
 export async function generateImageEmbeddingFromBuffer(
   buffer: Buffer,
@@ -269,42 +222,24 @@ export async function generateImageEmbeddingFromBuffer(
   filename = "pasted-image",
 ): Promise<number[]> {
   const { clipVisionApiUrl } = getLibraryConfig();
-  // Throws on failure (see generateImageEmbedding) so reverse-image search
-  // surfaces a real error instead of matching everything at score 0.
-  if (clipVisionApiUrl) {
-    return callVisionApiImageBuffer(buffer, mime, filename);
+  if (!clipVisionApiUrl) {
+    throw new VisionServiceNotConfiguredError();
   }
-  return localImageEmbedding(buffer);
+  return callVisionApiImageBuffer(buffer, mime, filename);
 }
 
 /**
- * Text query embedding.
- * When deedlit.vision is configured, uses the CLIP text tower (same embedding
- * space as images → true semantic search).  Otherwise falls back to a local
- * hashed bag-of-tokens vector that is NOT aligned with image vectors.
+ * Text query embedding via the deedlit.vision CLIP text tower (same embedding
+ * space as images → true semantic search).  Requires deedlit.vision — there is
+ * no local hashed-token fallback (it was never aligned with image vectors, so a
+ * fallback query silently returned irrelevant results).
  */
 export async function generateTextEmbedding(text: string): Promise<number[]> {
-  const { clipVisionApiUrl, embeddingDimensions } = getLibraryConfig();
-  if (clipVisionApiUrl) {
-    try {
-      return await callVisionApiText(text);
-    } catch (error) {
-      logger.warn({ err: error, text }, "Vision API text embed failed; falling back to local hash vector");
-    }
+  const { clipVisionApiUrl } = getLibraryConfig();
+  if (!clipVisionApiUrl) {
+    throw new VisionServiceNotConfiguredError();
   }
-
-  const dims = embeddingDimensions;
-  const vec = new Array(dims).fill(0);
-  const tokens = text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  for (const token of tokens) {
-    let h = 2166136261;
-    for (let i = 0; i < token.length; i++) {
-      h ^= token.charCodeAt(i);
-      h = Math.imul(h, 16777619);
-    }
-    vec[Math.abs(h) % dims] += 1;
-  }
-  return l2normalize(vec);
+  return callVisionApiText(text);
 }
 
 function embeddingKey(sha256: string): string {

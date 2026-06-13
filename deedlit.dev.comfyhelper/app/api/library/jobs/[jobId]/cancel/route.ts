@@ -1,18 +1,16 @@
-import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
-import { ensureLibrarySchema } from "@/lib/library/db/migrate";
-import { cancelJob } from "@/lib/library/services/jobs-service";
+import { jsonError } from "@/lib/library/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type RouteContext = { params: Promise<{ jobId: string }> };
-
-export async function POST(_request: Request, context: RouteContext) {
-  return handleRoute(async () => {
-    const { jobId } = await context.params;
-    await ensureLibrarySchema();
-    const cancelled = await cancelJob(jobId);
-    if (!cancelled) return jsonError("Job not found or not cancellable.", 404);
-    return jsonOk({ jobId, status: "cancelled" });
-  });
+/**
+ * Cancel a running job.
+ *
+ * DEGRADED: the deedlit.api gateway exposes no job-cancel endpoint (it can
+ * dispatch jobs via POST /jobs and list them, but not cancel one). Returns 501
+ * until the gateway proxies an ingest cancel route.
+ * TODO(#17): wire cancellation once the gateway exposes it.
+ */
+export async function POST() {
+  return jsonError("Job cancellation is not available through the gateway.", 501);
 }
