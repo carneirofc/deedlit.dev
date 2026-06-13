@@ -145,6 +145,45 @@ def embed_sparse(text: str) -> dict[str, list]:
 
 
 # ---------------------------------------------------------------------------
+# Maintenance boundary (read image bytes / trigger rebuilds) — monkeypatched
+# ---------------------------------------------------------------------------
+def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
+    """GET the raw original bytes of an image by sha256 from the TS app.
+
+    Used by the ``reindex-one-image`` maintenance job, which re-runs the per-file
+    pipeline for a single already-cataloged image. The cross-service id is the
+    sha256, so the read endpoint is keyed by it. Returns ``(bytes, mime)``.
+
+    NOTE: this reads from the TS app (``APP_WRITE_URL``). Re-pointing the read
+    directly at catalog/object-store is deferred to issue #17.
+    """
+    url = f"{APP_WRITE_URL}/api/library/images/{sha256}/file"
+    resp = httpx.get(url, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+    return resp.content, mime
+
+
+def trigger_rebuild(path: str) -> dict[str, Any]:
+    """POST to a TS app maintenance/rebuild endpoint and return its JSON result.
+
+    ``rebuild-search`` / ``rebuild-graph`` / ``rebuild-thumbnails`` are owned by
+    the stores' rebuild logic, which (in this phase) still lives behind the TS
+    app's maintenance endpoints. The ingest job drives that endpoint so the
+    operation gets the in-memory job lifecycle (progress/cancel) wrapped around
+    it. Re-pointing rebuilds directly at search/graph/object-store is deferred to
+    issue #17.
+    """
+    url = f"{APP_WRITE_URL}{path}"
+    resp = httpx.post(url, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Record assembly
 # ---------------------------------------------------------------------------
 def _references_list(references: dict[str, Any] | None) -> list[dict[str, Any]]:

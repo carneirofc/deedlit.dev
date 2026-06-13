@@ -23,6 +23,25 @@ COMPLETED = "completed"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
+# Root walked by the ``rescan-files`` maintenance job when no folderPath is
+# given. Mirrors the monolith's IMAGE_LIBRARY_ROOT.
+LIBRARY_ROOT = os.getenv("IMAGE_LIBRARY_ROOT", os.path.join("data", "library"))
+
+# Maintenance job types (mirrors MaintenanceRequest.type in the contract).
+REINDEX_ONE_IMAGE = "reindex-one-image"
+RESCAN_FILES = "rescan-files"
+REBUILD_SEARCH = "rebuild-search"
+REBUILD_GRAPH = "rebuild-graph"
+REBUILD_THUMBNAILS = "rebuild-thumbnails"
+
+# rebuild-* -> the TS app maintenance endpoint each one drives (this phase).
+# Re-pointing these directly at search/graph/object-store is deferred to #17.
+REBUILD_ENDPOINTS = {
+    REBUILD_SEARCH: "/api/library/maintenance/rebuild-qdrant",
+    REBUILD_GRAPH: "/api/library/maintenance/rebuild-neo4j",
+    REBUILD_THUMBNAILS: "/api/library/maintenance/regenerate-thumbnails",
+}
+
 
 @dataclass
 class Progress:
@@ -41,6 +60,8 @@ class Job:
     error: str | None = None
     # Inputs / control (not serialized to the API).
     folder_path: str | None = None
+    sha256: str | None = None
+    rebuild_path: str | None = None
     cancel_requested: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +96,35 @@ class JobStore:
         self._queue.put_nowait(job.id)
         return job
 
+    def _enqueue(self, job: Job) -> Job:
+        self._jobs[job.id] = job
+        self._queue.put_nowait(job.id)
+        return job
+
+    def create_maintenance_job(
+        self, mtype: str, *, sha256: str | None = None, folder_path: str | None = None
+    ) -> Job:
+        """Create a maintenance job. The worker dispatches on ``job.type``.
+
+        Maintenance jobs reuse the SAME in-memory Job model + async worker loop
+        as ``ingest`` (issue #9), so they get progress counters and cooperative
+        cancellation for free.
+
+          - reindex-one-image: re-run the per-file pipeline for one sha256.
+          - rescan-files: walk the library root (or an explicit folder) and
+            ingest new/changed files (reuses the #9 folder pipeline).
+          - rebuild-search/graph/thumbnails: drive the corresponding rebuild via
+            the TS app maintenance endpoint (this phase; see REBUILD_ENDPOINTS).
+        """
+        job = Job(id=str(uuid.uuid4()), type=mtype)
+        if mtype == REINDEX_ONE_IMAGE:
+            job.sha256 = sha256
+        elif mtype == RESCAN_FILES:
+            job.folder_path = folder_path or LIBRARY_ROOT
+        elif mtype in REBUILD_ENDPOINTS:
+            job.rebuild_path = REBUILD_ENDPOINTS[mtype]
+        return self._enqueue(job)
+
     def request_cancel(self, job_id: str) -> Job | None:
         job = self._jobs.get(job_id)
         if job is None:
@@ -106,17 +156,66 @@ class JobStore:
             return
         job.status = RUNNING
         try:
-            files = _list_supported_files(job.folder_path or "")
-            job.progress.total = len(files)
-            for path in files:
-                if job.cancel_requested:
-                    job.status = CANCELLED
-                    return
-                await self._process_one(job, path)
-            job.status = COMPLETED
-        except Exception as exc:  # folder missing, etc.
-            job.status = FAILED
-            job.error = str(exc)
+            if job.type == REINDEX_ONE_IMAGE:
+                await self._run_reindex_one(job)
+            elif job.type in REBUILD_ENDPOINTS:
+                await self._run_rebuild(job)
+            else:
+                # "ingest" and "rescan-files" both walk a folder and run the
+                # per-file pipeline — rescan-files reuses the #9 folder pipeline.
+                await self._run_folder(job)
+        except Exception as exc:  # folder missing, image not found, etc.
+            if job.status not in (CANCELLED,):
+                job.status = FAILED
+                job.error = str(exc)
+
+    async def _run_folder(self, job: Job) -> None:
+        files = _list_supported_files(job.folder_path or "")
+        job.progress.total = len(files)
+        for path in files:
+            if job.cancel_requested:
+                job.status = CANCELLED
+                return
+            await self._process_one(job, path)
+        job.status = COMPLETED
+
+    async def _run_reindex_one(self, job: Job) -> None:
+        """Re-run the per-file pipeline for a single already-cataloged image.
+
+        Fetches the image's raw bytes from the app by sha256, runs the full
+        pipeline, and fans out the writes — the same path a fresh ingest takes,
+        but bypassing the dedup memory so the record is always refreshed.
+        """
+        job.progress.total = 1
+        if job.cancel_requested:
+            job.status = CANCELLED
+            return
+        sha256 = job.sha256 or ""
+        data, mime = await asyncio.to_thread(pipeline.fetch_image_bytes, sha256)
+        filename = f"{sha256}{_ext_for_mime(mime)}"
+        if job.cancel_requested:
+            job.status = CANCELLED
+            return
+        rec = await asyncio.to_thread(pipeline.process_file, data, filename)
+        await asyncio.to_thread(pipeline.fan_out_writes, rec)
+        self._seen_sha256.add(rec.sha256)
+        job.progress.done += 1
+        job.status = COMPLETED
+
+    async def _run_rebuild(self, job: Job) -> None:
+        """Drive a store rebuild via the TS app maintenance endpoint.
+
+        The rebuild itself is a single opaque unit of work owned by the store
+        (this phase); the ingest job wraps it so it gets the standard lifecycle
+        (queued/running/completed + cancellable while queued).
+        """
+        job.progress.total = 1
+        if job.cancel_requested:
+            job.status = CANCELLED
+            return
+        await asyncio.to_thread(pipeline.trigger_rebuild, job.rebuild_path or "")
+        job.progress.done += 1
+        job.status = COMPLETED
 
     async def _process_one(self, job: Job, path: Path) -> None:
         try:
@@ -131,6 +230,14 @@ class JobStore:
             job.progress.done += 1
         except Exception:
             job.progress.failed += 1
+
+
+def _ext_for_mime(mime: str) -> str:
+    return {
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/jpeg": ".jpg",
+    }.get(mime.lower(), ".png")
 
 
 def _list_supported_files(folder_path: str) -> list[Path]:
