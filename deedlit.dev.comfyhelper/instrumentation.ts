@@ -1,21 +1,14 @@
-export async function register() {
-  // Only bootstrap workers on the server (Node.js runtime), not during builds
-  // or in the Edge runtime.
-  if (process.env.NEXT_RUNTIME === "nodejs") {
-    const { ensureDatabase } = await import("@/lib/db/client");
-    await ensureDatabase();
+// Next.js instrumentation hook. Runs once per server process at startup.
+// Registers OpenTelemetry tracing via @vercel/otel, which auto-instruments
+// HTTP/fetch and exports spans over OTLP to the endpoint named by
+// OTEL_EXPORTER_OTLP_ENDPOINT (Alloy -> Tempo in docker-compose).
+//
+// When that env var is unset (e.g. plain `npm run dev`), no exporter is wired
+// up and tracing is a no-op, so this is safe to leave registered everywhere.
+import { registerOTel } from "@vercel/otel";
 
-    const { bootstrapWorkers } = await import("@/lib/workers/bootstrap");
-    await bootstrapWorkers();
-
-    // Register a graceful shutdown handler so the SQLite connection is cleanly
-    // closed (releasing WAL locks / journal files) when the process exits.
-    const { disconnectDatabase } = await import("@/lib/db/client");
-    const shutdown = () => {
-      disconnectDatabase().catch(() => {});
-    };
-    process.once("SIGTERM", shutdown);
-    process.once("SIGINT", shutdown);
-    process.once("beforeExit", shutdown);
-  }
+export function register() {
+  registerOTel({
+    serviceName: process.env.OTEL_SERVICE_NAME ?? "comfyhelper",
+  });
 }
