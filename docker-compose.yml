@@ -1,0 +1,199 @@
+# Deedlit target topology — datastores + all FastAPI services + UI.
+#
+#   docker compose up -d                     # datastores + all app services (stubs fill in)
+#   docker compose --profile vision up -d    # also start the GPU vision service
+#   docker compose --profile full up -d      # everything
+#
+# Each app service builds from its monorepo sibling dir and exposes GET /health
+# (+ FastAPI /openapi.json). PostgreSQL is the source of truth; Neo4j and Qdrant
+# are rebuildable projections; RustFS is S3-compatible blob storage.
+name: deedlit
+
+x-app-healthcheck: &app-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+  interval: 10s
+  timeout: 5s
+  retries: 20
+  start_period: 10s
+
+services:
+  # --- Datastores --------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: imageapp
+      POSTGRES_PASSWORD: imageapp
+      POSTGRES_DB: imageapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imageapp -d imageapp"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_VOLUMES: /data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs_data:/data
+      - rustfs_logs:/logs
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # --- Owning services ---------------------------------------------------
+  catalog:
+    build: { context: ./deedlit.catalog }
+    restart: unless-stopped
+    ports: ["8001:8000"]
+    environment:
+      DATABASE_URL: postgresql://imageapp:imageapp@postgres:5432/imageapp
+      OBJECT_STORE_ENDPOINT: http://rustfs:9000
+      OBJECT_STORE_ACCESS_KEY: rustfsadmin
+      OBJECT_STORE_SECRET_KEY: rustfsadmin
+      OBJECT_STORE_BUCKET: deedlit
+    depends_on:
+      postgres: { condition: service_healthy }
+      rustfs: { condition: service_healthy }
+    healthcheck: *app-healthcheck
+
+  search:
+    build: { context: ./deedlit.search }
+    restart: unless-stopped
+    ports: ["8002:8000"]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      qdrant: { condition: service_healthy }
+    healthcheck: *app-healthcheck
+
+  graph:
+    build: { context: ./deedlit.graph }
+    restart: unless-stopped
+    ports: ["8003:8000"]
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+    depends_on:
+      neo4j: { condition: service_healthy }
+    healthcheck: *app-healthcheck
+
+  # --- Stateless services ------------------------------------------------
+  metadata:
+    build: { context: ./deedlit.metadata }
+    restart: unless-stopped
+    ports: ["8005:8000"]
+    healthcheck: *app-healthcheck
+
+  ingest:
+    build: { context: ./deedlit.ingest }
+    restart: unless-stopped
+    ports: ["8004:8000"]
+    environment:
+      METADATA_URL: http://metadata:8000
+      VISION_URL: http://vision:8000
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+    depends_on:
+      metadata: { condition: service_healthy }
+    healthcheck: *app-healthcheck
+
+  # --- Gateway -----------------------------------------------------------
+  api:
+    build: { context: ./deedlit.api }
+    restart: unless-stopped
+    ports: ["8080:8000"]
+    environment:
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+      INGEST_URL: http://ingest:8000
+    depends_on:
+      catalog: { condition: service_healthy }
+      search: { condition: service_healthy }
+      graph: { condition: service_healthy }
+      ingest: { condition: service_healthy }
+    healthcheck: *app-healthcheck
+
+  # --- GPU vision (profile-gated; needs NVIDIA runtime) ------------------
+  vision:
+    profiles: ["vision", "full"]
+    build: { context: ./deedlit.vision }
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    environment:
+      COMFYUI_ROOT: /comfyui
+      CLIP_DEVICE: cuda
+      CLIP_MODEL_PRESET: vit_h
+      CLIP_FP16: "true"
+    volumes:
+      - "${COMFYUI_ROOT_HOST:-K:/comfyui/ComfyUI_windows_portable/ComfyUI}:/comfyui:ro"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  rustfs_data:
+  rustfs_logs:
