@@ -7,6 +7,7 @@ from catalog import object_store, repository
 from catalog.schemas import (
     Collection,
     CollectionImages,
+    CollectionRename,
     CollectionUpsert,
     FavoriteBody,
     Image,
@@ -127,6 +128,14 @@ def update_note(payload: NoteUpsert, id: str = Path(...)) -> Note:
     return note
 
 
+@router.get("/notes/{id}/export", response_model=Note)
+def export_note(id: str = Path(...)) -> Note:
+    note = repository.export_note(id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return note
+
+
 # --- collections -----------------------------------------------------------
 
 
@@ -138,6 +147,34 @@ def create_collection(payload: CollectionUpsert) -> Collection:
 @router.get("/collections", response_model=list[Collection])
 def list_collections() -> list[Collection]:
     return repository.list_collections()
+
+
+@router.get("/collections/by-image/{sha256}", response_model=list[Collection])
+def collections_by_image(sha256: str = SHA256) -> list[Collection]:
+    return repository.collections_by_image(sha256)
+
+
+@router.get("/collections/{id}", response_model=Collection)
+def read_collection(id: str = Path(...)) -> Collection:
+    col = repository.get_collection(id)
+    if col is None:
+        raise HTTPException(status_code=404, detail="collection not found")
+    return col
+
+
+@router.put("/collections/{id}", response_model=Collection)
+def rename_collection(payload: CollectionRename, id: str = Path(...)) -> Collection:
+    col = repository.rename_collection(id, payload.name)
+    if col is None:
+        raise HTTPException(status_code=404, detail="collection not found")
+    return col
+
+
+@router.delete("/collections/{id}")
+def delete_collection(id: str = Path(...)) -> dict:
+    if not repository.delete_collection(id):
+        raise HTTPException(status_code=404, detail="collection not found")
+    return {"status": "ok"}
 
 
 @router.put("/collections/{id}/images")

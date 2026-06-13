@@ -516,6 +516,11 @@ def get_note(note_id: str) -> Note | None:
         )
 
 
+def export_note(note_id: str) -> Note | None:
+    """Return the full note payload for export (same shape as get_note)."""
+    return get_note(note_id)
+
+
 def notes_by_image(sha256: str) -> list[Note]:
     eng = get_engine()
     with eng.connect() as conn:
@@ -582,6 +587,46 @@ def get_collection(cid: str) -> Collection | None:
             ).all()
         ]
         return Collection(id=str(row["id"]), name=row["name"], images=images)
+
+
+def rename_collection(cid: str, name: str) -> Collection | None:
+    eng = get_engine()
+    with eng.begin() as conn:
+        res = conn.execute(
+            text(
+                "UPDATE collections SET name = :name, updated_at = now() "
+                "WHERE id = :id"
+            ),
+            {"name": name, "id": cid},
+        )
+        if res.rowcount == 0:
+            return None
+    return get_collection(cid)
+
+
+def delete_collection(cid: str) -> bool:
+    eng = get_engine()
+    with eng.begin() as conn:
+        res = conn.execute(
+            text("DELETE FROM collections WHERE id = :id"), {"id": cid}
+        )
+        return res.rowcount > 0
+
+
+def collections_by_image(sha256: str) -> list[Collection]:
+    eng = get_engine()
+    with eng.connect() as conn:
+        ids = [
+            str(r[0])
+            for r in conn.execute(
+                text(
+                    "SELECT DISTINCT collection_id FROM collection_images "
+                    "WHERE sha256 = :sha"
+                ),
+                {"sha": sha256},
+            ).all()
+        ]
+    return [c for cid in ids if (c := get_collection(cid)) is not None]
 
 
 def set_collection_images(cid: str, images: list[str]) -> bool:

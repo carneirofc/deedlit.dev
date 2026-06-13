@@ -86,3 +86,7 @@ class Collection(CollectionUpsert):
 
 class CollectionImages(BaseModel):
     images: list[str]
+
+
+class CollectionRename(BaseModel):
+    name: str

@@ -207,3 +207,98 @@ def test_notes_and_collections(client) -> None:
     r = client.put(f"/collections/{col['id']}/images", json={"images": []})
     assert r.status_code == 200
     assert client.get("/collections").json()[0]["images"] == []
+
+
+# --- #12: note export ------------------------------------------------------
+
+
+def test_note_export(client) -> None:
+    sha = _sha()
+    note = client.post(
+        "/notes",
+        json={
+            "title": "export me",
+            "positive": "masterpiece",
+            "negative": "lowres",
+            "blocks": {"time": 7, "blocks": [{"type": "paragraph"}]},
+            "imageRefs": [sha],
+        },
+    ).json()
+
+    r = client.get(f"/notes/{note['id']}/export")
+    assert r.status_code == 200, r.text
+    payload = r.json()
+    assert payload["id"] == note["id"]
+    assert payload["title"] == "export me"
+    assert payload["positive"] == "masterpiece"
+    assert payload["negative"] == "lowres"
+    assert payload["blocks"] == {"time": 7, "blocks": [{"type": "paragraph"}]}
+    assert payload["imageRefs"] == [sha]
+
+
+def test_note_export_missing_404(client) -> None:
+    import uuid as _uuid
+
+    assert client.get(f"/notes/{_uuid.uuid4()}/export").status_code == 404
+
+
+# --- #13: collection rename / delete / reorder / by-image ------------------
+
+
+def test_collection_rename(client) -> None:
+    col = client.post("/collections", json={"name": "old"}).json()
+    r = client.put(f"/collections/{col['id']}", json={"name": "new"})
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "new"
+    assert client.get(f"/collections/{col['id']}").json()["name"] == "new"
+
+
+def test_collection_rename_missing_404(client) -> None:
+    import uuid as _uuid
+
+    assert (
+        client.put(f"/collections/{_uuid.uuid4()}", json={"name": "x"}).status_code
+        == 404
+    )
+
+
+def test_collection_delete(client) -> None:
+    col = client.post("/collections", json={"name": "doomed"}).json()
+    r = client.delete(f"/collections/{col['id']}")
+    assert r.status_code == 200, r.text
+    assert client.get(f"/collections/{col['id']}").status_code == 404
+    assert client.delete(f"/collections/{col['id']}").status_code == 404
+
+
+def test_collection_read_one(client) -> None:
+    sha = _sha()
+    col = client.post("/collections", json={"name": "single", "images": [sha]}).json()
+    got = client.get(f"/collections/{col['id']}")
+    assert got.status_code == 200, got.text
+    assert got.json()["images"] == [sha]
+
+
+def test_collection_reorder_images(client) -> None:
+    a, b, c = _sha(), _sha(), _sha()
+    col = client.post(
+        "/collections", json={"name": "ordered", "images": [a, b, c]}
+    ).json()
+    assert col["images"] == [a, b, c]
+    # reorder + remove b (set semantics)
+    r = client.put(f"/collections/{col['id']}/images", json={"images": [c, a]})
+    assert r.status_code == 200, r.text
+    assert client.get(f"/collections/{col['id']}").json()["images"] == [c, a]
+
+
+def test_collections_by_image(client) -> None:
+    sha = _sha()
+    other = _sha()
+    c1 = client.post("/collections", json={"name": "has-it", "images": [sha]}).json()
+    client.post("/collections", json={"name": "not-it", "images": [other]}).json()
+    c3 = client.post(
+        "/collections", json={"name": "also-has-it", "images": [other, sha]}
+    ).json()
+
+    listed = client.get(f"/collections/by-image/{sha}").json()
+    ids = {c["id"] for c in listed}
+    assert ids == {c1["id"], c3["id"]}
