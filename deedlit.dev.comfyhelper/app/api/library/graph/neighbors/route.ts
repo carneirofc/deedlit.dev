@@ -1,24 +1,23 @@
-import { z } from "zod";
-
 import { handleRoute, jsonOk } from "@/lib/library/http";
-import { ensureLibrarySchema } from "@/lib/library/db/migrate";
-import { GraphScopeSchema } from "@/lib/library/schemas";
-import { resolveGraphScope } from "@/lib/library/services/graph-service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const BodySchema = z.object({
-  graphScope: GraphScopeSchema,
-  limit: z.number().int().min(1).max(5000).default(1000),
-});
-
-/** Resolve a graph scope to the image ids it permits (count preview + scoping). */
-export async function POST(request: Request) {
-  return handleRoute(async () => {
-    const body = BodySchema.parse(await request.json());
-    await ensureLibrarySchema();
-    const ids = (await resolveGraphScope(body.graphScope, body.limit)) ?? [];
-    return jsonOk({ ids, count: ids.length });
-  });
+/**
+ * Resolve a graph scope (hub node / related-to-image) to the image ids it
+ * permits — used by the GraphFilterPanel to preview a match count and to
+ * constrain searches.
+ *
+ * DEGRADED: the deedlit.api gateway exposes no graph-scope resolution endpoint
+ * (deedlit.graph has /neighbors but the gateway only surfaces it per-image via
+ * MCP, with no hub-node or scoped-id resolution). comfyhelper is UI-only and
+ * may not query Neo4j directly, so graph-scoped filtering is unavailable: we
+ * return an empty, unconstraining result (count 0, unsupported flag) so the
+ * panel renders without breaking searches.
+ * TODO(#17): wire scoped filtering once the gateway resolves graph scopes.
+ */
+export async function POST() {
+  return handleRoute(async () =>
+    jsonOk({ ids: [], count: 0, unsupported: true }),
+  );
 }

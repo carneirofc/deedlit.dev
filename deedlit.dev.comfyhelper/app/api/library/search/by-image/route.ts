@@ -1,55 +1,22 @@
-import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
-import { ensureLibrarySchema } from "@/lib/library/db/migrate";
-import { ImageSearchOptionsSchema } from "@/lib/library/schemas";
-import { searchByExternalImage } from "@/lib/library/services/search-service";
-import { getEmbeddingProvider, hasExternalImageEmbeddings } from "@/lib/library/services/embedding-service";
+import { jsonError } from "@/lib/library/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
-
 /**
- * Reverse-image search.  Accepts multipart form-data with a `file` (the pasted
- * or uploaded image, never persisted) and an optional `options` JSON string
- * carrying filters / limit / minScore.  The image is embedded in-memory and
- * matched against the Qdrant collection.
+ * Reverse-image search from a pasted/uploaded image.
+ *
+ * DEGRADED: this requires embedding raw image bytes and querying the vector
+ * store with the resulting vector. The deedlit.api gateway exposes no
+ * image-upload search path (deedlit.search /by-image takes a *stored* sha256,
+ * and the gateway does not surface it). comfyhelper is UI-only and may not call
+ * deedlit.vision / deedlit.search directly, so this returns 501 until the
+ * gateway adds an upload-search endpoint.
+ * TODO(#17): wire reverse-image search once the gateway exposes upload search.
  */
-export async function POST(request: Request) {
-  return handleRoute(async () => {
-    const form = await request.formData();
-
-    const file = form.get("file");
-    if (!(file instanceof Blob)) {
-      return jsonError("Expected an image in the 'file' field.", 400);
-    }
-    if (file.size === 0) return jsonError("Empty image file.", 400);
-    if (file.size > MAX_BYTES) return jsonError("Image too large (max 20 MB).", 413);
-
-    const rawOptions = form.get("options");
-    const options = ImageSearchOptionsSchema.parse(
-      rawOptions ? JSON.parse(String(rawOptions)) : {},
-    );
-
-    await ensureLibrarySchema();
-
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const mime = file.type || "image/png";
-    const results = await searchByExternalImage(
-      buffer,
-      mime,
-      options.filters,
-      options.limit,
-      options.minScore,
-      options.graphScope,
-    );
-
-    return jsonOk({
-      results,
-      count: results.length,
-      provider: getEmbeddingProvider(),
-      // false → matched on the local color/layout fallback (CLIP not configured)
-      semantic: hasExternalImageEmbeddings(),
-    });
-  });
+export async function POST() {
+  return jsonError(
+    "Reverse-image search is not available: the gateway exposes no image-upload search endpoint.",
+    501,
+  );
 }

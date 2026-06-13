@@ -1,26 +1,16 @@
-import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
-import { browseDirectory } from "@/lib/library/services/fs-browse-service";
+import { jsonError } from "@/lib/library/http";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * GET /api/library/fs/browse?path=<dir>
+ * Server-side directory listing for the ingest folder picker.
  *
- * Lists the server-side directory at `path` (or the synthetic roots view when
- * omitted) so the directory picker can navigate the filesystem to choose an
- * ingest folder.  Read-only.
+ * DEGRADED: this listed the host filesystem of the monolith. comfyhelper is now
+ * UI-only and runs nowhere near the ingest worker's filesystem, and the gateway
+ * exposes no fs-browse endpoint. The picker falls back to manual path entry.
+ * TODO(#17): wire a folder picker against deedlit.ingest's host if needed.
  */
-export async function GET(request: Request) {
-  return handleRoute(async () => {
-    const target = new URL(request.url).searchParams.get("path");
-    try {
-      return jsonOk(await browseDirectory(target));
-    } catch (error) {
-      // Filesystem errors (missing/denied/not-a-dir) are user-correctable, so
-      // surface them as 400s the picker can show inline rather than 500s.
-      const message = error instanceof Error ? error.message : "Unable to read folder.";
-      return jsonError(message, 400);
-    }
-  });
+export async function GET() {
+  return jsonError("Folder browsing is not available; type the ingest path manually.", 501);
 }

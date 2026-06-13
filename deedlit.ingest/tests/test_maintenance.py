@@ -2,13 +2,14 @@
 
 Maintenance jobs reuse the #9 in-memory Job model + async worker loop, so they
 get progress + cooperative cancel for free. All outbound HTTP (metadata, vision,
-app fan-out, app read of image bytes, app/service rebuild endpoints) is
-monkeypatched so the suite is deterministic and offline.
+the catalog/search/graph fan-out, the catalog read of original image bytes, and
+the owning-service rebuild calls) is monkeypatched so the suite is deterministic
+and offline.
 
 Covered:
   (1) POST /jobs type=reindex-one-image (with sha256) runs and reports progress
   (2) POST /jobs type=rescan-files runs over a tmp library dir
-  (3) a rebuild-* type starts and completes
+  (3) a rebuild-* type starts and completes (driving the owning service directly)
   (4) a maintenance job is cancellable mid-run
   (5) invalid/missing required fields -> 4xx (reindex without sha256, bad type)
 """
@@ -157,24 +158,30 @@ def test_rescan_files_accepts_explicit_root(tmp_path, fresh_store, mock_outbound
 
 
 # ---------------------------------------------------------------------------
-# (3) rebuild-* types start and complete
+# (3) rebuild-* types start and complete (driving the owning service directly)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "rtype,endpoint",
+    "rtype,func_name",
     [
-        ("rebuild-search", "/api/library/maintenance/rebuild-qdrant"),
-        ("rebuild-graph", "/api/library/maintenance/rebuild-neo4j"),
-        ("rebuild-thumbnails", "/api/library/maintenance/regenerate-thumbnails"),
+        ("rebuild-search", "rebuild_search"),       # search POST /rebuild
+        ("rebuild-graph", "rebuild_graph"),         # graph  POST /rebuild
+        ("rebuild-thumbnails", "rebuild_thumbnails"),  # catalog-owned rebuild
     ],
 )
-def test_rebuild_types_drive_app_endpoint(fresh_store, monkeypatch, rtype, endpoint):
+def test_rebuild_types_drive_owning_service(fresh_store, monkeypatch, rtype, func_name):
     triggered: list[str] = []
 
-    def fake_trigger(path):
-        triggered.append(path)
-        return {"ok": True}
+    def make_fake(name):
+        def fake():
+            triggered.append(name)
+            return {"ok": True}
 
-    monkeypatch.setattr(pipeline, "trigger_rebuild", fake_trigger)
+        return fake
+
+    # Mock every owning-service rebuild so we can assert exactly one fired.
+    monkeypatch.setattr(pipeline, "rebuild_search", make_fake("rebuild_search"))
+    monkeypatch.setattr(pipeline, "rebuild_graph", make_fake("rebuild_graph"))
+    monkeypatch.setattr(pipeline, "rebuild_thumbnails", make_fake("rebuild_thumbnails"))
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": rtype})
@@ -189,7 +196,7 @@ def test_rebuild_types_drive_app_endpoint(fresh_store, monkeypatch, rtype, endpo
         assert final["progress"]["total"] == 1
         assert final["progress"]["done"] == 1
 
-    assert triggered == [endpoint]
+    assert triggered == [func_name]
 
 
 # ---------------------------------------------------------------------------

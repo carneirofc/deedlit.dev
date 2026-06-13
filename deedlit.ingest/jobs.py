@@ -43,12 +43,16 @@ RECONCILE = "reconcile"
 # them one-by-one (cheaper, targeted) instead of a full collection rebuild.
 RECONCILE_PER_IMAGE_MAX = int(os.getenv("RECONCILE_PER_IMAGE_MAX", "10"))
 
-# rebuild-* -> the TS app maintenance endpoint each one drives (this phase).
-# Re-pointing these directly at search/graph/object-store is deferred to #17.
-REBUILD_ENDPOINTS = {
-    REBUILD_SEARCH: "/api/library/maintenance/rebuild-qdrant",
-    REBUILD_GRAPH: "/api/library/maintenance/rebuild-neo4j",
-    REBUILD_THUMBNAILS: "/api/library/maintenance/regenerate-thumbnails",
+# rebuild-* -> the owning service's rebuild-from-catalog entrypoint (#17).
+# Each value is the name of the pipeline function that drives the owning
+# service's rebuild DIRECTLY (no longer the TS app):
+#   rebuild-search     -> search POST /rebuild
+#   rebuild-graph      -> graph  POST /rebuild
+#   rebuild-thumbnails -> catalog rebuild (catalog owns thumbnail blobs)
+REBUILD_FUNCS = {
+    REBUILD_SEARCH: "rebuild_search",
+    REBUILD_GRAPH: "rebuild_graph",
+    REBUILD_THUMBNAILS: "rebuild_thumbnails",
 }
 
 
@@ -70,7 +74,7 @@ class Job:
     # Inputs / control (not serialized to the API).
     folder_path: str | None = None
     sha256: str | None = None
-    rebuild_path: str | None = None
+    rebuild_func: str | None = None
     per_image_max: int | None = None
     cancel_requested: bool = False
     # Reconcile output: per-image projection status + repair summary (#21).
@@ -128,16 +132,16 @@ class JobStore:
           - reindex-one-image: re-run the per-file pipeline for one sha256.
           - rescan-files: walk the library root (or an explicit folder) and
             ingest new/changed files (reuses the #9 folder pipeline).
-          - rebuild-search/graph/thumbnails: drive the corresponding rebuild via
-            the TS app maintenance endpoint (this phase; see REBUILD_ENDPOINTS).
+          - rebuild-search/graph/thumbnails: drive the corresponding rebuild
+            DIRECTLY against the owning service (#17; see REBUILD_FUNCS).
         """
         job = Job(id=str(uuid.uuid4()), type=mtype)
         if mtype == REINDEX_ONE_IMAGE:
             job.sha256 = sha256
         elif mtype == RESCAN_FILES:
             job.folder_path = folder_path or LIBRARY_ROOT
-        elif mtype in REBUILD_ENDPOINTS:
-            job.rebuild_path = REBUILD_ENDPOINTS[mtype]
+        elif mtype in REBUILD_FUNCS:
+            job.rebuild_func = REBUILD_FUNCS[mtype]
         elif mtype == RECONCILE:
             return self.create_reconcile_job()
         return self._enqueue(job)
@@ -190,7 +194,7 @@ class JobStore:
                 await self._run_reindex_one(job)
             elif job.type == RECONCILE:
                 await self._run_reconcile(job)
-            elif job.type in REBUILD_ENDPOINTS:
+            elif job.type in REBUILD_FUNCS:
                 await self._run_rebuild(job)
             else:
                 # "ingest" and "rescan-files" both walk a folder and run the
@@ -235,17 +239,20 @@ class JobStore:
         job.status = COMPLETED
 
     async def _run_rebuild(self, job: Job) -> None:
-        """Drive a store rebuild via the TS app maintenance endpoint.
+        """Drive a store rebuild DIRECTLY against the owning service (#17).
 
         The rebuild itself is a single opaque unit of work owned by the store
-        (this phase); the ingest job wraps it so it gets the standard lifecycle
-        (queued/running/completed + cancellable while queued).
+        (search/graph/catalog); the ingest job wraps it so it gets the standard
+        lifecycle (queued/running/completed + cancellable while queued). The
+        target function is resolved from REBUILD_FUNCS (search/graph POST
+        /rebuild, catalog thumbnail rebuild).
         """
         job.progress.total = 1
         if job.cancel_requested:
             job.status = CANCELLED
             return
-        await asyncio.to_thread(pipeline.trigger_rebuild, job.rebuild_path or "")
+        rebuild = getattr(pipeline, job.rebuild_func or "")
+        await asyncio.to_thread(rebuild)
         job.progress.done += 1
         job.status = COMPLETED
 

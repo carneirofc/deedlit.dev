@@ -3,10 +3,11 @@
 FastAPI worker that owns write/index orchestration (moved out of the Next.js
 app). Per-file pipeline computes sha256/phash/dims/WebP-thumbnail, calls
 ``metadata`` + ``vision`` (dense + sparse), assembles a record, and fans the
-writes out to the TS app's write endpoints (catalog-first, per-store retry).
+writes out DIRECTLY to the owning services — catalog (record + thumbnail blob),
+search (point), graph (edges) — catalog-first, per-store retry (#17).
 
 The job model is IN-MEMORY (the service holds no DB driver) with an async
-claim/worker loop. Direct fan-out to catalog/search/graph is deferred to #17.
+claim/worker loop.
 
 Endpoints (see contracts/ingest.openapi.yaml):
   GET  /health

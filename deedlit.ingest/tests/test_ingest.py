@@ -1,7 +1,8 @@
 """Tests for the deedlit.ingest job lifecycle + single-file pipeline + fan-out.
 
-All outbound HTTP (metadata, vision, app fan-out) is monkeypatched so the suite
-is deterministic and offline. Images are tiny PNGs built with Pillow.
+All outbound HTTP (metadata, vision, and the catalog/search/graph fan-out) is
+monkeypatched so the suite is deterministic and offline. Images are tiny PNGs
+built with Pillow.
 """
 from __future__ import annotations
 
@@ -198,67 +199,118 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     assert rec.record["sha256"] == rec.sha256
     assert rec.point["dense"] == [0.1, 0.2, 0.3]
     assert rec.point["sparse"] == {"indices": [1, 2], "values": [0.5, 0.7]}
-    assert rec.point["id"] == pipeline.point_id_for_sha256(rec.sha256)
+    # search UpsertPoint is keyed by sha256 (search derives uuid5 itself); the
+    # derived point id is surfaced in the payload.
+    assert rec.point["sha256"] == rec.sha256
+    assert rec.point["payload"]["point_id"] == pipeline.point_id_for_sha256(rec.sha256)
     # references flattened to {kind,name,hash}
     assert {"kind": "checkpoint", "name": "sdxl", "hash": None} in rec.record["references"]
     assert rec.thumbnail is not None
 
 
 # ---------------------------------------------------------------------------
-# (5) fan-out calls catalog-first with retry on transient failure
+# (5) fan-out writes DIRECTLY to catalog/search/graph, catalog-first, w/ retry
 # ---------------------------------------------------------------------------
-def test_fanout_catalog_first_with_retry(monkeypatch):
-    posted: list[str] = []
-    attempts = {"n": 0}
+class _FakeResp:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.request = None
+        self.response = None
 
-    class FakeResp:
-        def __init__(self, status_code):
-            self.status_code = status_code
-            self.request = None
-            self.response = None
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise pipeline.httpx.HTTPStatusError("err", request=None, response=None)
 
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise pipeline.httpx.HTTPStatusError("err", request=None, response=None)
+
+def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
+    """The fan-out hits the OWNING services directly (#17), not the TS app:
+
+      catalog POST /images -> catalog PUT /blobs/{sha}/thumbnail
+        -> search POST /points -> graph POST /edges
+
+    Catalog is FIRST (record before blob before the derived projections) and the
+    catalog record POST is retried on a transient 500.
+    """
+    sha = "a" * 64
+    calls: list[tuple[str, str]] = []  # (method, url)
+    attempts = {"images": 0}
 
     def fake_post(url, json=None, timeout=None):
-        posted.append(url)
-        # First call to the catalog endpoint fails transiently (500), then 200.
-        if url.endswith("/api/library/images"):
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                return FakeResp(500)
-        return FakeResp(200)
+        calls.append(("POST", url))
+        if url == f"{pipeline.CATALOG_URL}/images":
+            attempts["images"] += 1
+            if attempts["images"] == 1:
+                return _FakeResp(500)  # transient failure, then retry succeeds
+        return _FakeResp(200)
+
+    def fake_put(url, content=None, headers=None, timeout=None):
+        calls.append(("PUT", url))
+        return _FakeResp(200)
 
     monkeypatch.setattr(pipeline.httpx, "post", fake_post)
+    monkeypatch.setattr(pipeline.httpx, "put", fake_put)
 
     rec = pipeline.IngestRecord(
-        sha256="a" * 64,
-        record={"sha256": "a" * 64},
-        point={"sha256": "a" * 64, "dense": [0.0]},
-        edges={"sha256": "a" * 64},
+        sha256=sha,
+        record={"sha256": sha},
+        point={"sha256": sha, "dense": [0.0]},
+        edges={"sha256": sha},
+        thumbnail=b"webp-bytes",
+    )
+    pipeline.fan_out_writes(rec)
+
+    urls = [u for _m, u in calls]
+    images_idx = [i for i, u in enumerate(urls) if u == f"{pipeline.CATALOG_URL}/images"]
+    thumb_idx = urls.index(f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail")
+    points_idx = urls.index(f"{pipeline.SEARCH_URL}/points")
+    edges_idx = urls.index(f"{pipeline.GRAPH_URL}/edges")
+
+    # Direct service targets, NOT the TS app.
+    assert all("/api/library/" not in u for u in urls)
+    # Catalog record retried (2 POSTs) and the whole catalog write (record +
+    # thumbnail blob) lands BEFORE search, which lands before graph.
+    assert len(images_idx) == 2  # one failed + one retry success
+    assert max(images_idx) < thumb_idx < points_idx < edges_idx
+    # The thumbnail blob was PUT (not POSTed).
+    assert ("PUT", f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail") in calls
+
+
+def test_fanout_skips_thumbnail_blob_when_absent(monkeypatch):
+    """No thumbnail -> no blob PUT, but the record/point/edges still fan out."""
+    sha = "c" * 64
+    calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline.httpx,
+        "post",
+        lambda url, json=None, timeout=None: (calls.append(url) or _FakeResp(200)),
+    )
+    monkeypatch.setattr(
+        pipeline.httpx,
+        "put",
+        lambda url, content=None, headers=None, timeout=None: (calls.append(url) or _FakeResp(200)),
+    )
+
+    rec = pipeline.IngestRecord(
+        sha256=sha,
+        record={"sha256": sha},
+        point={"sha256": sha, "dense": [0.0]},
+        edges={"sha256": sha},
         thumbnail=None,
     )
     pipeline.fan_out_writes(rec)
 
-    # Catalog retried (2 posts to images) and succeeded BEFORE search/graph ran.
-    images_idx = [i for i, u in enumerate(posted) if u.endswith("/api/library/images")]
-    points_idx = posted.index(f"{pipeline.APP_WRITE_URL}/api/library/points")
-    edges_idx = posted.index(f"{pipeline.APP_WRITE_URL}/api/library/edges")
-    assert len(images_idx) == 2  # one failed + one retry success
-    assert max(images_idx) < points_idx < edges_idx  # catalog-first ordering
+    assert f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail" not in calls
+    assert calls == [
+        f"{pipeline.CATALOG_URL}/images",
+        f"{pipeline.SEARCH_URL}/points",
+        f"{pipeline.GRAPH_URL}/edges",
+    ]
 
 
 def test_fanout_raises_after_exhausting_retries(monkeypatch):
-    class FakeResp:
-        status_code = 503
-        request = None
-        response = None
-
-        def raise_for_status(self):
-            raise pipeline.httpx.HTTPStatusError("err", request=None, response=None)
-
-    monkeypatch.setattr(pipeline.httpx, "post", lambda url, json=None, timeout=None: FakeResp())
+    monkeypatch.setattr(
+        pipeline.httpx, "post", lambda url, json=None, timeout=None: _FakeResp(503)
+    )
     rec = pipeline.IngestRecord(
         sha256="b" * 64, record={}, point={}, edges={}, thumbnail=None
     )

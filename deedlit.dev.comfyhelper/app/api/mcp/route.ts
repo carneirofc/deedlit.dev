@@ -1,21 +1,16 @@
 import { NextResponse } from "next/server";
 
-import { getLibraryConfig } from "@/lib/library/config";
-import { handleMcpBody } from "@/lib/library/mcp/server";
-import { MCP_TOOLS } from "@/lib/library/mcp/tools";
+import { mcpRpc } from "@/lib/api-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * MCP-over-HTTP endpoint (stateless JSON-RPC).  External LLMs/agents connect
- * here to call the image-library tools.  Security is intentionally open for v1;
- * the tool boundary is the seam where auth will later be added.
+ * MCP-over-HTTP endpoint. comfyhelper is UI-only; the MCP tool surface now lives
+ * in the deedlit.api gateway (deedlit.api/mcp.py). This route is a thin proxy
+ * that forwards JSON-RPC bodies to the gateway's POST /mcp and relays the reply.
  */
 export async function POST(request: Request) {
-  if (!getLibraryConfig().mcpEnabled) {
-    return NextResponse.json({ error: "MCP is disabled (set MCP_ENABLED=true)." }, { status: 403 });
-  }
   let body: unknown;
   try {
     body = await request.json();
@@ -25,21 +20,22 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
-  const response = await handleMcpBody(body);
-  if (response === null) {
+  const response = await mcpRpc(body);
+  if (response === null || response === undefined) {
     return new NextResponse(null, { status: 202 });
   }
   return NextResponse.json(response);
 }
 
-/** Convenience discovery endpoint: list available tools without JSON-RPC. */
+/** Discovery: list the gateway's MCP tools without JSON-RPC framing. */
 export async function GET() {
-  if (!getLibraryConfig().mcpEnabled) {
-    return NextResponse.json({ error: "MCP is disabled (set MCP_ENABLED=true)." }, { status: 403 });
-  }
+  const res = (await mcpRpc({ jsonrpc: "2.0", id: 1, method: "tools/list" })) as {
+    result?: { tools?: Array<{ name: string; description: string }> };
+  };
   return NextResponse.json({
     server: "comfyhelper-image-library",
     transport: "http-jsonrpc",
-    tools: MCP_TOOLS.map((t) => ({ name: t.name, description: t.description })),
+    proxiedTo: "deedlit.api",
+    tools: (res?.result?.tools ?? []).map((t) => ({ name: t.name, description: t.description })),
   });
 }

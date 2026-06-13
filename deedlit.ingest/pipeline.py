@@ -7,12 +7,20 @@ The pipeline for one image file:
       -> vision POST /embed/image (dense)
       -> vision POST /embed/sparse (sparse, over the extracted prompt text)
       -> assemble a catalog-shaped record + a search point + graph edges
-      -> fan out the writes to the TS app's write endpoints (catalog-first,
-         per-store retry).
+      -> fan out the writes DIRECTLY to the owning services (catalog/search/
+         graph), catalog-first, per-store retry.
 
 deedlit.ingest holds NO DB drivers. Persistence happens by HTTP fan-out to the
-TS app (``APP_WRITE_URL``); re-pointing the fan-out directly at
-catalog/search/graph is deferred to issue #17.
+owning services (issue #17):
+
+  - record    -> catalog  POST /images            (ImageUpsert shape)
+  - thumbnail -> catalog  PUT  /blobs/{sha}/thumbnail
+  - point     -> search   POST /points            (dense + sparse + payload)
+  - edges     -> graph    POST /edges             (references/tags/lineage)
+
+The fan-out used the TS app's write endpoints as an interim (issue #9); #17
+re-points it at the owning service contracts (contracts/{catalog,search,graph}
+.openapi.yaml) so the TS app is UI-only.
 
 The outbound HTTP boundary lives in small module-level functions
 (``extract_metadata``, ``embed_image``, ``embed_sparse``, ``fan_out_writes``)
@@ -35,16 +43,22 @@ from id_scheme import point_id_for_sha256
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via env)
 # ---------------------------------------------------------------------------
-APP_WRITE_URL = os.getenv("APP_WRITE_URL", "http://localhost:3000").rstrip("/")
 METADATA_URL = os.getenv("METADATA_URL", "http://localhost:8005").rstrip("/")
 VISION_URL = os.getenv("VISION_URL", "http://localhost:8000").rstrip("/")
 
-# Per-service URLs for the reconcile sweep (issue #21). Reconcile reads catalog
-# coverage and probes/repairs the search + graph projections directly against
-# their own service contracts (contracts/{catalog,search,graph}.openapi.yaml).
+# Per-service URLs for the fan-out (#17) AND the reconcile sweep (#21). The
+# fan-out and reconcile both talk DIRECTLY to the owning service contracts
+# (contracts/{catalog,search,graph}.openapi.yaml); the TS app is UI-only.
 CATALOG_URL = os.getenv("CATALOG_URL", "http://localhost:8001").rstrip("/")
 SEARCH_URL = os.getenv("SEARCH_URL", "http://localhost:8002").rstrip("/")
 GRAPH_URL = os.getenv("GRAPH_URL", "http://localhost:8003").rstrip("/")
+
+# Catalog RustFS blob kind that holds the raw original image bytes. The catalog
+# contract enumerates only `thumbnail`/`embedding` blob kinds for I/O, but the
+# original bytes live in the same sha256-keyed object store; reindex reads them
+# from this kind. Overridable so deployments that key the original differently
+# (or front the object store directly) can re-point without code changes.
+CATALOG_ORIGINAL_BLOB_KIND = os.getenv("CATALOG_ORIGINAL_BLOB_KIND", "original")
 
 HTTP_TIMEOUT = float(os.getenv("INGEST_HTTP_TIMEOUT", "30.0"))
 FANOUT_RETRIES = int(os.getenv("INGEST_FANOUT_RETRIES", "3"))
@@ -158,34 +172,32 @@ def embed_sparse(text: str) -> dict[str, list]:
 # Maintenance boundary (read image bytes / trigger rebuilds) — monkeypatched
 # ---------------------------------------------------------------------------
 def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
-    """GET the raw original bytes of an image by sha256 from the TS app.
+    """GET the raw original bytes of an image by sha256 from catalog (#17).
 
     Used by the ``reindex-one-image`` maintenance job, which re-runs the per-file
     pipeline for a single already-cataloged image. The cross-service id is the
-    sha256, so the read endpoint is keyed by it. Returns ``(bytes, mime)``.
+    sha256, so the blob read is keyed by it. Returns ``(bytes, mime)``.
 
-    NOTE: this reads from the TS app (``APP_WRITE_URL``). Re-pointing the read
-    directly at catalog/object-store is deferred to issue #17.
+    Reads the original bytes from the catalog's sha256-keyed RustFS object store
+    via ``GET /blobs/{sha256}/{CATALOG_ORIGINAL_BLOB_KIND}`` (no longer the TS
+    app). See ``CATALOG_ORIGINAL_BLOB_KIND`` for the blob-kind caveat.
     """
-    url = f"{APP_WRITE_URL}/api/library/images/{sha256}/file"
+    url = f"{CATALOG_URL}/blobs/{sha256}/{CATALOG_ORIGINAL_BLOB_KIND}"
     resp = httpx.get(url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
     return resp.content, mime
 
 
-def trigger_rebuild(path: str) -> dict[str, Any]:
-    """POST to a TS app maintenance/rebuild endpoint and return its JSON result.
+def rebuild_thumbnails() -> dict[str, Any]:
+    """Regenerate thumbnails from catalog originals (catalog-owned rebuild, #17).
 
-    ``rebuild-search`` / ``rebuild-graph`` / ``rebuild-thumbnails`` are owned by
-    the stores' rebuild logic, which (in this phase) still lives behind the TS
-    app's maintenance endpoints. The ingest job drives that endpoint so the
-    operation gets the in-memory job lifecycle (progress/cancel) wrapped around
-    it. Re-pointing rebuilds directly at search/graph/object-store is deferred to
-    issue #17.
+    Thumbnails are catalog RustFS blobs, so the rebuild is owned by catalog. The
+    catalog contract has no dedicated thumbnail-rebuild verb, so this drives the
+    catalog ``POST /rebuild`` path (the owning-service rebuild entrypoint); the
+    ingest job wraps it for the standard progress/cancel lifecycle.
     """
-    url = f"{APP_WRITE_URL}{path}"
-    resp = httpx.post(url, timeout=HTTP_TIMEOUT)
+    resp = httpx.post(f"{CATALOG_URL}/rebuild", timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     try:
         return resp.json()
@@ -379,12 +391,15 @@ def assemble_record(
         "api_prompt_json": extract.get("api_prompt_json"),
     }
 
+    # search UpsertPoint: {sha256, dense, sparse?, payload?}. Search keys the
+    # Qdrant point by uuid5(sha256) itself; we surface the derived id in the
+    # payload so consumers that read points back can resolve it without
+    # recomputing.
     point = {
-        "id": point_id_for_sha256(sha256),
         "sha256": sha256,
         "dense": dense,
         "sparse": sparse,
-        "payload": {"sha256": sha256, "tags": tags},
+        "payload": {"sha256": sha256, "point_id": point_id_for_sha256(sha256), "tags": tags},
     }
 
     edges = {
@@ -442,15 +457,24 @@ def process_file(data: bytes, filename: str) -> IngestRecord:
 # ---------------------------------------------------------------------------
 # Fan-out (catalog-first, per-store retry)
 # ---------------------------------------------------------------------------
-def _post_with_retry(url: str, json_body: dict[str, Any], retries: int = FANOUT_RETRIES) -> None:
-    """POST with per-store retry on transient failure (5xx / network error)."""
+def _request_with_retry(
+    send,
+    label: str,
+    retries: int = FANOUT_RETRIES,
+) -> None:
+    """Run ``send`` with per-store retry on transient failure (5xx / network).
+
+    ``send`` is a zero-arg callable returning an ``httpx.Response``; ``label`` is
+    used only for the raised error message. A 5xx (or transport error) is
+    retried; a 4xx fails fast (the request itself is wrong and won't recover).
+    """
     last_exc: Exception | None = None
-    for attempt in range(retries):
+    for _attempt in range(retries):
         try:
-            resp = httpx.post(url, json=json_body, timeout=HTTP_TIMEOUT)
+            resp = send()
             if resp.status_code >= 500:
                 last_exc = httpx.HTTPStatusError(
-                    f"{url} -> {resp.status_code}", request=resp.request, response=resp
+                    f"{label} -> {resp.status_code}", request=resp.request, response=resp
                 )
                 continue
             resp.raise_for_status()
@@ -462,8 +486,31 @@ def _post_with_retry(url: str, json_body: dict[str, Any], retries: int = FANOUT_
     raise last_exc
 
 
+def _post_with_retry(url: str, json_body: dict[str, Any], retries: int = FANOUT_RETRIES) -> None:
+    """POST JSON with per-store retry on transient failure (5xx / network)."""
+    _request_with_retry(
+        lambda: httpx.post(url, json=json_body, timeout=HTTP_TIMEOUT), url, retries
+    )
+
+
+def _put_blob_with_retry(
+    url: str, data: bytes, content_type: str, retries: int = FANOUT_RETRIES
+) -> None:
+    """PUT raw blob bytes with per-store retry on transient failure."""
+    _request_with_retry(
+        lambda: httpx.put(
+            url,
+            content=data,
+            headers={"content-type": content_type},
+            timeout=HTTP_TIMEOUT,
+        ),
+        url,
+        retries,
+    )
+
+
 def fan_out_writes(rec: IngestRecord) -> None:
-    """Persist one record to the TS app's write endpoints.
+    """Persist one record directly to the owning services (catalog/search/graph).
 
     Order is catalog/truth FIRST (the source of truth must land before the
     derived projections), then the search point, then graph edges. Each store
@@ -471,12 +518,22 @@ def fan_out_writes(rec: IngestRecord) -> None:
     (the derived stores would point at a missing record); search/graph failures
     propagate too so the file is recorded as failed and can be re-run.
 
-    NOTE: this fans out to the TS app (``APP_WRITE_URL``). Re-pointing these
-    writes directly at catalog/search/graph is deferred to issue #17.
+    Targets (issue #17 — direct to owning services, no longer the TS app):
+      1. catalog  POST /images                 record (ImageUpsert)
+         catalog  PUT  /blobs/{sha}/thumbnail  thumbnail blob (if present)
+      2. search   POST /points                 dense + sparse + payload
+      3. graph    POST /edges                   references/tags/lineage
     """
-    # 1. catalog / truth  (record keyed by sha256)
-    _post_with_retry(f"{APP_WRITE_URL}/api/library/images", rec.record)
-    # 2. search           (dense + sparse point)
-    _post_with_retry(f"{APP_WRITE_URL}/api/library/points", rec.point)
-    # 3. graph            (reference/tag/lineage edges)
-    _post_with_retry(f"{APP_WRITE_URL}/api/library/edges", rec.edges)
+    sha = rec.sha256
+    # 1. catalog / truth FIRST: the record, then its thumbnail blob. The record
+    #    must land before the blob (the blob hangs off the cataloged image) and
+    #    before the derived projections.
+    _post_with_retry(f"{CATALOG_URL}/images", rec.record)
+    if rec.thumbnail is not None:
+        _put_blob_with_retry(
+            f"{CATALOG_URL}/blobs/{sha}/thumbnail", rec.thumbnail, "image/webp"
+        )
+    # 2. search: dense + sparse point (keyed by uuid5(sha256) inside search).
+    _post_with_retry(f"{SEARCH_URL}/points", rec.point)
+    # 3. graph: reference/tag/lineage edges.
+    _post_with_retry(f"{GRAPH_URL}/edges", rec.edges)
