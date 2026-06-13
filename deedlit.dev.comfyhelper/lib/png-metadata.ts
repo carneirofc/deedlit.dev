@@ -145,41 +145,6 @@ function toMetadataObject(chunks: TextChunk[]): unknown {
   };
 }
 
-function extractTextChunks(buffer: Buffer): TextChunk[] {
-  const chunks: TextChunk[] = [];
-
-  if (buffer.length < PNG_SIGNATURE.length || !buffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
-    return chunks;
-  }
-
-  let offset = 8;
-  while (offset + 12 <= buffer.length) {
-    const length = buffer.readUInt32BE(offset);
-    const type = buffer.subarray(offset + 4, offset + 8).toString("ascii");
-    const dataStart = offset + 8;
-    const dataEnd = dataStart + length;
-    const crcEnd = dataEnd + 4;
-
-    if (crcEnd > buffer.length) {
-      break;
-    }
-
-    if (type === "tEXt" || type === "zTXt" || type === "iTXt") {
-      const parsed = parseChunk(type, buffer.subarray(dataStart, dataEnd));
-      if (parsed) {
-        chunks.push(parsed);
-      }
-    }
-
-    offset = crcEnd;
-    if (type === "IEND") {
-      break;
-    }
-  }
-
-  return chunks;
-}
-
 export async function readEmbeddedMetadataFromPng(imagePath: string): Promise<EmbeddedMetadataResult> {
   let handle;
   try {
