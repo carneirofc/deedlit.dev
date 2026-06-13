@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deedlit Vision API</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111;
+      --panel: #181818;
+      --panel-2: #0d0d0d;
+      --ink: #f5f5f5;
+      --muted: #9a9a9a;
+      --line: #333;
+      --accent: #e8e0c8;
+      --good: #5dd39e;
+      --bad: #e06c6c;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink); }
+    main { max-width: 1040px; margin: 0 auto; display: grid; gap: 18px; }
+    header h1 { margin: 0 0 6px; font-size: 22px; }
+    nav { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-size: 13px; }
+    nav a { color: var(--accent); text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    .badge {
+      margin-left: auto; font-size: 12px; color: var(--muted);
+      border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px;
+    }
+    section {
+      border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+      background: var(--panel);
+    }
+    section h2 { margin: 0 0 4px; font-size: 16px; }
+    section p.hint { margin: 0 0 12px; font-size: 12px; color: var(--muted); }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    label { display: grid; gap: 5px; font-size: 13px; flex: 1 1 200px; }
+    input, textarea, select, button {
+      font: inherit; border-radius: 7px;
+    }
+    input, textarea, select {
+      border: 1px solid #3c3c3c; padding: 8px; background: var(--panel-2); color: #fff;
+    }
+    textarea { min-height: 72px; resize: vertical; }
+    button {
+      border: 0; padding: 9px 14px; background: var(--accent); color: #171717;
+      cursor: pointer; font-weight: 600; white-space: nowrap;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.secondary { background: #2a2a2a; color: var(--ink); border: 1px solid var(--line); }
+    .err { color: var(--bad); font-size: 13px; margin-top: 10px; min-height: 1em; }
+    .status { font-size: 13px; margin-bottom: 10px; }
+    .status.ok { color: var(--good); }
+    .status.warn { color: var(--accent); }
+    .status.bad { color: var(--bad); }
+
+    /* result grids */
+    .results { margin-top: 14px; display: grid; gap: 10px; }
+    .grid {
+      display: grid; gap: 12px; margin-top: 14px;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    }
+    .card {
+      border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+      background: var(--panel-2); display: grid;
+    }
+    .card img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; background: #000; }
+    .card .meta { padding: 8px; display: grid; gap: 6px; }
+    .card .name { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rank { font-size: 11px; color: var(--accent); font-weight: 700; }
+
+    .refbox { display: flex; gap: 12px; align-items: center; margin-top: 12px; }
+    .refbox img { width: 90px; height: 90px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+    .refbox .reflabel { font-size: 12px; color: var(--muted); }
+
+    .bar { height: 7px; border-radius: 999px; background: #2a2a2a; overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+    .score { font-size: 12px; display: flex; justify-content: space-between; gap: 8px; }
+    .score b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+    /* ranked text rows */
+    .rowitem { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--panel-2); display: grid; gap: 7px; }
+    .rowitem .label { font-size: 13px; word-break: break-word; }
+    .rowitem img.qd-thumb { width: 100%; max-height: 220px; object-fit: contain; background: #000; border-radius: 6px; display: block; }
+    .payload a { color: var(--accent); text-decoration: none; }
+    .payload a:hover { text-decoration: underline; }
+
+    /* encode preview */
+    pre.vec {
+      margin: 12px 0 0; white-space: pre-wrap; word-break: break-all;
+      border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+      background: var(--panel-2); font-size: 12px; max-height: 200px; overflow: auto;
+    }
+    .kv { font-size: 12px; color: var(--muted); }
+    .kv b { color: var(--ink); }
+    .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+    .seg button { background: var(--panel-2); color: var(--ink); border-radius: 0; padding: 7px 12px; font-weight: 500; }
+    .seg button.active { background: var(--accent); color: #171717; font-weight: 700; }
+
+    .payload { font-size: 12px; display: grid; gap: 3px; }
+    .payload code { color: var(--accent); word-break: break-all; }
+
+    /* services dashboard */
+    .svc-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); margin-top: 4px; }
+    .svc {
+      border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--panel-2);
+      display: grid; gap: 8px; align-content: start;
+    }
+    .svc .top { display: flex; align-items: center; gap: 8px; }
+    .svc .name { font-weight: 700; font-size: 14px; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); display: inline-block; vertical-align: middle; }
+    .model-pick { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+    .model-pick select { padding: 5px 8px; }
+    .dot.up { background: var(--good); box-shadow: 0 0 0 3px rgba(93,211,158,0.18); }
+    .dot.down { background: var(--bad); box-shadow: 0 0 0 3px rgba(224,108,108,0.18); }
+    .svc .detail { font-size: 12px; color: var(--muted); }
+    .svc .info { font-size: 12px; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .svc a.console { font-size: 12px; color: var(--accent); text-decoration: none; }
+    .svc a.console:hover { text-decoration: underline; }
+    .svc .nolink { font-size: 12px; color: var(--muted); }
+    .svc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .svc-head button { padding: 6px 10px; font-size: 12px; }
+
+    /* progress monitor */
+    .prog { margin-top: 12px; display: grid; gap: 6px; }
+    .prog .bar { height: 8px; }
+    .prog.indet .bar > span { width: 35% !important; animation: slide 1.1s ease-in-out infinite; }
+    @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+    .prog .line { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 10px; }
+    .prog .line b { color: var(--ink); font-variant-numeric: tabular-nums; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Deedlit Vision API</h1>
+    <nav>
+      <a href="/docs">Swagger</a>
+      <a href="/redoc">ReDoc</a>
+      <a href="/openapi.json">OpenAPI</a>
+      <a href="/health">Health</a>
+      <a href="/models">Models</a>
+      <label class="model-pick">Model
+        <select id="model-select"><option>…</option></select>
+      </label>
+    </nav>
+  </header>
+
+  <!-- SERVICES DASHBOARD -->
+  <section>
+    <div class="svc-head">
+      <h2 style="margin:0;">Services</h2>
+      <button class="secondary" id="svc-refresh" type="button">Refresh</button>
+    </div>
+    <p class="hint">Backing data-stack services (comfyhelper docker-compose). Status is probed by the API; links open each service's own console.</p>
+    <div class="svc-grid" id="svc-grid"><div class="kv">Checking…</div></div>
+  </section>
+
+  <!-- MODELS -->
+  <section>
+    <div class="svc-head">
+      <h2 style="margin:0;">Models</h2>
+      <button class="secondary" id="models-refresh" type="button">Refresh</button>
+    </div>
+    <p class="hint">Both CLIP models can be loaded for comparison. Pick one with the <b>Model</b> selector above; it applies to every section below. Settings come from <code>/models</code> — consumers use <b>dim</b> as the Qdrant vector size and <b>distance</b> as the metric.</p>
+    <div class="svc-grid" id="models-grid"><div class="kv">Checking…</div></div>
+  </section>
+
+  <!-- IMAGE -> IMAGE -->
+  <section>
+    <h2>Image → Image</h2>
+    <p class="hint">Upload one reference image and several candidates. Candidates are ranked by visual cosine similarity.</p>
+    <form id="ii-form">
+      <div class="row">
+        <label>Reference image <input name="reference" type="file" accept="image/*" required /></label>
+        <label>Candidate images <input name="candidates" type="file" accept="image/*" multiple required /></label>
+        <button type="submit">Compare</button>
+      </div>
+    </form>
+    <div class="prog" id="ii-prog" hidden></div>
+    <div class="refbox" id="ii-ref" hidden></div>
+    <div class="grid" id="ii-results"></div>
+    <div class="err" id="ii-err"></div>
+  </section>
+
+  <!-- TEXT -> IMAGE -->
+  <section>
+    <h2>Text → Image</h2>
+    <p class="hint">Type a query and upload images. Images are ranked by how well they match the text — the Qdrant search use case, run locally on your uploads.</p>
+    <form id="ti-form">
+      <div class="row">
+        <label>Text query <input name="text" value="red-haired anime knight in gothic ruins" required /></label>
+        <label>Candidate images <input name="images" type="file" accept="image/*" multiple required /></label>
+        <button type="submit">Rank</button>
+      </div>
+    </form>
+    <div class="prog" id="ti-prog" hidden></div>
+    <div class="grid" id="ti-results"></div>
+    <div class="err" id="ti-err"></div>
+  </section>
+
+  <!-- TEXT -> TEXT -->
+  <section>
+    <h2>Text → Text</h2>
+    <p class="hint">Score candidate phrases against a reference phrase.</p>
+    <form id="tt-form">
+      <label>Reference <input name="reference" value="a red sports car" required /></label>
+      <label>Candidates (one per line) <textarea name="candidates">a blue sedan
+a bowl of fruit
+a crimson ferrari</textarea></label>
+      <div class="row"><button type="submit">Compare</button></div>
+    </form>
+    <div class="prog" id="tt-prog" hidden></div>
+    <div class="results" id="tt-results"></div>
+    <div class="err" id="tt-err"></div>
+  </section>
+
+  <!-- ENCODE PREVIEW -->
+  <section>
+    <h2>Encode preview</h2>
+    <p class="hint">Encode a single input and inspect its vector — for debugging client ingestion into Qdrant.</p>
+    <div class="seg" id="enc-seg">
+      <button type="button" data-mode="text" class="active">Text</button>
+      <button type="button" data-mode="image">Image</button>
+    </div>
+    <form id="enc-form" style="margin-top:12px;">
+      <div class="row" id="enc-text-row">
+        <label>Text <input name="text" value="a calico cat on a windowsill" /></label>
+        <button type="submit">Encode</button>
+      </div>
+      <div class="row" id="enc-image-row" hidden>
+        <label>Image <input name="file" type="file" accept="image/*" /></label>
+        <button type="submit">Encode</button>
+      </div>
+    </form>
+    <div id="enc-out" hidden>
+      <div class="kv" id="enc-meta"></div>
+      <pre class="vec" id="enc-vec"></pre>
+      <button class="secondary" id="enc-copy" type="button">Copy full vector JSON</button>
+    </div>
+    <div class="err" id="enc-err"></div>
+  </section>
+
+  <!-- QDRANT SEARCH -->
+  <section id="qd-section">
+    <h2>Qdrant search</h2>
+    <p class="hint">Search a live Qdrant collection using a deedlit.vision embedding. Available only when Qdrant is reachable and the collection's vector size matches this model.</p>
+    <div class="status" id="qd-status">Checking Qdrant…</div>
+    <form id="qd-form">
+      <div class="row">
+        <div class="seg" id="qd-seg">
+          <button type="button" data-mode="text" class="active">By text</button>
+          <button type="button" data-mode="image">By image</button>
+        </div>
+        <label id="qd-text-label">Query <input name="text" value="anime knight in gothic ruins" /></label>
+        <label id="qd-image-label" hidden>Image <input name="file" type="file" accept="image/*" /></label>
+        <label style="flex:0 0 90px;">Limit <input name="limit" type="number" value="12" min="1" max="100" /></label>
+        <button type="submit" id="qd-submit" disabled>Search</button>
+      </div>
+    </form>
+    <div class="prog" id="qd-prog" hidden></div>
+    <div class="results" id="qd-results"></div>
+    <div class="err" id="qd-err"></div>
+  </section>
+</main>
+
+<script>
+// ---------------------------------------------------------------- helpers
+const $ = (sel, root = document) => root.querySelector(sel);
+
+async function api(url, options) {
+  const resp = await fetch(url, options);
+  const text = await resp.text();
+  let body = text;
+  try { body = JSON.parse(text); } catch {}
+  if (!resp.ok) {
+    const detail = (body && body.detail) ? body.detail : (typeof body === "string" ? body : resp.statusText);
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return body;
+}
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+function scoreBlock(score) {
+  const pct = (clamp01(score) * 100).toFixed(1);
+  const el = document.createElement("div");
+  el.innerHTML =
+    `<div class="bar"><span style="width:${pct}%"></span></div>` +
+    `<div class="score"><span>cosine</span><b>${score.toFixed(4)}</b></div>`;
+  return el;
+}
+
+function setErr(id, err) { $("#" + id).textContent = err ? (err.message || String(err)) : ""; }
+
+function fileMap(fileList) {
+  // index -> object URL, mirroring the order files are appended to FormData
+  return Array.from(fileList).map((f) => ({ file: f, url: URL.createObjectURL(f) }));
+}
+
+function imageCard({ url, name, score, rank }) {
+  const card = document.createElement("div");
+  card.className = "card";
+  const img = document.createElement("img");
+  img.src = url; img.alt = name || "";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.innerHTML = `<div class="rank">#${rank}</div><div class="name" title="${name || ""}">${name || ""}</div>`;
+  meta.appendChild(scoreBlock(score));
+  card.append(img, meta);
+  return card;
+}
+
+// ---------------------------------------------------------------- progress monitor
+function startProgress(elId, label) {
+  const el = document.getElementById(elId);
+  el.hidden = false;
+  el.classList.add("indet");
+  el.innerHTML =
+    `<div class="bar"><span style="width:35%"></span></div>` +
+    `<div class="line"><span class="phase"></span><b class="elapsed">0.0s</b></div>`;
+  const phaseEl = el.querySelector(".phase");
+  const elapsedEl = el.querySelector(".elapsed");
+  const barEl = el.querySelector(".bar > span");
+  phaseEl.textContent = label;
+  const t0 = performance.now();
+  const timer = setInterval(() => {
+    elapsedEl.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+  }, 100);
+  return {
+    upload(pct) {
+      el.classList.remove("indet");
+      barEl.style.width = pct.toFixed(0) + "%";
+      phaseEl.textContent = `Uploading… ${pct.toFixed(0)}%`;
+    },
+    setPhase(text) {
+      el.classList.add("indet");
+      barEl.style.width = "35%";
+      phaseEl.textContent = text;
+    },
+    done() { clearInterval(timer); el.hidden = true; el.classList.remove("indet"); el.innerHTML = ""; },
+  };
+}
+
+// POST a FormData with upload progress; resolves parsed JSON or throws Error(detail).
+function xhrSend(url, formData, onUpload) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    if (xhr.upload && onUpload) {
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onUpload((e.loaded / e.total) * 100); };
+      xhr.upload.onload = () => onUpload(100);
+    }
+    xhr.onload = () => {
+      let body = xhr.responseText;
+      try { body = JSON.parse(body); } catch {}
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      const detail = body && body.detail ? body.detail : xhr.statusText;
+      reject(new Error(typeof detail === "string" ? detail : JSON.stringify(detail)));
+    };
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.send(formData);
+  });
+}
+
+// ---------------------------------------------------------------- services dashboard
+function renderServices(list) {
+  const grid = $("#svc-grid");
+  grid.innerHTML = "";
+  for (const s of list) {
+    const card = document.createElement("div");
+    card.className = "svc";
+    const link = s.console_url
+      ? `<a class="console" href="${s.console_url}" target="_blank" rel="noopener">Open console ↗</a>`
+      : `<span class="nolink">no web console</span>`;
+    card.innerHTML =
+      `<div class="top"><span class="dot ${s.reachable ? "up" : "down"}"></span>` +
+      `<span class="name">${s.name}</span></div>` +
+      (s.info ? `<div class="info">${s.info}</div>` : "") +
+      (s.detail ? `<div class="detail">${s.detail}</div>` : "") +
+      link;
+    grid.appendChild(card);
+  }
+}
+
+async function loadServices() {
+  const grid = $("#svc-grid");
+  grid.innerHTML = `<div class="kv">Checking…</div>`;
+  try {
+    const data = await api("/services/status");
+    renderServices(data.services);
+  } catch (err) {
+    grid.innerHTML = `<div class="err">Could not read service status: ${err.message || err}</div>`;
+  }
+}
+$("#svc-refresh").addEventListener("click", loadServices);
+loadServices();
+
+// ---------------------------------------------------------------- models
+function currentModel() {
+  const sel = $("#model-select");
+  return sel && sel.value && sel.value !== "…" ? sel.value : "";
+}
+
+function renderModels(data) {
+  // selector: enabled presets only
+  const sel = $("#model-select");
+  const prev = sel.value;
+  const enabled = data.models.filter((m) => m.enabled);
+  sel.innerHTML = "";
+  for (const m of enabled) {
+    const opt = document.createElement("option");
+    opt.value = m.preset;
+    opt.textContent = `${m.preset} · ${m.model_name} · ${m.dim}d`;
+    sel.appendChild(opt);
+  }
+  sel.value = enabled.some((m) => m.preset === prev) ? prev : data.default_preset;
+
+  // cards
+  const grid = $("#models-grid");
+  grid.innerHTML = "";
+  for (const m of data.models) {
+    const card = document.createElement("div");
+    card.className = "svc";
+    const badge = m.is_default
+      ? `<span class="rank">default</span>`
+      : (m.enabled ? "" : `<span class="nolink">disabled</span>`);
+    const weights = m.local_safetensors_exists ? "weights ✓" : "weights ✗ (vision unavailable)";
+    card.innerHTML =
+      `<div class="top"><span class="name">${m.preset}</span> ${badge}</div>` +
+      `<div class="info">${m.model_name} · ${m.dim}d · ${m.distance}</div>` +
+      `<div class="detail">${m.device}${m.fp16 ? " · fp16" : ""} · ${weights}</div>` +
+      `<div class="detail">vision <span class="dot ${m.vision_ready ? "up" : "down"}"></span>` +
+      ` &nbsp; text <span class="dot ${m.text_ready ? "up" : "down"}"></span> ` +
+      `<span class="kv">(loaded when used)</span></div>`;
+    grid.appendChild(card);
+  }
+}
+
+async function loadModels() {
+  const grid = $("#models-grid");
+  grid.innerHTML = `<div class="kv">Checking…</div>`;
+  try {
+    renderModels(await api("/models"));
+  } catch (err) {
+    grid.innerHTML = `<div class="err">Could not read models: ${err.message || err}</div>`;
+  }
+}
+$("#models-refresh").addEventListener("click", loadModels);
+loadModels();
+
+// ---------------------------------------------------------------- image -> image
+$("#ii-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setErr("ii-err", null);
+  const form = e.currentTarget;
+  const refFile = form.elements.reference.files[0];
+  const cands = fileMap(form.elements.candidates.files);
+  if (!refFile || cands.length === 0) return;
+
+  const refBox = $("#ii-ref");
+  refBox.hidden = false;
+  refBox.innerHTML = "";
+  const refImg = document.createElement("img");
+  refImg.src = URL.createObjectURL(refFile);
+  const refLabel = document.createElement("div");
+  refLabel.className = "reflabel";
+  refLabel.textContent = `reference: ${refFile.name}`;
+  refBox.append(refImg, refLabel);
+
+  const results = $("#ii-results");
+  results.innerHTML = "";
+  const prog = startProgress("ii-prog", "Preparing…");
+  try {
+    const body = new FormData();
+    body.append("reference", refFile);
+    for (const c of cands) body.append("candidates", c.file);
+    body.append("model", currentModel());
+    const data = await xhrSend("/similarity/image", body, (p) => {
+      if (p >= 100) prog.setPhase(`Encoding ${cands.length + 1} images…`);
+      else prog.upload(p);
+    });
+    data.results.forEach((r, i) => {
+      results.appendChild(imageCard({ url: cands[r.index].url, name: r.label, score: r.similarity, rank: i + 1 }));
+    });
+  } catch (err) { setErr("ii-err", err); }
+  finally { prog.done(); }
+});
+
+// ---------------------------------------------------------------- text -> image
+$("#ti-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setErr("ti-err", null);
+  const form = e.currentTarget;
+  const imgs = fileMap(form.elements.images.files);
+  if (imgs.length === 0) return;
+  const results = $("#ti-results");
+  results.innerHTML = "";
+  const prog = startProgress("ti-prog", "Preparing…");
+  try {
+    const body = new FormData();
+    body.append("text", form.elements.text.value);
+    for (const c of imgs) body.append("images", c.file);
+    body.append("model", currentModel());
+    const data = await xhrSend("/similarity/text-to-image", body, (p) => {
+      if (p >= 100) prog.setPhase(`Encoding text + ${imgs.length} images…`);
+      else prog.upload(p);
+    });
+    data.results.forEach((r, i) => {
+      results.appendChild(imageCard({ url: imgs[r.index].url, name: r.label, score: r.similarity, rank: i + 1 }));
+    });
+  } catch (err) { setErr("ti-err", err); }
+  finally { prog.done(); }
+});
+
+// ---------------------------------------------------------------- text -> text
+$("#tt-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setErr("tt-err", null);
+  const form = e.currentTarget;
+  const candidates = form.elements.candidates.value.split("\n").map((v) => v.trim()).filter(Boolean);
+  if (!candidates.length) return;
+  const results = $("#tt-results");
+  results.innerHTML = "";
+  const prog = startProgress("tt-prog", `Encoding ${candidates.length + 1} texts…`);
+  try {
+    const data = await api("/similarity/text", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reference: form.elements.reference.value, candidates, model: currentModel() }),
+    });
+    data.results.forEach((r, i) => {
+      const item = document.createElement("div");
+      item.className = "rowitem";
+      item.innerHTML = `<div class="label"><span class="rank">#${i + 1}</span> ${r.label}</div>`;
+      item.appendChild(scoreBlock(r.similarity));
+      results.appendChild(item);
+    });
+  } catch (err) { setErr("tt-err", err); }
+  finally { prog.done(); }
+});
+
+// ---------------------------------------------------------------- encode preview
+let encMode = "text";
+let lastVector = null;
+$("#enc-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn) return;
+  encMode = btn.dataset.mode;
+  $$all("#enc-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+  $("#enc-text-row").hidden = encMode !== "text";
+  $("#enc-image-row").hidden = encMode !== "image";
+});
+function $$all(sel, root = document) { return Array.from(root.querySelectorAll(sel)); }
+
+$("#enc-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setErr("enc-err", null);
+  const form = e.currentTarget;
+  try {
+    let data;
+    if (encMode === "text") {
+      data = await api("/embed/text", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: form.elements.text.value, model: currentModel() }),
+      });
+    } else {
+      const file = form.elements.file.files[0];
+      if (!file) { setErr("enc-err", new Error("Choose an image first.")); return; }
+      const body = new FormData();
+      body.append("file", file);
+      body.append("model", currentModel());
+      data = await api("/embed/image", { method: "POST", body });
+    }
+    lastVector = data.embedding;
+    $("#enc-out").hidden = false;
+    $("#enc-meta").innerHTML =
+      `<b>dim</b> ${data.dim} · <b>model</b> ${data.model_name} · <b>device</b> ${data.device}`;
+    const head = data.embedding.slice(0, 12).map((v) => v.toFixed(5));
+    $("#enc-vec").textContent = `[${head.join(", ")}${data.embedding.length > 12 ? ", …" : ""}]`;
+  } catch (err) { setErr("enc-err", err); }
+});
+
+$("#enc-copy").addEventListener("click", async () => {
+  if (!lastVector) return;
+  await navigator.clipboard.writeText(JSON.stringify(lastVector));
+  const btn = $("#enc-copy");
+  const prev = btn.textContent;
+  btn.textContent = "Copied!";
+  setTimeout(() => (btn.textContent = prev), 1200);
+});
+
+// ---------------------------------------------------------------- qdrant search
+let qdMode = "text";
+let qdEnabled = false;
+
+$("#qd-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-mode]");
+  if (!btn) return;
+  qdMode = btn.dataset.mode;
+  $$all("#qd-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+  $("#qd-text-label").hidden = qdMode !== "text";
+  $("#qd-image-label").hidden = qdMode !== "image";
+});
+
+function renderQdrantHit(hit, rank) {
+  const p = hit.payload || {};
+  const item = document.createElement("div");
+  item.className = "rowitem";
+  const tags = Array.isArray(p.tags) ? p.tags.slice(0, 12).join(", ") : "";
+  // Proxy URLs are served by comfyhelper (absolute); file_path is a server-local
+  // filesystem path that the browser cannot open, so link the path to image_url.
+  const thumb = p.thumbnail_url || p.image_url;
+  const full = p.image_url || p.thumbnail_url;
+
+  // Thumbnail preview (drops itself if the proxy URL fails to load).
+  if (thumb) {
+    const link = document.createElement("a");
+    link.href = full || thumb; link.target = "_blank"; link.rel = "noopener";
+    const img = document.createElement("img");
+    img.className = "qd-thumb"; img.loading = "lazy"; img.alt = p.file_path || String(hit.id);
+    img.src = thumb;
+    img.onerror = () => link.remove();
+    link.appendChild(img);
+    item.appendChild(link);
+  }
+
+  const lines = [];
+  lines.push(`<div class="payload"><span class="rank">#${rank}</span> id <code>${hit.id}</code></div>`);
+  if (p.file_path) {
+    const pathHtml = full
+      ? `<a href="${full}" target="_blank" rel="noopener"><code>${p.file_path}</code></a>`
+      : `<code>${p.file_path}</code>`;
+    lines.push(`<div class="payload">path ${pathHtml}</div>`);
+  }
+  const facts = [p.model_family, p.checkpoint].filter(Boolean).join(" · ");
+  if (facts) lines.push(`<div class="payload">${facts}</div>`);
+  if (tags) lines.push(`<div class="payload">tags <code>${tags}</code></div>`);
+  const meta = document.createElement("div");
+  meta.style.display = "grid";
+  meta.style.gap = "3px";
+  meta.innerHTML = lines.join("");
+  item.appendChild(meta);
+  item.appendChild(scoreBlock(hit.score));
+  return item;
+}
+
+(async () => {
+  const statusEl = $("#qd-status");
+  let s;
+  try {
+    s = await api("/qdrant/status");
+  } catch (err) {
+    statusEl.className = "status bad";
+    statusEl.textContent = "Could not read Qdrant status: " + (err.message || err);
+    return;
+  }
+  if (!s.reachable) {
+    statusEl.className = "status bad";
+    statusEl.textContent = s.detail || `Qdrant not reachable at ${s.configured_url}.`;
+    return;
+  }
+  if (!s.collection_exists) {
+    statusEl.className = "status warn";
+    statusEl.textContent = s.detail || `Connected to ${s.configured_url}, but collection "${s.collection}" does not exist.`;
+    return;
+  }
+  if (!s.dim_matches) {
+    statusEl.className = "status warn";
+    statusEl.textContent = s.detail ||
+      `Collection "${s.collection}" is ${s.vector_size}-dim; model is ${s.model_dim}-dim. Rebuild it with deedlit.vision embeddings to enable search.`;
+    return;
+  }
+  qdEnabled = true;
+  $("#qd-submit").disabled = false;
+  statusEl.className = "status ok";
+  statusEl.textContent =
+    `Connected · collection "${s.collection}" · ${s.points_count ?? "?"} points · ${s.vector_size}-dim ${s.distance || ""}`;
+})();
+
+$("#qd-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  setErr("qd-err", null);
+  if (!qdEnabled) return;
+  const form = e.currentTarget;
+  const limit = Number(form.elements.limit.value) || 12;
+  const results = $("#qd-results");
+  results.innerHTML = "";
+  if (qdMode === "image" && !form.elements.file.files[0]) {
+    setErr("qd-err", new Error("Choose an image first.")); return;
+  }
+  const prog = startProgress("qd-prog", qdMode === "text" ? "Encoding query…" : "Preparing…");
+  try {
+    let data;
+    if (qdMode === "text") {
+      data = await api("/qdrant/search/text", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: form.elements.text.value, limit, model: currentModel() }),
+      });
+    } else {
+      const body = new FormData();
+      body.append("file", form.elements.file.files[0]);
+      body.append("limit", String(limit));
+      body.append("model", currentModel());
+      data = await xhrSend("/qdrant/search/image", body, (p) => {
+        if (p >= 100) prog.setPhase("Encoding image + searching…");
+        else prog.upload(p);
+      });
+    }
+    if (!data.results.length) { results.innerHTML = `<div class="kv">No matches.</div>`; }
+    else data.results.forEach((hit, i) => results.appendChild(renderQdrantHit(hit, i + 1)));
+  } catch (err) { setErr("qd-err", err); }
+  finally { prog.done(); }
+});
+</script>
+</body>
+</html>
