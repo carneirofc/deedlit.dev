@@ -4,12 +4,16 @@ import path from "node:path";
 const nextConfig: NextConfig = {
   transpilePackages: ["@deedlit.dev/ui"],
   // Native / server-only packages must not be bundled by the Next compiler.
+  // The OpenTelemetry instrumentations use Node module hooks (require/import-in-
+  // the-middle) and must stay external so they can patch pg/@aws-sdk at runtime.
   serverExternalPackages: [
     "sharp",
     "pg",
     "neo4j-driver",
     "@qdrant/js-client-rest",
     "@aws-sdk/client-s3",
+    "@opentelemetry/instrumentation-pg",
+    "@opentelemetry/instrumentation-aws-sdk",
   ],
   turbopack: {
     resolveAlias: {
