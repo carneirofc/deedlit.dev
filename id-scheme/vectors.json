@@ -1,0 +1,27 @@
+{
+  "_comment": "Shared cross-language test vectors for the deedlit ID scheme. Generated from Python's stdlib uuid (RFC 4122). Every service's reference helper MUST reproduce these exactly. See README.md.",
+  "namespace": "697124e2-0736-5d17-812d-590ba305cb45",
+  "namespaceDerivation": "uuid5(uuid.NAMESPACE_URL, \"https://deedlit.dev/id-scheme/v1\")",
+  "vectors": [
+    {
+      "label": "empty",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "pointId": "339906d9-4648-5292-b99c-88d5dda1b7b1"
+    },
+    {
+      "label": "hello",
+      "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "pointId": "82b6e40c-2cc9-54a3-81c4-46658525aaf6"
+    },
+    {
+      "label": "deedlit",
+      "sha256": "0ac1614da8b02d3683057f47999d8c0b6b759457c94ad95167d1072cfbb19bbb",
+      "pointId": "659fd46f-b20d-5480-aeae-ffe8d6259993"
+    },
+    {
+      "label": "png-bytes-sample",
+      "sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+      "pointId": "c404fba1-6273-5b30-af2f-1d57996c07a9"
+    }
+  ]
+}
