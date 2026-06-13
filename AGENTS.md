@@ -59,6 +59,20 @@ All commits must follow **[Conventional Commits](https://www.conventionalcommits
 
 Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `style`, `perf`.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub issues on `carneirofc/deedlit.dev` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default canonical vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context monorepo (root `CONTEXT.md` + `docs/adr/`, with authoritative package-local docs). See `docs/agents/domain.md`.
+
 ## Instruction Layout
 - Root `.github/copilot-instructions.md` contains shared monorepo rules.
 - Each package has its own `.github/copilot-instructions.md` for local architecture.
