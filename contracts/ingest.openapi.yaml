@@ -1,0 +1,52 @@
+openapi: 3.1.0
+info:
+  title: deedlit.ingest
+  version: 0.1.0
+  description: >
+    Stateless ingest/index worker. Per-file pipeline computes
+    sha256/phash/dims/WebP thumbnail, calls metadata + vision (dense + sparse),
+    then fans out writes to catalog/search/graph (catalog-first, per-store retry).
+    Also hosts maintenance job types. Holds no DB drivers.
+servers:
+  - url: http://deedlit-ingest:8000
+paths:
+  /health:
+    get: { summary: Liveness, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } } } }
+  /ingest:
+    post:
+      summary: Start an ingest job over a folder
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { folderPath: { type: string } }, required: [folderPath] } } } }
+      responses: { "202": { description: Job started, content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } } }
+  /jobs:
+    post:
+      summary: Start a maintenance job
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceRequest" } } } }
+      responses: { "202": { description: Job started, content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } } }
+  /jobs/{id}:
+    get:
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      summary: Job status / progress
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } }, "404": { description: Not found } }
+  /jobs/{id}/cancel:
+    post:
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      summary: Cancel a running job
+      responses: { "200": { description: Cancelling } }
+components:
+  schemas:
+    Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] } }, required: [status] }
+    MaintenanceRequest:
+      type: object
+      properties:
+        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails] }
+        sha256: { type: [string, "null"], pattern: "^[a-f0-9]{64}$", description: "for reindex-one-image" }
+      required: [type]
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string }
+        status: { type: string, enum: [queued, running, completed, failed, cancelled] }
+        progress: { type: object, properties: { total: { type: integer }, done: { type: integer }, skipped: { type: integer }, failed: { type: integer } } }
+        error: { type: [string, "null"] }
+      required: [id, type, status]

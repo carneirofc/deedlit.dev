@@ -1,0 +1,83 @@
+openapi: 3.1.0
+info:
+  title: deedlit.api
+  version: 0.1.0
+  description: >
+    BFF gateway (no DB). Single base URL for the UI. Aggregates catalog + search
+    + graph for detail pages (parallelized), hosts the MCP JSON-RPC surface,
+    dispatches/proxies ingest jobs, and serves stats + jobs/health dashboard data.
+servers:
+  - url: http://deedlit-api:8000
+paths:
+  /health:
+    get:
+      summary: Gateway liveness + downstream service health
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/HealthDashboard" } } } } }
+  /detail/{sha256}:
+    get:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Aggregated detail (catalog + search neighbors + graph), parallel fan-out
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Detail" } } } } }
+  /search:
+    post:
+      summary: Hybrid search proxied to deedlit.search
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { query: { type: string }, limit: { type: integer, default: 24 }, filter: { type: [object, "null"], additionalProperties: true } }, required: [query] } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+  /stats:
+    get:
+      summary: Aggregated library stats
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } } }
+  /jobs:
+    post:
+      summary: Dispatch an ingest/maintenance job (proxy to ingest)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses: { "202": { description: Started, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+    get:
+      summary: List jobs (proxy to ingest) for the dashboard
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } } }
+  /mcp:
+    post:
+      summary: MCP JSON-RPC over HTTP
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/JsonRpcRequest" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/JsonRpcResponse" } } } } }
+components:
+  schemas:
+    Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+    ServiceHealth: { type: object, properties: { name: { type: string }, status: { type: string, enum: [ok, degraded, down] } }, required: [name, status] }
+    HealthDashboard:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        services: { type: array, items: { $ref: "#/components/schemas/ServiceHealth" } }
+      required: [status]
+    Detail:
+      type: object
+      properties:
+        image: { type: object, additionalProperties: true, description: "from catalog" }
+        similar: { type: array, items: { type: object, additionalProperties: true }, description: "from search" }
+        neighbors: { type: array, items: { type: object, additionalProperties: true }, description: "from graph" }
+      required: [image]
+    Stats:
+      type: object
+      properties:
+        images: { type: integer }
+        tags: { type: integer }
+        collections: { type: integer }
+        notes: { type: integer }
+      required: [images]
+    JsonRpcRequest:
+      type: object
+      properties:
+        jsonrpc: { type: string, enum: ["2.0"] }
+        id: { type: [string, integer, "null"] }
+        method: { type: string }
+        params: { type: object, additionalProperties: true }
+      required: [jsonrpc, method]
+    JsonRpcResponse:
+      type: object
+      properties:
+        jsonrpc: { type: string, enum: ["2.0"] }
+        id: { type: [string, integer, "null"] }
+        result: { type: object, additionalProperties: true }
+        error: { type: [object, "null"], additionalProperties: true }
+      required: [jsonrpc]

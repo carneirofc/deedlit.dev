@@ -1,0 +1,96 @@
+openapi: 3.1.0
+info:
+  title: deedlit.search
+  version: 0.1.0
+  description: >
+    Vector search over Qdrant. Named vectors: `dense` (1024-dim, cosine) +
+    `sparse` (SPLADE). Hybrid query fuses dense + sparse prefetch via RRF.
+    Owning service: never calls catalog or graph.
+servers:
+  - url: http://deedlit-search:8000
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } } }
+  /points:
+    post:
+      summary: Upsert a point (dense + sparse + payload), keyed by uuid5(sha256)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/UpsertPoint" } } }
+      responses: { "200": { description: Upserted } }
+  /query:
+    post:
+      summary: Hybrid search (dense + sparse prefetch, RRF fusion)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/HybridQuery" } } }
+      responses:
+        "200":
+          description: Fused, ranked hits
+          content: { application/json: { schema: { $ref: "#/components/schemas/QueryResponse" } } }
+  /similar:
+    post:
+      summary: Nearest neighbors to a given point id
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { sha256: { $ref: "#/components/schemas/Sha256" }, limit: { type: integer, default: 24 } }, required: [sha256] } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/QueryResponse" } } } } }
+  /by-image:
+    post:
+      summary: Image-to-image search using a stored point's dense vector
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { sha256: { $ref: "#/components/schemas/Sha256" }, limit: { type: integer, default: 24 } }, required: [sha256] } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/QueryResponse" } } } } }
+  /rebuild:
+    post:
+      summary: Rebuild the collection from catalog
+      responses: { "202": { description: Rebuild started } }
+components:
+  schemas:
+    Sha256:
+      type: string
+      pattern: "^[a-f0-9]{64}$"
+      description: SHA-256 hex of the image bytes (cross-service id).
+    Health:
+      type: object
+      properties: { status: { type: string, enum: [ok, degraded] }, collection_ready: { type: boolean } }
+      required: [status]
+    SparseVector:
+      type: object
+      properties:
+        indices: { type: array, items: { type: integer } }
+        values: { type: array, items: { type: number } }
+      required: [indices, values]
+    UpsertPoint:
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        dense: { type: array, items: { type: number }, description: "1024-dim CLIP vector" }
+        sparse: { $ref: "#/components/schemas/SparseVector" }
+        payload: { type: object, additionalProperties: true }
+      required: [sha256, dense]
+    HybridQuery:
+      type: object
+      properties:
+        dense: { type: array, items: { type: number } }
+        sparse: { $ref: "#/components/schemas/SparseVector" }
+        limit: { type: integer, default: 24 }
+        filter: { type: [object, "null"], additionalProperties: true }
+      required: []
+      description: At least one of dense/sparse must be supplied; both → RRF fusion.
+    Hit:
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        score: { type: number, description: "RRF-fused score when hybrid" }
+        payload: { type: [object, "null"], additionalProperties: true }
+      required: [sha256, score]
+    QueryResponse:
+      type: object
+      properties:
+        fusion: { type: string, enum: [rrf, dense, sparse] }
+        hits: { type: array, items: { $ref: "#/components/schemas/Hit" } }
+      required: [hits]
