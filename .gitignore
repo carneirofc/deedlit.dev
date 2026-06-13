@@ -1,24 +1,24 @@
+# Dependencies
 node_modules/
-.vscode/
+
+# Build output
 dist/
+
+# Editor — ignore the folder but keep shared settings under version control.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Playwright MCP scratch output
 .playwright-mcp/
-.playwright-mcp/console-2026-02-19T03-02-07-776Z.log
-.playwright-mcp/console-2026-02-19T03-23-00-713Z.log
-.playwright-mcp/console-2026-02-19T03-25-35-519Z.log
-.playwright-mcp/console-2026-02-19T10-28-20-739Z.log
-.playwright-mcp/console-2026-02-19T10-35-32-999Z.log
-.playwright-mcp/image-2cc8149f3582bbc6.png
-.playwright-mcp/image-f97b88837c969c32.png
-.playwright-mcp/page-2026-02-19T02-53-59-424Z.png
-.playwright-mcp/page-2026-02-19T02-54-11-237Z.png
-.playwright-mcp/page-2026-02-19T02-54-23-591Z.png
-.playwright-mcp/page-2026-02-19T02-57-53-470Z.png
-.playwright-mcp/page-2026-02-19T02-58-03-686Z.png
-.playwright-mcp/page-2026-02-19T02-58-34-794Z.png
-.playwright-mcp/page-2026-02-19T03-02-19-904Z.png
-.playwright-mcp/page-2026-02-19T03-02-36-718Z.png
-.playwright-mcp/page-2026-02-19T03-03-30-395Z.png
-.playwright-mcp/page-2026-02-19T03-03-55-129Z.png
-.playwright-mcp/page-2026-02-19T10-29-22-832Z.png
-.playwright-mcp/page-2026-02-19T10-40-13-044Z.png
-.playwright-mcp/page-2026-02-19T10-41-00-168Z.png
+
+# Logs
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Comfyhelper generated data
+deedlit.dev.comfyhelper/data/thumbnails/

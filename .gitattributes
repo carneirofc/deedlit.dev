@@ -1,0 +1,44 @@
+# Normalize line endings across platforms.
+# Text files are stored as LF in the repo and checked out as LF everywhere,
+# which eliminates the CRLF<->LF churn between Windows and Linux/macOS.
+* text=auto eol=lf
+
+# Windows-native scripts must stay CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Unix shell scripts must stay LF.
+*.sh    text eol=lf
+
+# Lockfiles: keep as text, but hide from diffs and mark as generated so they
+# don't pollute review/merge noise or language stats.
+package-lock.json   -diff linguist-generated
+uv.lock             -diff linguist-generated
+pnpm-lock.yaml      -diff linguist-generated
+yarn.lock           -diff linguist-generated
+
+# Documents / data treated as text.
+*.svg   text
+*.ipynb text eol=lf
+
+# Binary assets — never normalize, never diff.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.avif  binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+*.eot   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.mp4   binary
+*.webm  binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary
