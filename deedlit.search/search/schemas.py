@@ -1,0 +1,48 @@
+"""Pydantic DTOs mirroring contracts/search.openapi.yaml."""
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+SHA256_PATTERN = r"^[a-f0-9]{64}$"
+
+
+class SparseVector(BaseModel):
+    indices: list[int]
+    values: list[float]
+
+
+class UpsertPoint(BaseModel):
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    dense: list[float] = Field(description="1024-dim CLIP vector")
+    sparse: SparseVector | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class HybridQuery(BaseModel):
+    dense: list[float] | None = None
+    sparse: SparseVector | None = None
+    limit: int = 24
+    filter: dict[str, Any] | None = None
+
+
+class SimilarQuery(BaseModel):
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    limit: int = 24
+
+
+class Hit(BaseModel):
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    score: float = Field(description="RRF-fused score when hybrid")
+    payload: dict[str, Any] | None = None
+
+
+class QueryResponse(BaseModel):
+    fusion: Literal["rrf", "dense", "sparse"]
+    hits: list[Hit] = Field(default_factory=list)
+
+
+class Health(BaseModel):
+    status: Literal["ok", "degraded"]
+    collection_ready: bool | None = None
