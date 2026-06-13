@@ -58,6 +58,11 @@ EMBEDDING_DISTANCE = "Cosine"
 DEVICE = os.getenv("CLIP_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 USE_FP16 = os.getenv("CLIP_FP16", "true").lower() == "true"
 
+# SPLADE sparse text embedding (lexical/term-weight vectors for hybrid search).
+# Loaded lazily on the first /embed/sparse call, mirroring the CLIP towers.
+# fastembed downloads the (small) ONNX model from the Hub on first use.
+SPARSE_MODEL_NAME = os.getenv("SPARSE_MODEL", "prithivida/Splade_PP_en_v1")
+
 # Standard CLIP image normalization (OpenAI dataset stats, used by OpenCLIP too).
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -226,6 +231,22 @@ class TextSimilarityRequest(BaseModel):
     }
 
 
+class SparseEmbeddingRequest(BaseModel):
+    text: str = Field(..., description="Text to embed into a SPLADE sparse vector.", examples=["red-haired anime knight in gothic ruins"])
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"text": "red-haired anime knight in gothic ruins"}],
+        }
+    }
+
+
+class SparseEmbeddingResponse(BaseModel):
+    model: str = Field(..., description="SPLADE model name used to produce the sparse vector.")
+    indices: list[int] = Field(..., description="Vocabulary token ids with non-zero weight.")
+    values: list[float] = Field(..., description="Term weight for each index, aligned with `indices`.")
+
+
 class EmbeddingResponse(BaseModel):
     model_preset: str = Field(..., description="Configured CLIP_MODEL_PRESET (`vit_h` or `big_g`).")
     model_name: str = Field(..., description="OpenCLIP model architecture name.")
@@ -275,6 +296,8 @@ class HealthResponse(BaseModel):
     local_safetensors_exists: bool = Field(..., description="Whether the local vision checkpoint file was found.")
     vision_ready: bool = Field(..., description="Whether the vision tower (image embeddings) is loaded.")
     text_ready: bool = Field(..., description="Whether the text tower (text embeddings) is loaded.")
+    sparse_model: str = Field(..., description="SPLADE model name used for sparse text embeddings.")
+    sparse_ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
 
 
 class QdrantStatusResponse(BaseModel):
@@ -340,13 +363,19 @@ class ModelInfo(BaseModel):
     text_ready: bool = Field(..., description="Whether the text tower is loaded for this preset.")
 
 
+class SparseModelInfo(BaseModel):
+    name: str = Field(..., description="SPLADE model name for sparse text embeddings.")
+    ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
+
+
 class ModelsResponse(BaseModel):
     default_preset: str = Field(..., description="Preset used when a request omits `model`.")
     enabled_presets: list[str] = Field(..., description="Presets consumers may select via the `model` parameter.")
     device: str = Field(..., description="Torch device used for all models.")
     fp16: bool = Field(..., description="Whether half precision is active.")
     distance: str = Field(..., description="Recommended Qdrant distance metric for these embeddings.")
-    models: list[ModelInfo] = Field(..., description="All known models with their settings and readiness.")
+    models: list[ModelInfo] = Field(..., description="All known dense models with their settings and readiness.")
+    sparse: SparseModelInfo = Field(..., description="SPLADE sparse text model name and readiness.")
 
 
 # Per-preset model caches. Both presets can be loaded at once so consumers can
@@ -355,6 +384,10 @@ _vision_models: dict[str, CLIPVisionModelWithProjection] = {}
 _vision_preprocess: dict[str, transforms.Compose] = {}
 _text_models: dict[str, object] = {}
 _tokenizers: dict[str, object] = {}
+
+# SPLADE sparse text model. Single-element cache keyed by model name so the
+# heavy fastembed import + ONNX model download happen only on first use.
+_sparse_models: dict[str, object] = {}
 
 
 def _normalize(x: torch.Tensor) -> torch.Tensor:
@@ -490,6 +523,38 @@ def _load_text_model(preset: str) -> None:
     _tokenizers[preset] = tok
 
 
+def _load_sparse_model() -> object:
+    """
+    Lazy-load the SPLADE sparse text model via fastembed. Like the text tower,
+    no local checkpoint is available, so the first call downloads the (small)
+    ONNX model from the Hub; it is then cached for the process lifetime.
+
+    The fastembed import is deferred to here so the rest of the API (and the
+    dense embedding paths) stay importable even if fastembed is unavailable.
+    """
+    if SPARSE_MODEL_NAME in _sparse_models:
+        return _sparse_models[SPARSE_MODEL_NAME]
+
+    from fastembed import SparseTextEmbedding
+
+    _sparse_models[SPARSE_MODEL_NAME] = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
+    return _sparse_models[SPARSE_MODEL_NAME]
+
+
+def _embed_sparse(text: str) -> tuple[list[int], list[float]]:
+    """Return aligned (indices, values) plain-Python lists for one text.
+
+    fastembed yields one ``SparseEmbedding`` per input, each exposing
+    ``.indices`` and ``.values`` as numpy arrays; we convert to JSON-safe
+    ``list[int]`` / ``list[float]``.
+    """
+    model = _load_sparse_model()
+    embedding = next(iter(model.embed([text])))
+    indices = [int(i) for i in embedding.indices.tolist()]
+    values = [float(v) for v in embedding.values.tolist()]
+    return indices, values
+
+
 def _render_index() -> HTMLResponse:
     try:
         return HTMLResponse(INDEX_HTML.read_text(encoding="utf-8"))
@@ -539,6 +604,8 @@ def health() -> HealthResponse:
         local_safetensors_exists=CONFIG["local_safetensors"].exists(),
         vision_ready=DEFAULT_PRESET in _vision_models,
         text_ready=DEFAULT_PRESET in _text_models,
+        sparse_model=SPARSE_MODEL_NAME,
+        sparse_ready=SPARSE_MODEL_NAME in _sparse_models,
     )
 
 
@@ -585,6 +652,10 @@ def models() -> ModelsResponse:
         fp16=USE_FP16 and DEVICE.startswith("cuda"),
         distance=EMBEDDING_DISTANCE,
         models=[_model_info(p) for p in MODEL_CONFIGS],
+        sparse=SparseModelInfo(
+            name=SPARSE_MODEL_NAME,
+            ready=SPARSE_MODEL_NAME in _sparse_models,
+        ),
     )
 
 
@@ -611,6 +682,32 @@ def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
         device=DEVICE,
         dim=len(embedding),
         embedding=embedding,
+    )
+
+
+@app.post(
+    "/embed/sparse",
+    response_model=SparseEmbeddingResponse,
+    summary="Sparse (SPLADE) embedding of text",
+    response_description="A SPLADE sparse vector as aligned indices/values.",
+    operation_id="embedSparse",
+    tags=["embeddings"],
+    description=(
+        "Encode a single text into a SPLADE sparse vector for lexical / hybrid search. "
+        "Returns aligned `indices` (vocabulary token ids) and `values` (term weights). "
+        "The SPLADE model loads lazily on first use."
+    ),
+)
+def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+    indices, values = _embed_sparse(request.text)
+
+    return SparseEmbeddingResponse(
+        model=SPARSE_MODEL_NAME,
+        indices=indices,
+        values=values,
     )
 
 
