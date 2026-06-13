@@ -1,0 +1,15 @@
+**/node_modules
+**/.next
+**/out
+**/dist
+**/.git
+**/coverage
+**/playwright-report
+**/test-results
+**/screenshots
+**/.playwright-mcp
+**/*.log
+**/.env*
+deedlit.dev.comfyhelper/library
+deedlit.dev.comfyhelper/data/*.db
+deedlit.dev.comfyhelper/lib/generated/prisma
