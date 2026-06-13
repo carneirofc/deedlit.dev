@@ -1,0 +1,154 @@
+openapi: 3.1.0
+info:
+  title: deedlit.catalog
+  version: 0.1.0
+  description: >
+    Source-of-truth catalog over Postgres + RustFS. Images, tags, params,
+    references, ratings, favorites, notes, collections, and blob I/O for
+    thumbnails / cached embeddings. Owning service: never calls search or graph.
+servers:
+  - url: http://deedlit-catalog:8000
+paths:
+  /health:
+    get: { summary: Liveness, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } } } }
+  /images:
+    post:
+      summary: Create/upsert an image record (keyed by sha256)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ImageUpsert" } } } }
+      responses: { "200": { description: Upserted, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } } }
+    get:
+      summary: List/search images
+      parameters:
+        - { name: tag, in: query, schema: { type: string } }
+        - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }
+  /images/{sha256}:
+    parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+    get: { summary: Read one image, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } }, "404": { description: Not found } } }
+    patch:
+      summary: Update mutable fields (rating/favorite/tags)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ImagePatch" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } } }
+  /images/{sha256}/rating:
+    put:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Set rating
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { rating: { type: integer, minimum: 0, maximum: 5 } }, required: [rating] } } } }
+      responses: { "200": { description: OK } }
+  /images/{sha256}/favorite:
+    put:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Set favorite
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { favorite: { type: boolean } }, required: [favorite] } } } }
+      responses: { "200": { description: OK } }
+  /blobs/{sha256}/{kind}:
+    parameters:
+      - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
+      - { name: kind, in: path, required: true, schema: { type: string, enum: [thumbnail, embedding] } }
+    get: { summary: Fetch a RustFS blob, responses: { "200": { description: Blob, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "404": { description: Not found } } }
+    put:
+      summary: Store a RustFS blob (sha256-keyed)
+      requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+      responses: { "200": { description: Stored } }
+  /notes:
+    post:
+      summary: Create a note (Editor.js blocks + ordered image refs)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/NoteUpsert" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Note" } } } } }
+  /notes/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    get: { summary: Read note, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Note" } } } } } }
+    put: { summary: Update note, requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/NoteUpsert" } } } }, responses: { "200": { description: OK } } }
+  /notes/by-image/{sha256}:
+    get:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Notes referencing an image
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Note" } } } } } }
+  /collections:
+    post:
+      summary: Create a collection
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CollectionUpsert" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Collection" } } } } }
+    get: { summary: List collections, responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Collection" } } } } } } }
+  /collections/{id}/images:
+    put:
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      summary: Set/reorder collection membership (ordered sha256 list)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { images: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [images] } } } }
+      responses: { "200": { description: OK } }
+components:
+  schemas:
+    Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+    Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, db_ready: { type: boolean }, blob_ready: { type: boolean } }, required: [status] }
+    AssetRef: { type: object, properties: { kind: { type: string, enum: [checkpoint, lora, embedding, vae, controlnet, upscaler] }, name: { type: string }, hash: { type: [string, "null"] } }, required: [kind, name] }
+    Params:
+      type: object
+      properties:
+        seed: { type: [integer, "null"] }
+        steps: { type: [integer, "null"] }
+        cfg: { type: [number, "null"] }
+        sampler: { type: [string, "null"] }
+        scheduler: { type: [string, "null"] }
+        denoise: { type: [number, "null"] }
+        clipskip: { type: [integer, "null"] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+    ImageUpsert:
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        phash: { type: [string, "null"] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        sourceTool: { type: [string, "null"] }
+        prompt: { type: [string, "null"] }
+        negative: { type: [string, "null"] }
+        tags: { type: array, items: { type: string } }
+        params: { $ref: "#/components/schemas/Params" }
+        references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        workflow_json: { type: [object, "null"] }
+        api_prompt_json: { type: [object, "null"] }
+      required: [sha256]
+    Image:
+      allOf:
+        - { $ref: "#/components/schemas/ImageUpsert" }
+        - type: object
+          properties:
+            rating: { type: [integer, "null"] }
+            favorite: { type: boolean }
+            created_at: { type: string, format: date-time }
+    ImagePatch:
+      type: object
+      properties:
+        rating: { type: [integer, "null"] }
+        favorite: { type: [boolean, "null"] }
+        tags: { type: [array, "null"], items: { type: string } }
+    NoteUpsert:
+      type: object
+      properties:
+        title: { type: [string, "null"] }
+        positive: { type: [string, "null"] }
+        negative: { type: [string, "null"] }
+        blocks: { type: object, description: "Editor.js block document", additionalProperties: true }
+        imageRefs: { type: array, items: { $ref: "#/components/schemas/Sha256" }, description: "ordered" }
+      required: [blocks]
+    Note:
+      allOf:
+        - { $ref: "#/components/schemas/NoteUpsert" }
+        - type: object
+          properties: { id: { type: string }, created_at: { type: string, format: date-time } }
+          required: [id]
+    CollectionUpsert:
+      type: object
+      properties:
+        name: { type: string }
+        images: { type: array, items: { $ref: "#/components/schemas/Sha256" }, description: "ordered" }
+      required: [name]
+    Collection:
+      allOf:
+        - { $ref: "#/components/schemas/CollectionUpsert" }
+        - type: object
+          properties: { id: { type: string } }
+          required: [id]

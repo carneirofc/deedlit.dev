@@ -1,0 +1,107 @@
+openapi: 3.1.0
+info:
+  title: deedlit.vision
+  version: 0.1.0
+  description: >
+    GPU embedding service. Dense embeddings via CLIP (vit_h, 1024-dim default);
+    sparse embeddings via SPLADE. Holds no DB drivers.
+servers:
+  - url: http://deedlit-vision:8000
+paths:
+  /health:
+    get:
+      summary: Liveness + model readiness
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /models:
+    get:
+      summary: Loaded models and readiness
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Models" }
+  /embed/image:
+    post:
+      summary: Dense embedding of an image
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+              required: [file]
+      responses:
+        "200":
+          description: Dense vector
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DenseEmbedding" }
+  /embed/text:
+    post:
+      summary: Dense embedding of text
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TextInput" }
+      responses:
+        "200":
+          description: Dense vector
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DenseEmbedding" }
+  /embed/sparse:
+    post:
+      summary: SPLADE sparse embedding of text
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TextInput" }
+      responses:
+        "200":
+          description: Sparse vector (indices/values)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SparseEmbedding" }
+components:
+  schemas:
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        dense_ready: { type: boolean }
+        sparse_ready: { type: boolean }
+      required: [status]
+    Models:
+      type: object
+      properties:
+        dense: { type: object, properties: { name: { type: string }, dim: { type: integer }, ready: { type: boolean } } }
+        sparse: { type: object, properties: { name: { type: string }, ready: { type: boolean } } }
+    TextInput:
+      type: object
+      properties:
+        text: { type: string }
+      required: [text]
+    DenseEmbedding:
+      type: object
+      properties:
+        model: { type: string }
+        dim: { type: integer, default: 1024 }
+        vector: { type: array, items: { type: number } }
+      required: [dim, vector]
+    SparseEmbedding:
+      type: object
+      properties:
+        model: { type: string }
+        indices: { type: array, items: { type: integer } }
+        values: { type: array, items: { type: number } }
+      required: [indices, values]

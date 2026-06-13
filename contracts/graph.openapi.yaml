@@ -1,0 +1,77 @@
+openapi: 3.1.0
+info:
+  title: deedlit.graph
+  version: 0.1.0
+  description: >
+    Relationship graph over Neo4j. Edges derived from references (shared
+    checkpoint/lora/embedding/vae/controlnet), tag co-occurrence, and lineage
+    (variant/upscale/inpaint). Owning service: never calls catalog or search.
+servers:
+  - url: http://deedlit-graph:8000
+paths:
+  /health:
+    get: { summary: Liveness, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } } } }
+  /edges:
+    post:
+      summary: Upsert edges for one image's references/tags/lineage
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/EdgeUpsert" } } } }
+      responses: { "200": { description: Upserted } }
+  /neighbors/{sha256}:
+    get:
+      parameters:
+        - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
+        - { name: relation, in: query, schema: { type: string, enum: [shared_asset, tag_cooccurrence, any], default: any } }
+        - { name: limit, in: query, schema: { type: integer, default: 24 } }
+      summary: Related images by shared assets / tag co-occurrence
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/NeighborResponse" } } } } }
+  /lineage/{sha256}:
+    get:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Variant/upscale/inpaint lineage chain
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/NeighborResponse" } } } } }
+  /related-tags/{tag}:
+    get:
+      parameters: [ { name: tag, in: path, required: true, schema: { type: string } } ]
+      summary: Tags frequently co-occurring with a tag
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { tag: { type: string }, weight: { type: number } }, required: [tag] } } } } } }
+  /rebuild:
+    post: { summary: Rebuild the graph from catalog, responses: { "202": { description: Rebuild started } } }
+components:
+  schemas:
+    Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+    Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, neo4j_ready: { type: boolean } }, required: [status] }
+    AssetRef:
+      type: object
+      properties:
+        kind: { type: string, enum: [checkpoint, lora, embedding, vae, controlnet, upscaler] }
+        name: { type: string }
+        hash: { type: [string, "null"], description: "edges key on normalized name when hash is absent" }
+      required: [kind, name]
+    EdgeUpsert:
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        tags: { type: array, items: { type: string } }
+        lineage:
+          type: array
+          items:
+            type: object
+            properties:
+              parent: { $ref: "#/components/schemas/Sha256" }
+              kind: { type: string, enum: [variant, upscale, inpaint] }
+            required: [parent, kind]
+      required: [sha256]
+    NeighborResponse:
+      type: object
+      properties:
+        neighbors:
+          type: array
+          items:
+            type: object
+            properties:
+              sha256: { $ref: "#/components/schemas/Sha256" }
+              relation: { type: string }
+              weight: { type: number }
+            required: [sha256, relation]
+      required: [neighbors]

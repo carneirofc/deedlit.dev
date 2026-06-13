@@ -1,0 +1,84 @@
+openapi: 3.1.0
+info:
+  title: deedlit.metadata
+  version: 0.1.0
+  description: >
+    Stateless metadata extraction. Parses PNG text chunks, A1111 `parameters`,
+    and the ComfyUI node graph. Pixel work (sha256/phash/dims/thumbnail) is NOT
+    done here — ingest owns it.
+servers:
+  - url: http://deedlit-metadata:8000
+paths:
+  /health:
+    get:
+      summary: Liveness
+      responses:
+        "200":
+          description: OK
+          content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } }
+  /extract:
+    post:
+      summary: Extract typed metadata from image bytes
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+              required: [file]
+      responses:
+        "200":
+          description: Extracted metadata
+          content: { application/json: { schema: { $ref: "#/components/schemas/ExtractResult" } } }
+        "422":
+          description: Unparseable / no recognized metadata
+components:
+  schemas:
+    Health:
+      type: object
+      properties: { status: { type: string, enum: [ok, degraded] } }
+      required: [status]
+    AssetRef:
+      type: object
+      description: One referenced asset resolved from the node graph.
+      properties:
+        name: { type: string }
+        hash: { type: [string, "null"], description: "optional; absent for assets named without a hash" }
+      required: [name]
+    References:
+      type: object
+      description: Full asset-reference graph resolved from the ComfyUI node graph.
+      properties:
+        checkpoints: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        loras: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        embeddings: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        vae: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        controlnets: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        upscalers: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+      required: [checkpoints, loras, embeddings, vae, controlnets, upscalers]
+    Params:
+      type: object
+      properties:
+        seed: { type: [integer, "null"] }
+        steps: { type: [integer, "null"] }
+        cfg: { type: [number, "null"] }
+        sampler: { type: [string, "null"] }
+        scheduler: { type: [string, "null"] }
+        denoise: { type: [number, "null"] }
+        clipskip: { type: [integer, "null"] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+    ExtractResult:
+      type: object
+      properties:
+        sourceTool: { type: string, enum: [a1111, comfyui, unknown] }
+        prompt: { type: [string, "null"] }
+        negative: { type: [string, "null"] }
+        tags: { type: array, items: { type: string }, description: "normalized prompt tags (emphasis weights + BREAK handled)" }
+        params: { $ref: "#/components/schemas/Params" }
+        references: { $ref: "#/components/schemas/References" }
+        workflow_json: { type: [object, "null"], description: "raw ComfyUI workflow graph" }
+        api_prompt_json: { type: [object, "null"], description: "raw ComfyUI api prompt" }
+      required: [sourceTool, tags, params, references]
