@@ -14,6 +14,12 @@ type NavIconLinkProps = {
   onNavigate?: () => void;
 };
 
+type ExternalLinkProps = {
+  href: string;
+  label: string;
+  icon: ReactNode;
+};
+
 function navItemClass(isActive: boolean): string {
   const baseClassName =
     "app-sidebar-nav-item relative grid h-11 w-11 place-items-center rounded-xl border transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2";
@@ -57,6 +63,24 @@ function NavIconLink({
   );
 }
 
+function ExternalToolLink({ href, label, icon }: ExternalLinkProps) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={label}
+      title={label}
+      className="app-sidebar-nav-item group relative grid h-11 w-11 place-items-center rounded-xl border transition hover:border-accent-cyan/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+    >
+      {icon}
+      <span className="app-sidebar-nav-tooltip pointer-events-none absolute left-[calc(100%+10px)] top-1/2 z-90 hidden -translate-y-1/2 rounded-md border px-2 py-1 text-ui-xs font-medium whitespace-nowrap shadow-panel-sm md:group-hover:block md:group-focus-visible:block">
+        {label}
+      </span>
+    </a>
+  );
+}
+
 export function AppSidebar() {
   const pathname = usePathname();
   const [isMobileNavExpanded, setIsMobileNavExpanded] = useState(false);
@@ -69,19 +93,13 @@ export function AppSidebar() {
     >
       <div className="app-sidebar-shell pointer-events-auto flex max-w-full items-center gap-2 rounded-2xl border p-2 shadow-panel-lg backdrop-blur-xl md:flex-col md:max-w-none">
         <Link
-          href="/"
+          href="/library"
           prefetch={false}
           id="nav-home-link"
           data-testid="nav-home-link"
-          aria-label="Go to gallery root"
-          title="Go to gallery root"
+          aria-label="Go to image library"
+          title="Go to image library"
           className="app-sidebar-home-link grid h-11 w-11 shrink-0 place-items-center rounded-xl border text-ui-sm font-semibold tracking-[0.08em] transition focus-visible:outline-2 focus-visible:outline-offset-2"
-          onClick={() => {
-            // if we are at home, we scroll to the top
-            if (pathname === "/") {
-              window.scrollTo({ top: 0, behavior: "smooth" });
-            }
-          }}
         >
           DL
         </Link>
@@ -130,29 +148,13 @@ export function AppSidebar() {
           aria-label="Primary navigation"
         >
           <NavIconLink
-            href="/"
-            label="Gallery"
-            isActive={pathname === "/"}
-            testId="gallery"
-            onNavigate={() => setIsMobileNavExpanded(false)}
-            icon={
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                className="h-5 w-5 fill-none stroke-current"
-                strokeWidth="1.8"
-              >
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <circle cx="9" cy="9" r="1.6" />
-                <path d="M21 16l-5.5-5.5L6 20" />
-              </svg>
+            href="/library"
+            label="Image Library"
+            isActive={
+              (pathname === "/library" || pathname.startsWith("/library/")) &&
+              !pathname.startsWith("/library/settings")
             }
-          />
-          <NavIconLink
-            href="/stats"
-            label="Statistics"
-            isActive={pathname.startsWith("/stats")}
-            testId="statistics"
+            testId="library"
             onNavigate={() => setIsMobileNavExpanded(false)}
             icon={
               <svg
@@ -161,48 +163,10 @@ export function AppSidebar() {
                 className="h-5 w-5 fill-none stroke-current"
                 strokeWidth="1.8"
               >
-                <path d="M4 20V10" />
-                <path d="M10 20V4" />
-                <path d="M16 20v-7" />
-                <path d="M22 20V8" />
-              </svg>
-            }
-          />
-          <NavIconLink
-            href="/notes"
-            label="Prompt Notes"
-            isActive={pathname.startsWith("/notes")}
-            testId="notes"
-            onNavigate={() => setIsMobileNavExpanded(false)}
-            icon={
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                className="h-5 w-5 fill-none stroke-current"
-                strokeWidth="1.8"
-              >
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <path d="M14 2v6h6" />
-                <path d="M16 13H8" />
-                <path d="M16 17H8" />
-                <path d="M10 9H8" />
-              </svg>
-            }
-          />
-          <NavIconLink
-            href="/collections"
-            label="Collections"
-            isActive={pathname.startsWith("/collections")}
-            testId="collections"
-            onNavigate={() => setIsMobileNavExpanded(false)}
-            icon={
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                className="h-5 w-5 fill-none stroke-current"
-                strokeWidth="1.8"
-              >
-                <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                <circle cx="11" cy="9" r="1.4" />
+                <path d="M20 14l-4-3.5L9 17" />
               </svg>
             }
           />
@@ -225,9 +189,10 @@ export function AppSidebar() {
               </svg>
             }
           />
+
           <NavIconLink
             href="/admin"
-            label="Admin"
+            label="Backend Admin"
             isActive={pathname.startsWith("/admin")}
             testId="admin"
             onNavigate={() => setIsMobileNavExpanded(false)}
@@ -237,9 +202,100 @@ export function AppSidebar() {
                 viewBox="0 0 24 24"
                 className="h-5 w-5 fill-none stroke-current"
                 strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 2 4 5v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V5l-8-3z" />
+                <path d="m9 12 2 2 4-4" />
+              </svg>
+            }
+          />
+
+          <NavIconLink
+            href="/library/settings"
+            label="Settings"
+            isActive={pathname.startsWith("/library/settings")}
+            testId="settings"
+            onNavigate={() => setIsMobileNavExpanded(false)}
+            icon={
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-5 w-5 fill-none stroke-current"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
               >
                 <circle cx="12" cy="12" r="3" />
-                <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.56V21a2 2 0 0 1-4 0v-.09a1.7 1.7 0 0 0-1-1.56 1.7 1.7 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.56-1H3a2 2 0 0 1 0-4h.09a1.7 1.7 0 0 0 1.56-1 1.7 1.7 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.7 1.7 0 0 0 1.82.33h.03a1.7 1.7 0 0 0 .97-1.55V3a2 2 0 0 1 4 0v.09a1.7 1.7 0 0 0 .99 1.56 1.7 1.7 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.7 1.7 0 0 0-.33 1.82v.03a1.7 1.7 0 0 0 1.55.97H21a2 2 0 0 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1z" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            }
+          />
+
+          {/* Divider */}
+          <div className="mx-1 h-px w-7 bg-ui-border/60 md:h-7 md:w-px" aria-hidden="true" />
+
+          {/* External tool links */}
+          <ExternalToolLink
+            href="http://localhost:8000"
+            label="deedlit.vision — CLIP embedding API"
+            icon={
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2a4 4 0 0 1 4 4c0 1.5-.8 2.8-2 3.5V12" />
+                <path d="M8 6a4 4 0 0 1 4-4" />
+                <circle cx="12" cy="16" r="4" />
+                <path d="M12 12v2" />
+                <path d="M9.5 17.5 8 19" />
+                <path d="M14.5 17.5 16 19" />
+              </svg>
+            }
+          />
+          <ExternalToolLink
+            href="http://localhost:8188"
+            label="ComfyUI"
+            icon={
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="7" height="7" rx="1" />
+                <rect x="14" y="3" width="7" height="7" rx="1" />
+                <rect x="3" y="14" width="7" height="7" rx="1" />
+                <path d="M14 17.5h7M17.5 14v7" />
+              </svg>
+            }
+          />
+          <ExternalToolLink
+            href="http://localhost:7474"
+            label="Neo4j Browser"
+            icon={
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="5" r="2" />
+                <circle cx="5" cy="19" r="2" />
+                <circle cx="19" cy="19" r="2" />
+                <path d="M12 7v4M7 18l4-5M17 18l-4-5" />
+              </svg>
+            }
+          />
+          <ExternalToolLink
+            href="http://localhost:6333/dashboard"
+            label="Qdrant Dashboard"
+            icon={
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="6" cy="6" r="1.5" />
+                <circle cx="18" cy="6" r="1.5" />
+                <circle cx="6" cy="18" r="1.5" />
+                <circle cx="18" cy="18" r="1.5" />
+                <circle cx="12" cy="12" r="2" />
+                <path d="M7.5 6h4.5M12 6v4.5M6 7.5v4.5M7.5 18h4.5M12 18v-4.5M18 7.5v4.5M16.5 6h-4.5" />
+              </svg>
+            }
+          />
+          <ExternalToolLink
+            href="http://localhost:9001"
+            label="RustFS Console"
+            icon={
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <ellipse cx="12" cy="5" rx="9" ry="3" />
+                <path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5" />
+                <path d="M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6" />
               </svg>
             }
           />

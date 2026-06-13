@@ -1,36 +1,20 @@
 "use client";
 
-import { Provider as JotaiProvider } from "jotai";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 
-import { useEventHub } from "@/lib/store/event-hub";
+import { CompareTrayProvider } from "@/lib/store/compare-tray";
+import { SettingsProvider } from "@/lib/store/settings";
 
-function EventHubMount() {
-  useEventHub();
-  return null;
-}
-
+/**
+ * App-wide client providers.  The legacy SQLite gallery used Jotai + React Query
+ * + an SSE event hub here; the image-library UI uses plain fetch.  The compare
+ * tray (images queued for side-by-side comparison) and the user settings store
+ * live here so they are shared across every library page.
+ */
 export default function AppProviders({ children }: { children: ReactNode }) {
-  const [queryClient] = useState(
-    () =>
-      new QueryClient({
-        defaultOptions: {
-          queries: {
-            staleTime: 30_000,
-            retry: 1,
-            refetchOnWindowFocus: false,
-          },
-        },
-      }),
-  );
-
   return (
-    <QueryClientProvider client={queryClient}>
-      <JotaiProvider>
-        <EventHubMount />
-        {children}
-      </JotaiProvider>
-    </QueryClientProvider>
+    <SettingsProvider>
+      <CompareTrayProvider>{children}</CompareTrayProvider>
+    </SettingsProvider>
   );
 }
