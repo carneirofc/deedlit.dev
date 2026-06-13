@@ -34,6 +34,15 @@ REBUILD_SEARCH = "rebuild-search"
 REBUILD_GRAPH = "rebuild-graph"
 REBUILD_THUMBNAILS = "rebuild-thumbnails"
 
+# Reconcile sweep (issue #21): compare catalog coverage against the search and
+# graph projections and repair drift via the rebuild-from-catalog paths. Backs
+# the eventual-consistency guarantees of the fan-out write model.
+RECONCILE = "reconcile"
+
+# When the number of drifted images for a projection is at or below this, repair
+# them one-by-one (cheaper, targeted) instead of a full collection rebuild.
+RECONCILE_PER_IMAGE_MAX = int(os.getenv("RECONCILE_PER_IMAGE_MAX", "10"))
+
 # rebuild-* -> the TS app maintenance endpoint each one drives (this phase).
 # Re-pointing these directly at search/graph/object-store is deferred to #17.
 REBUILD_ENDPOINTS = {
@@ -62,16 +71,22 @@ class Job:
     folder_path: str | None = None
     sha256: str | None = None
     rebuild_path: str | None = None
+    per_image_max: int | None = None
     cancel_requested: bool = False
+    # Reconcile output: per-image projection status + repair summary (#21).
+    report: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "id": self.id,
             "type": self.type,
             "status": self.status,
             "progress": asdict(self.progress),
             "error": self.error,
         }
+        if self.report is not None:
+            out["report"] = self.report
+        return out
 
 
 class JobStore:
@@ -123,6 +138,21 @@ class JobStore:
             job.folder_path = folder_path or LIBRARY_ROOT
         elif mtype in REBUILD_ENDPOINTS:
             job.rebuild_path = REBUILD_ENDPOINTS[mtype]
+        elif mtype == RECONCILE:
+            return self.create_reconcile_job()
+        return self._enqueue(job)
+
+    def create_reconcile_job(self, *, per_image_max: int | None = None) -> Job:
+        """Create a reconcile sweep job (issue #21).
+
+        Compares catalog coverage against the search and graph projections and
+        repairs drift via the rebuild-from-catalog paths. Reuses the in-memory
+        Job model + async worker loop, so it gets progress + cooperative cancel.
+        """
+        job = Job(id=str(uuid.uuid4()), type=RECONCILE)
+        job.per_image_max = (
+            RECONCILE_PER_IMAGE_MAX if per_image_max is None else per_image_max
+        )
         return self._enqueue(job)
 
     def request_cancel(self, job_id: str) -> Job | None:
@@ -158,6 +188,8 @@ class JobStore:
         try:
             if job.type == REINDEX_ONE_IMAGE:
                 await self._run_reindex_one(job)
+            elif job.type == RECONCILE:
+                await self._run_reconcile(job)
             elif job.type in REBUILD_ENDPOINTS:
                 await self._run_rebuild(job)
             else:
@@ -217,6 +249,93 @@ class JobStore:
         job.progress.done += 1
         job.status = COMPLETED
 
+    async def _run_reconcile(self, job: Job) -> None:
+        """Reconcile sweep: catalog coverage vs search + graph projections (#21).
+
+        Steps:
+          1. list every sha256 the catalog holds (the set that SHOULD project);
+          2. probe which of those the search and graph projections cover;
+          3. compute drift (catalog-present-but-missing-in-{search,graph});
+          4. repair drift via the rebuild-from-catalog paths — a full collection
+             rebuild when many images drift, or targeted per-image reindex when
+             only a few do (<= job.per_image_max);
+          5. record a per-image projection status report on the job.
+
+        Progress counts catalog images probed. Cancellation is checked between
+        images (probing) and is honoured before the repair phase.
+        """
+        per_image_max = (
+            RECONCILE_PER_IMAGE_MAX if job.per_image_max is None else job.per_image_max
+        )
+
+        catalog = await asyncio.to_thread(pipeline.list_catalog_sha256)
+        job.progress.total = len(catalog)
+
+        images: dict[str, dict[str, Any]] = {}
+        search_drift: list[str] = []
+        graph_drift: list[str] = []
+
+        # -- coverage probe (per catalog image) --
+        for sha in catalog:
+            if job.cancel_requested:
+                job.status = CANCELLED
+                return
+            in_search = await asyncio.to_thread(pipeline.search_has, sha)
+            in_graph = await asyncio.to_thread(pipeline.graph_has, sha)
+            images[sha] = {"in_search": in_search, "in_graph": in_graph, "repaired": False}
+            if not in_search:
+                search_drift.append(sha)
+            if not in_graph:
+                graph_drift.append(sha)
+            job.progress.done += 1
+
+        if job.cancel_requested:
+            job.status = CANCELLED
+            return
+
+        # -- repair drift via rebuild-from-catalog paths --
+        repaired: set[str] = set()
+        strategy = "none"
+        drift_images = set(search_drift) | set(graph_drift)
+        total_drift_images = len(drift_images)
+
+        if total_drift_images == 0:
+            strategy = "none"
+        elif total_drift_images <= per_image_max:
+            # Targeted, image-by-image repair (cheaper than a full rebuild).
+            # A single reindex re-projects BOTH search + graph for that image.
+            strategy = "per-image"
+            for sha in sorted(drift_images):
+                if job.cancel_requested:
+                    job.status = CANCELLED
+                    return
+                await asyncio.to_thread(pipeline.reindex_image, sha)
+                images[sha]["repaired"] = True
+                repaired.add(sha)
+        else:
+            # Full collection rebuild-from-catalog for any drifting projection.
+            strategy = "rebuild"
+            if search_drift:
+                await asyncio.to_thread(pipeline.rebuild_search)
+                for sha in search_drift:
+                    images[sha]["repaired"] = True
+                    repaired.add(sha)
+            if graph_drift:
+                await asyncio.to_thread(pipeline.rebuild_graph)
+                for sha in graph_drift:
+                    images[sha]["repaired"] = True
+                    repaired.add(sha)
+
+        job.report = {
+            "catalog_count": len(catalog),
+            "search_drift": search_drift,
+            "graph_drift": graph_drift,
+            "repaired": sorted(repaired),
+            "repair_strategy": strategy,
+            "images": images,
+        }
+        job.status = COMPLETED
+
     async def _process_one(self, job: Job, path: Path) -> None:
         try:
             data = await asyncio.to_thread(path.read_bytes)
@@ -250,3 +369,43 @@ def _list_supported_files(folder_path: str) -> list[Path]:
         if p.is_file() and p.suffix.lower() in pipeline.SUPPORTED_EXTENSIONS
     ]
     return files
+
+
+# ---------------------------------------------------------------------------
+# Reconcile scheduler (issue #21) — opt-in periodic trigger
+#
+# Disabled by default so tests / dev never get surprise background jobs. Set
+# RECONCILE_INTERVAL_SECONDS > 0 to have the service enqueue a reconcile sweep
+# every N seconds. A single tick is exposed separately so tests can drive it
+# directly instead of waiting on real time.
+# ---------------------------------------------------------------------------
+def reconcile_interval_seconds() -> int:
+    """Reconcile schedule interval in seconds; 0/unset disables the scheduler."""
+    try:
+        return int(os.getenv("RECONCILE_INTERVAL_SECONDS", "0"))
+    except ValueError:
+        return 0
+
+
+def run_reconcile_tick(store: "JobStore") -> Job:
+    """Enqueue one reconcile job. The scheduler calls this every interval; tests
+    call it directly to assert a job is enqueued without waiting on the clock."""
+    return store.create_reconcile_job()
+
+
+async def reconcile_scheduler(store: "JobStore") -> None:
+    """Background loop: enqueue a reconcile sweep every interval (opt-in).
+
+    No-op (returns immediately) when RECONCILE_INTERVAL_SECONDS is 0/unset, so
+    importing the app or running the test suite never starts a real scheduler.
+    """
+    interval = reconcile_interval_seconds()
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            run_reconcile_tick(store)
+        except Exception:
+            # A scheduling hiccup must not kill the loop; next tick retries.
+            continue

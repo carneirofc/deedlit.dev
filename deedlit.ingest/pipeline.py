@@ -39,8 +39,18 @@ APP_WRITE_URL = os.getenv("APP_WRITE_URL", "http://localhost:3000").rstrip("/")
 METADATA_URL = os.getenv("METADATA_URL", "http://localhost:8005").rstrip("/")
 VISION_URL = os.getenv("VISION_URL", "http://localhost:8000").rstrip("/")
 
+# Per-service URLs for the reconcile sweep (issue #21). Reconcile reads catalog
+# coverage and probes/repairs the search + graph projections directly against
+# their own service contracts (contracts/{catalog,search,graph}.openapi.yaml).
+CATALOG_URL = os.getenv("CATALOG_URL", "http://localhost:8001").rstrip("/")
+SEARCH_URL = os.getenv("SEARCH_URL", "http://localhost:8002").rstrip("/")
+GRAPH_URL = os.getenv("GRAPH_URL", "http://localhost:8003").rstrip("/")
+
 HTTP_TIMEOUT = float(os.getenv("INGEST_HTTP_TIMEOUT", "30.0"))
 FANOUT_RETRIES = int(os.getenv("INGEST_FANOUT_RETRIES", "3"))
+
+# Catalog list page size for the reconcile sweep (GET /images is paginated).
+CATALOG_PAGE_SIZE = int(os.getenv("RECONCILE_CATALOG_PAGE_SIZE", "500"))
 
 SUPPORTED_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
 
@@ -181,6 +191,123 @@ def trigger_rebuild(path: str) -> dict[str, Any]:
         return resp.json()
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Reconcile boundary (issue #21) — catalog coverage + projection probes/repair
+#
+# These talk DIRECTLY to the per-service contracts (catalog/search/graph), not
+# the TS app, because reconcile is the eventual-consistency backstop for the
+# fan-out write model and must compare each store's actual coverage.
+#
+# All four are thin module-level wrappers so tests can monkeypatch them and stay
+# offline/deterministic.
+# ---------------------------------------------------------------------------
+def list_catalog_sha256() -> list[str]:
+    """List every sha256 the catalog holds — the set that SHOULD be projected.
+
+    Pages through catalog ``GET /images`` (limit/offset) until a short page is
+    returned. Catalog is the source of truth, so this is the reference set the
+    search and graph projections are reconciled against.
+    """
+    out: list[str] = []
+    offset = 0
+    while True:
+        resp = httpx.get(
+            f"{CATALOG_URL}/images",
+            params={"limit": CATALOG_PAGE_SIZE, "offset": offset},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json() or []
+        for row in rows:
+            sha = row.get("sha256") if isinstance(row, dict) else None
+            if sha:
+                out.append(sha)
+        if len(rows) < CATALOG_PAGE_SIZE:
+            break
+        offset += CATALOG_PAGE_SIZE
+    return out
+
+
+def search_has(sha256: str) -> bool:
+    """Coverage probe: is ``sha256`` present in the search (Qdrant) projection?
+
+    The search contract has no "list covered ids" endpoint, so we use the
+    cheapest per-id probe available: ``POST /by-image`` does an image-to-image
+    search using the *stored* point's dense vector. A 200 means the point exists
+    (a missing point yields a 4xx); any other status / transport error is treated
+    as "not covered" so reconcile repairs it rather than silently skipping.
+    """
+    try:
+        resp = httpx.post(
+            f"{SEARCH_URL}/by-image",
+            json={"sha256": sha256, "limit": 1},
+            timeout=HTTP_TIMEOUT,
+        )
+    except httpx.TransportError:
+        return False
+    return resp.status_code == 200
+
+
+def graph_has(sha256: str) -> bool:
+    """Coverage probe: is ``sha256`` present in the graph (Neo4j) projection?
+
+    The graph contract has no "list covered ids" endpoint either, so we probe
+    ``GET /neighbors/{sha256}``: a 200 means the node exists in the graph (even
+    with zero neighbors); a 404 / error means it is missing and must be repaired.
+    """
+    try:
+        resp = httpx.get(
+            f"{GRAPH_URL}/neighbors/{sha256}",
+            params={"limit": 1},
+            timeout=HTTP_TIMEOUT,
+        )
+    except httpx.TransportError:
+        return False
+    return resp.status_code == 200
+
+
+def rebuild_search() -> dict[str, Any]:
+    """Rebuild the search projection from catalog (search ``POST /rebuild``)."""
+    resp = httpx.post(f"{SEARCH_URL}/rebuild", timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def rebuild_graph() -> dict[str, Any]:
+    """Rebuild the graph projection from catalog (graph ``POST /rebuild``)."""
+    resp = httpx.post(f"{GRAPH_URL}/rebuild", timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def reindex_image(sha256: str) -> None:
+    """Targeted per-image repair: re-run the full pipeline for one sha256.
+
+    Used when only a few images drift (cheaper than a full collection rebuild).
+    Fetches the original bytes, runs the per-file pipeline, and fans the writes
+    back out — the same path :class:`reindex-one-image` takes — so both the
+    search point and graph edges for that image are re-projected.
+    """
+    data, mime = fetch_image_bytes(sha256)
+    filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
+    rec = process_file(data, filename)
+    fan_out_writes(rec)
+
+
+def _reconcile_ext_for_mime(mime: str) -> str:
+    return {
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/jpeg": ".jpg",
+    }.get(mime.lower(), ".png")
 
 
 # ---------------------------------------------------------------------------
