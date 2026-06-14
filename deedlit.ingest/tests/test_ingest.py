@@ -140,6 +140,42 @@ def test_dedup_skips_unchanged_on_rerun(tmp_path, fresh_store, mock_outbound):
 
 
 # ---------------------------------------------------------------------------
+# (2b) GET /jobs lists jobs (newest first) with UI-shaped flat fields
+# ---------------------------------------------------------------------------
+def test_list_jobs_returns_jobs_with_flat_fields(tmp_path, fresh_store, mock_outbound):
+    # Without this list endpoint the gateway GET /jobs 405s -> [] and the UI's
+    # job poller never sees progress/completion. The flat *_files aliases are
+    # what the UI dashboard/dock normalize on.
+    _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0)])
+    with TestClient(app_module.app) as client:
+        first = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()
+        final = _wait_for(client, first["id"], {"completed"})
+        assert final["status"] == "completed"
+
+        listed = client.get("/jobs")
+        assert listed.status_code == 200
+        jobs = listed.json()
+        assert isinstance(jobs, list) and len(jobs) == 1
+        job = jobs[0]
+        # Flat aliases the UI consumes (snake_case file counts + folder path).
+        assert job["total_files"] == 2
+        assert job["processed_files"] == 2
+        assert job["failed_files"] == 0
+        assert job["folder_path"] == str(tmp_path)
+        # Nested progress is preserved for the contract / per-job detail.
+        assert job["progress"]["done"] == 2
+
+
+def test_list_jobs_newest_first(fresh_store, mock_outbound):
+    with TestClient(app_module.app) as client:
+        a = client.post("/jobs", json={"type": "rebuild-search"}).json()["id"]
+        b = client.post("/jobs", json={"type": "rebuild-graph"}).json()["id"]
+        ids = [j["id"] for j in client.get("/jobs").json()]
+        # Most recently created job appears first.
+        assert ids[0] == b and ids[1] == a
+
+
+# ---------------------------------------------------------------------------
 # (3) cancel mid-run leaves status=cancelled
 # ---------------------------------------------------------------------------
 def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):

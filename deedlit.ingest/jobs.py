@@ -8,6 +8,7 @@ the worker checks a per-job flag between files.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pipeline
+
+log = logging.getLogger("deedlit.ingest.jobs")
 
 # Job lifecycle states (mirrors contracts/ingest.openapi.yaml).
 QUEUED = "queued"
@@ -87,6 +90,16 @@ class Job:
             "status": self.status,
             "progress": asdict(self.progress),
             "error": self.error,
+            # Flattened aliases for the UI dashboard + activity dock, which
+            # normalize on snake_case `*_files` / `folder_path` / `error_message`
+            # (see comfyhelper lib/store/activity-jobs.ts + api/library/jobs).
+            # Without these the dock shows 0/0 progress and never settles.
+            "total_files": self.progress.total,
+            "processed_files": self.progress.done,
+            "skipped_files": self.progress.skipped,
+            "failed_files": self.progress.failed,
+            "folder_path": self.folder_path,
+            "error_message": self.error,
         }
         if self.report is not None:
             out["report"] = self.report
@@ -108,6 +121,10 @@ class JobStore:
     # -- registry ---------------------------------------------------------
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
+
+    def list(self) -> list[Job]:
+        """All jobs, newest first — backs the gateway/dashboard GET /jobs list."""
+        return list(reversed(self._jobs.values()))
 
     def create_ingest_job(self, folder_path: str) -> Job:
         job = Job(id=str(uuid.uuid4()), type="ingest", folder_path=folder_path)
@@ -189,6 +206,7 @@ class JobStore:
             job.status = CANCELLED
             return
         job.status = RUNNING
+        log.info("job %s (%s) started folder=%s sha256=%s", job.id, job.type, job.folder_path, job.sha256)
         try:
             if job.type == REINDEX_ONE_IMAGE:
                 await self._run_reindex_one(job)
@@ -204,6 +222,12 @@ class JobStore:
             if job.status not in (CANCELLED,):
                 job.status = FAILED
                 job.error = str(exc)
+            log.exception("job %s (%s) FAILED: %s", job.id, job.type, exc)
+        log.info(
+            "job %s (%s) -> %s (total=%d done=%d skipped=%d failed=%d)",
+            job.id, job.type, job.status,
+            job.progress.total, job.progress.done, job.progress.skipped, job.progress.failed,
+        )
 
     async def _run_folder(self, job: Job) -> None:
         files = _list_supported_files(job.folder_path or "")
@@ -349,13 +373,19 @@ class JobStore:
             sha256 = pipeline.compute_sha256(data)
             if sha256 in self._seen_sha256:
                 job.progress.skipped += 1
+                log.debug("skip (already seen) %s -> %s", path.name, sha256[:12])
                 return
             rec = await asyncio.to_thread(pipeline.process_file, data, path.name)
             await asyncio.to_thread(pipeline.fan_out_writes, rec)
             self._seen_sha256.add(sha256)
             job.progress.done += 1
+            log.info("ingested %s -> %s (%d/%d)", path.name, sha256[:12], job.progress.done, job.progress.total)
         except Exception:
             job.progress.failed += 1
+            # Previously swallowed silently — the #1 reason ingest "fails" with
+            # no trace. Log the offending file + full traceback so a downstream
+            # write rejection (e.g. search/catalog 4xx) is debuggable.
+            log.exception("FAILED to ingest %s", path)
 
 
 def _ext_for_mime(mime: str) -> str:
