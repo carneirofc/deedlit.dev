@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
+import { useActivity } from "@/lib/store/activity";
 import { useSettings } from "@/lib/store/settings";
 
 interface Detail {
@@ -82,6 +83,7 @@ export default function ImageDetailPage() {
   const params = useParams<{ imageId: string }>();
   const imageId = params.imageId;
   const { settings, hydrated } = useSettings();
+  const { track } = useActivity();
 
   const [detail, setDetail] = useState<Detail | null>(null);
   const [similar, setSimilar] = useState<CompactResult[]>([]);
@@ -203,13 +205,25 @@ export default function ImageDetailPage() {
 
   const toggleFavorite = useCallback(async () => {
     if (!detail) return;
-    const res = await fetch(`/api/library/images/${imageId}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ favorite: !detail.favorite }),
-    });
-    if (res.ok) setDetail(await res.json());
-  }, [detail, imageId]);
+    const next = !detail.favorite;
+    try {
+      const updated = await track(next ? "Add favorite" : "Remove favorite", async () => {
+        const res = await fetch(`/api/library/images/${imageId}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ favorite: next }),
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j.error ?? "Failed to update favorite");
+        }
+        return res.json();
+      });
+      setDetail(updated);
+    } catch {
+      // Surfaced by the activity dock/toast; nothing else to do here.
+    }
+  }, [detail, imageId, track]);
 
   const loadDebug = useCallback(async () => {
     setDebugOpen((open) => !open);

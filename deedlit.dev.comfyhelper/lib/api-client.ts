@@ -42,20 +42,18 @@ export function getGatewayBaseUrl(): string {
 }
 
 /**
- * Optional base URL for fetching image blobs (thumbnails / originals).
+ * Base URL for fetching image blobs (thumbnails / originals).
  *
- * The gateway (contracts/api.openapi.yaml) does NOT expose a blob route — the
- * catalog owns blobs at GET /blobs/{sha256}/{kind}, but the gateway does not
- * proxy them. Since comfyhelper is UI-only it cannot stream bytes from a
- * datastore itself. When DEEDLIT_BLOB_URL is set (to a base that serves
- * `/blobs/{sha256}/{kind}` — e.g. the gateway once it proxies blobs, or the
- * catalog in a dev setup) the thumbnail/file routes proxy through it; when
- * unset they degrade to 501.
- * TODO(#17): point this at the gateway once it proxies catalog blobs.
+ * The catalog owns blobs at GET /blobs/{sha256}/{kind}; the gateway now proxies
+ * them at the same path (deedlit.api GET /blobs/{sha256}/{kind}). Since
+ * comfyhelper is UI-only it can't stream bytes from a datastore itself, so the
+ * thumbnail/file routes proxy through this base. DEEDLIT_BLOB_URL overrides it
+ * (e.g. to hit the catalog directly in a dev setup); when unset we default to
+ * the gateway, which is the canonical blob source.
  */
 export function getBlobBaseUrl(): string | null {
   const v = process.env.DEEDLIT_BLOB_URL?.trim();
-  return v ? v.replace(/\/+$/, "") : null;
+  return (v ? v : getGatewayBaseUrl()).replace(/\/+$/, "");
 }
 
 /** Build the upstream blob URL for an image, or null if blob serving is unconfigured. */
@@ -202,6 +200,12 @@ export interface StatsResponse {
 export interface ServiceHealth {
   name: string;
   status: "ok" | "degraded" | "down";
+  /**
+   * Downstream readiness flags forwarded verbatim by the gateway, e.g.
+   * { db_ready, blob_ready } (catalog), { neo4j_ready } (graph),
+   * { collection_ready } (search), { vision_ready, sparse_ready } (vision).
+   */
+  detail?: Record<string, unknown>;
 }
 
 export interface HealthResponse {
@@ -246,6 +250,159 @@ export async function dispatchJob(
 
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return request<HealthResponse>("/health", { signal });
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem browse — the admin directory picker. The gateway proxies this to
+// deedlit.ingest, which owns the host filesystem the ingest paths live on.
+// comfyhelper itself has no filesystem access, so this is the only way the
+// picker can list folders.
+// ---------------------------------------------------------------------------
+
+export interface FsEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+}
+
+export interface FsRoot {
+  label: string;
+  path: string;
+}
+
+export interface FsBrowseResult {
+  /** Absolute path being listed, or null for the synthetic "roots" view. */
+  path: string | null;
+  /** Parent directory, or null when already at a drive/filesystem root. */
+  parent: string | null;
+  separator: string;
+  entries: FsEntry[];
+  /** Quick-access jump targets (drives, home, cwd) shown in every view. */
+  roots: FsRoot[];
+}
+
+/**
+ * List a directory on the ingest host. Passing null/empty returns the roots
+ * view. A {@link GatewayError} with status 400 means the path is missing /
+ * denied / not a folder — user-correctable, surfaced inline by the picker.
+ */
+export async function browseFs(path: string | null, signal?: AbortSignal): Promise<FsBrowseResult> {
+  return request<FsBrowseResult>("/fs/browse", {
+    query: path ? { path } : undefined,
+    signal,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Notes — the catalog "note" record (Editor.js block document + positive /
+// negative prompt fields + ordered image refs by sha256), proxied through the
+// gateway /notes routes. `blocks` is the raw Editor.js OutputData document; the
+// gateway/catalog stores it opaquely so the editor round-trips it verbatim.
+// ---------------------------------------------------------------------------
+
+/** Editor.js document (kept opaque; the editor owns the exact shape). */
+export type NoteBlocks = Record<string, unknown>;
+
+/** The writable fields of a note (POST /notes, PUT /notes/{id}). */
+export interface NoteUpsert {
+  title?: string | null;
+  positive?: string | null;
+  negative?: string | null;
+  /** Editor.js OutputData document. */
+  blocks: NoteBlocks;
+  /** Ordered image references by sha256. */
+  imageRefs: string[];
+}
+
+/** A persisted note (NoteUpsert + server-assigned id / timestamp). */
+export interface Note extends NoteUpsert {
+  id: string;
+  created_at?: string;
+}
+
+export async function createNote(body: NoteUpsert, signal?: AbortSignal): Promise<Note> {
+  return request<Note>("/notes", { method: "POST", body, signal });
+}
+
+export async function getNote(id: string, signal?: AbortSignal): Promise<Note> {
+  return request<Note>(`/notes/${encodeURIComponent(id)}`, { signal });
+}
+
+export async function updateNote(id: string, body: NoteUpsert, signal?: AbortSignal): Promise<Note> {
+  return request<Note>(`/notes/${encodeURIComponent(id)}`, { method: "PUT", body, signal });
+}
+
+export async function exportNote(id: string, signal?: AbortSignal): Promise<Note> {
+  return request<Note>(`/notes/${encodeURIComponent(id)}/export`, { signal });
+}
+
+export async function notesByImage(sha256: string, signal?: AbortSignal): Promise<Note[]> {
+  const res = await request<unknown>(`/notes/by-image/${encodeURIComponent(sha256)}`, { signal });
+  return Array.isArray(res) ? (res as Note[]) : [];
+}
+
+// ---------------------------------------------------------------------------
+// Collections — manual, ordered groups of images by sha256, proxied through
+// the gateway /collections routes. Membership uses set/replace semantics: PUT
+// /collections/{id}/images replaces the whole ordered list.
+// ---------------------------------------------------------------------------
+
+/** The writable fields of a collection on create (POST /collections). */
+export interface CollectionUpsert {
+  name: string;
+  /** Ordered image refs by sha256. */
+  images?: string[];
+}
+
+/** A persisted collection (id + name + ordered image refs). */
+export interface Collection {
+  id: string;
+  name: string;
+  images: string[];
+}
+
+export async function createCollection(body: CollectionUpsert, signal?: AbortSignal): Promise<Collection> {
+  return request<Collection>("/collections", { method: "POST", body, signal });
+}
+
+export async function listCollections(signal?: AbortSignal): Promise<Collection[]> {
+  const res = await request<unknown>("/collections", { signal });
+  return Array.isArray(res) ? (res as Collection[]) : [];
+}
+
+export async function getCollection(id: string, signal?: AbortSignal): Promise<Collection> {
+  return request<Collection>(`/collections/${encodeURIComponent(id)}`, { signal });
+}
+
+/** Rename a collection (PUT /collections/{id} with the new name). */
+export async function renameCollection(id: string, name: string, signal?: AbortSignal): Promise<Collection> {
+  return request<Collection>(`/collections/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    body: { name },
+    signal,
+  });
+}
+
+export async function deleteCollection(id: string, signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/collections/${encodeURIComponent(id)}`, { method: "DELETE", signal });
+}
+
+/**
+ * Replace a collection's ordered membership (PUT /collections/{id}/images).
+ * Set semantics: `images` is the complete, ordered sha256 list — adds, removes,
+ * and reorders are all expressed by sending the desired final list.
+ */
+export async function setCollectionImages(id: string, images: string[], signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/collections/${encodeURIComponent(id)}/images`, {
+    method: "PUT",
+    body: { images },
+    signal,
+  });
+}
+
+export async function collectionsByImage(sha256: string, signal?: AbortSignal): Promise<Collection[]> {
+  const res = await request<unknown>(`/collections/by-image/${encodeURIComponent(sha256)}`, { signal });
+  return Array.isArray(res) ? (res as Collection[]) : [];
 }
 
 // ---------------------------------------------------------------------------
