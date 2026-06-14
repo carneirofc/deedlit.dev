@@ -9,11 +9,17 @@ See contracts/search.openapi.yaml.
 """
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status
 
+from activity import install_activity
 from search.config import get_config
 from search.rebuild import rebuild_from_catalog
 from search.schemas import (
@@ -60,6 +66,7 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.search", version="0.1.0", lifespan=lifespan)
+install_activity(app)
 
 
 @app.get("/health", response_model=Health)
@@ -82,6 +89,20 @@ def upsert_point(point: UpsertPoint) -> dict:
         payload=point.payload,
     )
     return {"status": "ok", "id": point_id, "sha256": point.sha256.lower()}
+
+
+@app.delete("/points/{sha256}")
+def delete_point(sha256: str) -> dict:
+    """Delete the point for ``sha256`` (keyed by uuid5). Idempotent.
+
+    Part of un-indexing an image: the gateway calls this after the catalog
+    record is gone. Deleting a missing point is not an error, so this always
+    returns ``ok`` for a well-formed sha256.
+    """
+    store = get_store()
+    store.ensure_collection()
+    point_id = store.delete_point(sha256)
+    return {"status": "ok", "id": point_id, "sha256": sha256.lower()}
 
 
 @app.post("/query", response_model=QueryResponse)

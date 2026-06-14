@@ -176,3 +176,22 @@ def test_by_image_returns_neighbors():
     shas = [h["sha256"] for h in data["hits"]]
     assert SHA_A not in shas
     assert shas[0] == SHA_B
+
+
+# --- (6) DELETE /points/{sha256} removes the point (idempotent) --------------
+
+
+def test_delete_point_removes_it_idempotently():
+    # Use a throwaway point so the seeded A/B/C fixtures stay intact.
+    sha = _sha("to-delete")
+    _upsert(sha, _dense(123))
+    pid = point_id_for_sha256(sha)
+    assert store.client.retrieve(TEST_COLLECTION, ids=[pid])  # present
+
+    r = client.delete(f"/points/{sha}")
+    assert r.status_code == 200, r.text
+    assert r.json()["sha256"] == sha
+    assert store.client.retrieve(TEST_COLLECTION, ids=[pid]) == []  # gone
+
+    # Deleting a missing point is not an error.
+    assert client.delete(f"/points/{sha}").status_code == 200

@@ -100,6 +100,20 @@ class SearchStore:
         )
         return point_id
 
+    def delete_point(self, sha256: str) -> str:
+        """Delete the point keyed by ``uuid5(sha256)``. Idempotent.
+
+        Returns the derived point id. Qdrant's delete-by-id is a no-op when the
+        point is absent, so calling this for an unknown sha256 still succeeds —
+        which is what the gateway's best-effort projection cleanup wants.
+        """
+        point_id = point_id_for_sha256(sha256)
+        self.client.delete(
+            collection_name=self.collection,
+            points_selector=models.PointIdsList(points=[point_id]),
+        )
+        return point_id
+
     # -- reads --------------------------------------------------------------
 
     def _to_hits(self, points: list[Any]) -> list[Hit]:
