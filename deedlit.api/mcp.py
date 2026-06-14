@@ -49,6 +49,7 @@ def _pick_filters(d: dict[str, Any] | None) -> dict[str, Any]:
         "loras": d.get("loras"),
         "ratingGte": d.get("rating_gte"),
         "favorite": d.get("favorite"),
+        "safety": d.get("safety"),
     }
     return {k: v for k, v in out.items() if v is not None}
 
@@ -67,7 +68,7 @@ async def _search_images(args: dict[str, Any]) -> Any:
 
 def _top_level_filters(args: dict[str, Any]) -> dict[str, Any]:
     """search_images carries filter fields at the top level (per the TS schema)."""
-    keys = ("tags", "exclude_tags", "model_family", "checkpoint", "loras", "rating_gte", "favorite")
+    keys = ("tags", "exclude_tags", "model_family", "checkpoint", "loras", "rating_gte", "favorite", "safety")
     return {k: args[k] for k in keys if k in args}
 
 
@@ -142,6 +143,7 @@ def _filter_props() -> dict[str, Any]:
         "loras": {"type": "array", "items": {"type": "string"}},
         "rating_gte": {"type": "integer", "minimum": 0, "maximum": 5},
         "favorite": {"type": "boolean"},
+        "safety": {"type": "array", "items": {"type": "string", "enum": ["sfw", "nsfw", "explicit"]}},
     }
 
 

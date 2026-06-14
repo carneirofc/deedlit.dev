@@ -177,6 +177,45 @@ async def encode_query(query: str) -> dict[str, Any] | None:
     }
 
 
+def _to_qdrant_filter(facets: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Translate the UI's camelCase facet object into a Qdrant ``Filter`` shape.
+
+    Only facets that exist in each point's payload (written by ingest) can be
+    filtered on the vector path: ``tags`` (+ ``excludeTags``) and ``safety`` (the
+    content-safety class). The other facets (modelFamily / checkpoint / loras /
+    sourceTool / favorite / ratingGte) are catalog-only — mutable and not
+    projected into Qdrant — so they're ignored here and apply on the no-query
+    browse path instead. Returns ``None`` when nothing translatable is present so
+    search runs unfiltered (and so a raw facet dict never reaches Qdrant's
+    ``Filter(**raw)``, which only understands must/should/must_not).
+    """
+    if not facets:
+        return None
+    must: list[dict[str, Any]] = []
+    must_not: list[dict[str, Any]] = []
+
+    tags = facets.get("tags")
+    if isinstance(tags, list) and tags:
+        must.append({"key": "tags", "match": {"any": list(tags)}})
+
+    safety = facets.get("safety")
+    if isinstance(safety, str) and safety:
+        safety = [safety]
+    if isinstance(safety, list) and safety:
+        must.append({"key": "safety", "match": {"any": list(safety)}})
+
+    exclude = facets.get("excludeTags")
+    if isinstance(exclude, list) and exclude:
+        must_not.append({"key": "tags", "match": {"any": list(exclude)}})
+
+    qfilter: dict[str, Any] = {}
+    if must:
+        qfilter["must"] = must
+    if must_not:
+        qfilter["must_not"] = must_not
+    return qfilter or None
+
+
 async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) -> Any:
     """Encode ``query`` via vision, then run the hybrid search on deedlit.search.
 
@@ -184,11 +223,16 @@ async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) 
     (which left the default library gallery blank after a successful ingest),
     fall back to a catalog browse — list the cataloged images directly so the
     no-query "browse" view shows the library.
+
+    The UI sends a flat camelCase facet object as ``filter``; for the vector path
+    it is translated into a Qdrant filter (payload facets only — see
+    :func:`_to_qdrant_filter`), while the browse path threads the catalog-backed
+    facets straight into ``GET /images``.
     """
     vectors = await encode_query(query)
     if vectors is None:
         return await browse_catalog(limit, filter)
-    body = {**vectors, "limit": limit, "filter": filter}
+    body = {**vectors, "limit": limit, "filter": _to_qdrant_filter(filter)}
     return await search("POST", "/query", json=body)
 
 
@@ -212,6 +256,13 @@ async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str,
         fav = filter.get("favorite")
         if isinstance(fav, bool):
             params["favorite"] = fav
+        # Content-safety multi-select -> repeated ?safety= params (catalog lists
+        # by the set). httpx serialises a list value as repeated query params.
+        safety = filter.get("safety")
+        if isinstance(safety, str) and safety:
+            safety = [safety]
+        if isinstance(safety, list) and safety:
+            params["safety"] = list(safety)
     try:
         rows = await catalog("GET", "/images", params=params)
     except DownstreamError:

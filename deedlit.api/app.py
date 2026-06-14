@@ -22,6 +22,11 @@ MCP tool surface lives in mcp.py.
 """
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import asyncio
 import logging
 from typing import Any
@@ -32,6 +37,8 @@ from pydantic import BaseModel
 
 import clients
 import mcp
+from activity import install_activity
+from activity import tracker as gateway_tracker
 from clients import DownstreamError
 
 
@@ -50,6 +57,9 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.api", version="0.1.0")
+# Middleware only: the gateway serves an AGGREGATED /activity (every service's
+# snapshot) defined below, so the per-service route must not shadow it.
+install_activity(app, register_route=False)
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +89,52 @@ async def health() -> dict[str, Any]:
     )
     overall = "ok" if all(s["status"] == "ok" for s in services) else "degraded"
     return {"status": overall, "services": list(services)}
+
+
+# ---------------------------------------------------------------------------
+# GET /activity — live per-service work snapshot (parallel probe)
+#
+# Aggregates every service's lightweight GET /activity (in-flight count, recent
+# throughput, current op) into one payload the comfyhelper system-activity board
+# renders alongside /health. Mirrors the /health fan-out: probes run in parallel
+# and a downstream miss degrades to an idle row (busy=false, reachable=false) so
+# the board still shows the service rather than dropping it.
+# ---------------------------------------------------------------------------
+def _idle_activity(name: str, *, reachable: bool) -> dict[str, Any]:
+    return {
+        "name": name,
+        "inflight": 0,
+        "per_min": 0.0,
+        "busy": False,
+        "last_op": None,
+        "reachable": reachable,
+    }
+
+
+@app.get("/activity")
+async def activity() -> dict[str, Any]:
+    async def probe(name: str, base: str) -> dict[str, Any]:
+        try:
+            body = await clients.request(name, "GET", base, "/activity")
+        except DownstreamError:
+            return _idle_activity(name, reachable=False)
+        b = body if isinstance(body, dict) else {}
+        return {
+            "name": name,
+            "inflight": int(b.get("inflight", 0) or 0),
+            "per_min": float(b.get("per_min", 0) or 0),
+            "busy": bool(b.get("busy", False)),
+            "last_op": b.get("last_op"),
+            "reachable": True,
+        }
+
+    downstream = await asyncio.gather(
+        *(probe(name, base) for name, base in clients.HEALTH_SERVICES.items())
+    )
+    # The gateway answered, so include its own live work first (mirrors how the
+    # comfyhelper health route prepends the gateway component).
+    gateway = {"name": "gateway", **gateway_tracker.snapshot(), "reachable": True}
+    return {"services": [gateway, *downstream]}
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +176,51 @@ async def detail(sha256: str) -> dict[str, Any]:
         "image": image_r,
         "similar": [] if isinstance(similar_r, Exception) else similar_r,
         "neighbors": [] if isinstance(neighbors_r, Exception) else neighbors_r,
+    }
+
+
+# ---------------------------------------------------------------------------
+# DELETE /images/{sha256} — un-index an image across the stores
+# ---------------------------------------------------------------------------
+@app.delete("/images/{sha256}")
+async def delete_image(sha256: str) -> dict[str, Any]:
+    """Delete an image's INDEXATION (catalog record + search vector + graph
+    node), NOT the original file on disk.
+
+    Catalog is the source of truth and goes FIRST: a 404 there means the image
+    is not in the library (404 here); any other catalog failure aborts with 502
+    BEFORE the projections are touched, so a failed truth-delete can't strand
+    half-removed state. With the catalog row gone, the derived projections
+    (search point, graph node) are cleaned best-effort IN PARALLEL — a transient
+    search/graph failure leaves an orphan a reconcile/rebuild can prune and is
+    reported in the body rather than failing the whole delete.
+    """
+    try:
+        await clients.catalog("DELETE", f"/images/{sha256}")
+    except DownstreamError as exc:
+        if exc.status == 404:
+            raise HTTPException(status_code=404, detail="image not found") from exc
+        raise HTTPException(
+            status_code=502, detail=f"catalog unavailable: {exc.detail}"
+        ) from exc
+
+    async def del_search() -> bool:
+        await clients.search("DELETE", f"/points/{sha256}")
+        return True
+
+    async def del_graph() -> bool:
+        await clients.graph("DELETE", f"/images/{sha256}")
+        return True
+
+    search_r, graph_r = await asyncio.gather(
+        del_search(), del_graph(), return_exceptions=True
+    )
+    return {
+        "status": "ok",
+        "sha256": sha256,
+        "catalog": True,
+        "search": search_r is True,
+        "graph": graph_r is True,
     }
 
 

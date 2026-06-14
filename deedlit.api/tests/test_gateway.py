@@ -181,6 +181,39 @@ def test_search_encodes_text_then_queries(rec, client):
     assert "query" not in seen["body"]
 
 
+def test_search_translates_facets_to_qdrant_filter(rec, client):
+    # The UI sends a flat camelCase facet object; on the vector path the gateway
+    # must translate the payload-backed facets (tags/excludeTags/safety) into a
+    # valid Qdrant filter, NOT pass the raw facets (which Qdrant's Filter rejects).
+    seen = {}
+
+    def query_handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return {"hits": [], "fusion": "rrf"}
+
+    rec.on("POST", "/embed/text", lambda r: {"embedding": [0.1, 0.2, 0.3]})
+    rec.on("POST", "/embed/sparse", lambda r: {"indices": [1], "values": [0.5]})
+    rec.on("POST", "/query", query_handler)
+
+    r = client.post("/search", json={
+        "query": "a knight",
+        "limit": 10,
+        "filter": {
+            "tags": ["knight"],
+            "excludeTags": ["blurry"],
+            "safety": ["sfw", "nsfw"],
+            "modelFamily": "sdxl",  # catalog-only facet -> dropped on the vector path
+        },
+    })
+    assert r.status_code == 200
+    qfilter = seen["body"]["filter"]
+    assert qfilter["must"] == [
+        {"key": "tags", "match": {"any": ["knight"]}},
+        {"key": "safety", "match": {"any": ["sfw", "nsfw"]}},
+    ]
+    assert qfilter["must_not"] == [{"key": "tags", "match": {"any": ["blurry"]}}]
+
+
 def test_search_empty_query_browses_catalog_without_calling_search(rec, client):
     # An empty query has no vector to search by, so the gateway must NOT dispatch
     # a vectorless query (search would 422). Instead it browses the catalog — the
@@ -207,6 +240,77 @@ def test_search_empty_query_browses_catalog_without_calling_search(rec, client):
     # Only catalog was touched — vision/search stay out of the browse path.
     assert _bases(rec) == {clients.CATALOG_URL}
     assert "limit=10" in seen["url"]
+
+
+def test_browse_threads_safety_into_catalog_params(rec, client):
+    # No-query browse with a content-safety filter threads it into catalog
+    # GET /images as repeated ?safety= params (catalog lists by the set).
+    seen = {}
+
+    def images_handler(request: httpx.Request):
+        seen["safety"] = request.url.params.get_list("safety")
+        return []
+
+    rec.on("GET", "/images", images_handler)
+
+    r = client.post("/search", json={"query": "", "limit": 10, "filter": {"safety": ["sfw", "nsfw"]}})
+    assert r.status_code == 200
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["safety"] == ["sfw", "nsfw"]
+
+
+# ---------------------------------------------------------------------------
+# (4b) DELETE /images/{sha256} un-indexes across the stores
+# ---------------------------------------------------------------------------
+def test_delete_image_fans_out_catalog_first_then_projections(rec, client):
+    # catalog + graph both live at DELETE /images/{sha}; search at /points/{sha}.
+    rec.on("DELETE", f"/images/{SHA}", lambda r: {"status": "ok", "deleted": 1})
+    rec.on("DELETE", f"/points/{SHA}", lambda r: {"status": "ok"})
+
+    r = client.delete(f"/images/{SHA}")
+    assert r.status_code == 200
+    assert r.json() == {
+        "status": "ok",
+        "sha256": SHA,
+        "catalog": True,
+        "search": True,
+        "graph": True,
+    }
+    # All three owning services were hit.
+    assert _bases(rec) == {clients.CATALOG_URL, clients.SEARCH_URL, clients.GRAPH_URL}
+    # Catalog (the source of truth) is deleted FIRST, before the projections.
+    assert rec.calls[0][0] == clients.CATALOG_URL
+
+
+def test_delete_image_404_when_catalog_missing_leaves_projections(rec, client):
+    rec.on("DELETE", f"/images/{SHA}", lambda r: httpx.Response(404, json={"detail": "nope"}))
+    rec.on("DELETE", f"/points/{SHA}", lambda r: {"status": "ok"})
+
+    r = client.delete(f"/images/{SHA}")
+    assert r.status_code == 404
+    # A failed truth-delete must NOT touch the derived projections.
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_delete_image_reports_projection_failure_but_succeeds(rec, client):
+    rec.on("DELETE", f"/images/{SHA}", lambda r: {"status": "ok", "deleted": 1})
+    rec.on("DELETE", f"/points/{SHA}", lambda r: httpx.Response(500, json={"detail": "boom"}))
+
+    r = client.delete(f"/images/{SHA}")
+    # Catalog (truth) is gone, so the delete succeeds; the search projection
+    # failure is reported in the body rather than failing the whole request.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["catalog"] is True
+    assert body["search"] is False
+    assert body["graph"] is True
+
+
+def test_delete_image_502_when_catalog_errors(rec, client):
+    rec.on("DELETE", f"/images/{SHA}", lambda r: httpx.Response(500, json={"detail": "db down"}))
+    r = client.delete(f"/images/{SHA}")
+    assert r.status_code == 502
+    assert _bases(rec) == {clients.CATALOG_URL}
 
 
 def test_blob_proxy_streams_catalog_bytes(rec, client):
