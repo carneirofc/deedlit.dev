@@ -6,10 +6,16 @@ the Alembic migrations and NEVER calls search (Qdrant) or graph (Neo4j).
 
 See contracts/catalog.openapi.yaml.
 """
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import logging
 
 from fastapi import FastAPI
 
+from activity import install_activity
 from catalog import object_store
 from catalog.db import db_ready
 from catalog.routers import router
@@ -30,6 +36,7 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.catalog", version="0.1.0")
+install_activity(app)
 
 
 @app.get("/health")

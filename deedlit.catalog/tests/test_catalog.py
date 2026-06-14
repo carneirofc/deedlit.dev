@@ -43,6 +43,32 @@ def test_create_image_and_read_back(client) -> None:
     assert got["created_at"] is not None
 
 
+def test_filepath_roundtrips_and_survives_reindex(client) -> None:
+    sha = _sha()
+    # Fresh ingest carries the original on-disk source path.
+    r = client.post("/images", json={"sha256": sha, "filepath": "/lib/a/cat.png"})
+    assert r.status_code == 200, r.text
+    assert r.json()["filepath"] == "/lib/a/cat.png"
+
+    # A later reindex re-upserts the same sha WITHOUT a path (the path is unknown
+    # when re-running from stored bytes). file_path is INSERT-only, so the real
+    # path must be preserved rather than clobbered with the object-store URI.
+    r2 = client.post("/images", json={"sha256": sha, "prompt": "refreshed"})
+    assert r2.status_code == 200, r2.text
+    got = client.get(f"/images/{sha}").json()
+    assert got["filepath"] == "/lib/a/cat.png"
+    assert got["prompt"] == "refreshed"
+
+
+def test_filepath_defaults_to_object_store_uri_when_absent(client) -> None:
+    # No path supplied (e.g. an ingest that never had one): the NOT NULL column
+    # falls back to the sha256-keyed object-store URI rather than failing.
+    sha = _sha()
+    r = client.post("/images", json={"sha256": sha})
+    assert r.status_code == 200, r.text
+    assert r.json()["filepath"] == f"s3://images/{sha}"
+
+
 def test_missing_image_404(client) -> None:
     assert client.get(f"/images/{_sha()}").status_code == 404
 
@@ -98,6 +124,38 @@ def test_set_favorite(client) -> None:
     assert any(i["sha256"] == sha for i in listed)
 
 
+def test_delete_image_removes_record_refs_and_blob(client) -> None:
+    sha = _sha()
+    client.post(
+        "/images",
+        json={
+            "sha256": sha,
+            "tags": ["todelete_xyz"],
+            "references": [{"kind": "lora", "name": "x"}],
+        },
+    )
+    client.put(
+        f"/blobs/{sha}/thumbnail",
+        content=b"fake-webp",
+        headers={"content-type": "application/octet-stream"},
+    )
+    assert client.get(f"/images/{sha}").status_code == 200
+
+    r = client.delete(f"/images/{sha}")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+
+    # Record + blob are gone, and the image no longer lists under its tag.
+    assert client.get(f"/images/{sha}").status_code == 404
+    assert client.get(f"/blobs/{sha}/thumbnail").status_code == 404
+    listed = client.get("/images", params={"tag": "todelete_xyz"}).json()
+    assert all(i["sha256"] != sha for i in listed)
+
+
+def test_delete_missing_image_404(client) -> None:
+    assert client.delete(f"/images/{_sha()}").status_code == 404
+
+
 def test_patch_image(client) -> None:
     sha = _sha()
     client.post("/images", json={"sha256": sha})
@@ -110,6 +168,40 @@ def test_patch_image(client) -> None:
     assert got["rating"] == 5
     assert got["favorite"] is True
     assert got["tags"] == ["landscape"]
+
+
+def test_safety_roundtrips_and_survives_reindex(client) -> None:
+    # Ingest classifies the image; the safety class round-trips on read.
+    sha = _sha()
+    r = client.post("/images", json={"sha256": sha, "safety": "explicit"})
+    assert r.status_code == 200, r.text
+    assert r.json()["safety"] == "explicit"
+
+    # A reindex with no safety supplied must not wipe the stored class (COALESCE).
+    r2 = client.post("/images", json={"sha256": sha, "prompt": "refreshed"})
+    assert r2.status_code == 200, r2.text
+    assert client.get(f"/images/{sha}").json()["safety"] == "explicit"
+
+
+def test_patch_safety(client) -> None:
+    sha = _sha()
+    client.post("/images", json={"sha256": sha, "safety": "nsfw"})
+    r = client.patch(f"/images/{sha}", json={"safety": "sfw"})
+    assert r.status_code == 200, r.text
+    assert r.json()["safety"] == "sfw"
+
+
+def test_list_filter_by_safety_multi(client) -> None:
+    sfw, nsfw, exp = _sha(), _sha(), _sha()
+    client.post("/images", json={"sha256": sfw, "safety": "sfw"})
+    client.post("/images", json={"sha256": nsfw, "safety": "nsfw"})
+    client.post("/images", json={"sha256": exp, "safety": "explicit"})
+
+    # Multi-select: include sfw + nsfw, exclude explicit.
+    listed = client.get("/images", params={"safety": ["sfw", "nsfw"]}).json()
+    shas = {i["sha256"] for i in listed}
+    assert sfw in shas and nsfw in shas
+    assert exp not in shas
 
 
 def test_attach_references(client) -> None:

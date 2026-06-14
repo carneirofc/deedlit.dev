@@ -35,11 +35,12 @@ def create_image(payload: ImageUpsert) -> Image:
 def list_images(
     tag: str | None = Query(default=None),
     favorite: bool | None = Query(default=None),
+    safety: list[str] | None = Query(default=None),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
 ) -> list[Image]:
     return repository.list_images(
-        tag=tag, favorite=favorite, limit=limit, offset=offset
+        tag=tag, favorite=favorite, safety=safety, limit=limit, offset=offset
     )
 
 
@@ -57,6 +58,22 @@ def patch_image(payload: ImagePatch, sha256: str = SHA256) -> Image:
     if img is None:
         raise HTTPException(status_code=404, detail="image not found")
     return img
+
+
+@router.delete("/images/{sha256}")
+def delete_image(sha256: str = SHA256) -> dict:
+    """Hard-delete an image's catalog record (NOT the source file on disk).
+
+    Removes the Postgres row (FK children cascade) plus the per-image asset
+    references, then drops the sha256-keyed RustFS blobs (thumbnail + cached
+    embedding). The image row is already gone before blob cleanup runs, so a
+    lingering or already-missing blob never fails the delete.
+    """
+    if not repository.delete_image(sha256):
+        raise HTTPException(status_code=404, detail="image not found")
+    for kind in ("thumbnail", "embedding"):
+        object_store.delete_blob(sha256, kind)
+    return {"status": "ok"}
 
 
 @router.put("/images/{sha256}/rating")

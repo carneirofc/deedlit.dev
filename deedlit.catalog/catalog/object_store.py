@@ -120,6 +120,23 @@ def get_blob(sha256: str, kind: str) -> bytes | None:
         return None
 
 
+def delete_blob(sha256: str, kind: str) -> bool:
+    """Delete a sha256-keyed blob. Returns ``True`` if the store accepted it.
+
+    S3 DeleteObject is idempotent (deleting a missing key still succeeds), so a
+    ``True`` result does not prove the blob existed — only that cleanup ran. A
+    ``ClientError`` (bucket/endpoint trouble) returns ``False`` so callers can
+    treat blob cleanup on image-delete as best-effort.
+    """
+    cfg = get_config().object_store
+    key = blob_key(sha256, kind)
+    try:
+        get_client().delete_object(Bucket=cfg.bucket, Key=key)
+        return True
+    except ClientError:
+        return False
+
+
 def blob_ready() -> bool:
     try:
         ensure_bucket()

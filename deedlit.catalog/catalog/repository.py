@@ -12,6 +12,7 @@ This layer touches ONLY Postgres. It never imports a Qdrant or Neo4j driver.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from sqlalchemy import text
@@ -34,6 +35,16 @@ from catalog.schemas import (
 # ---------------------------------------------------------------------------
 
 
+def _basename(path: str) -> str:
+    """Last path segment, OS-agnostic.
+
+    Ingest may run on Windows (backslash separators) while the catalog runs on
+    Linux, so ``os.path.basename`` alone would not split a ``C:\\a\\b.png`` path.
+    Normalize both separators before taking the final segment.
+    """
+    return os.path.basename(path.replace("\\", "/")) or path
+
+
 def upsert_image(payload: ImageUpsert) -> Image:
     eng = get_engine()
     with eng.begin() as conn:
@@ -43,11 +54,11 @@ def upsert_image(payload: ImageUpsert) -> Image:
                 INSERT INTO images (
                     file_path, filename, sha256_hash, perceptual_hash,
                     width, height, source_tool, prompt, negative_prompt,
-                    workflow_json, metadata_json
+                    workflow_json, metadata_json, safety
                 ) VALUES (
                     :file_path, :filename, :sha256, :phash,
                     :width, :height, :source_tool, :prompt, :negative,
-                    CAST(:workflow_json AS JSONB), CAST(:metadata_json AS JSONB)
+                    CAST(:workflow_json AS JSONB), CAST(:metadata_json AS JSONB), :safety
                 )
                 ON CONFLICT (sha256_hash) DO UPDATE SET
                     perceptual_hash = COALESCE(EXCLUDED.perceptual_hash, images.perceptual_hash),
@@ -58,12 +69,21 @@ def upsert_image(payload: ImageUpsert) -> Image:
                     negative_prompt = COALESCE(EXCLUDED.negative_prompt, images.negative_prompt),
                     workflow_json   = COALESCE(EXCLUDED.workflow_json, images.workflow_json),
                     metadata_json   = COALESCE(EXCLUDED.metadata_json, images.metadata_json),
+                    -- Re-derivable AI classification: refresh when re-ingest
+                    -- supplies one, keep the existing value when it doesn't.
+                    safety          = COALESCE(EXCLUDED.safety, images.safety),
                     modified_at     = now()
                 """
             ),
             {
-                "file_path": f"s3://images/{payload.sha256}",
-                "filename": payload.sha256,
+                # Original source path of the file when ingest captured it, so a
+                # human can identify the image (the cross-service id is the
+                # opaque sha256). Falls back to the object-store URI when the
+                # path is unknown. Both columns are NOT NULL and set INSERT-only
+                # (absent from the ON CONFLICT update below), so a later reindex
+                # — which has no original path — never clobbers the real one.
+                "file_path": payload.filepath or f"s3://images/{payload.sha256}",
+                "filename": _basename(payload.filepath) if payload.filepath else payload.sha256,
                 "sha256": payload.sha256,
                 "phash": payload.phash,
                 "width": payload.width,
@@ -77,6 +97,7 @@ def upsert_image(payload: ImageUpsert) -> Image:
                 "metadata_json": json.dumps({"api_prompt_json": payload.api_prompt_json})
                 if payload.api_prompt_json is not None
                 else None,
+                "safety": payload.safety,
             },
         )
 
@@ -106,9 +127,9 @@ def get_image(sha256: str) -> Image | None:
         row = conn.execute(
             text(
                 """
-                SELECT id, sha256_hash, perceptual_hash, width, height,
+                SELECT id, sha256_hash, file_path, perceptual_hash, width, height,
                        source_tool, prompt, negative_prompt, rating, favorite,
-                       workflow_json, metadata_json, imported_at
+                       safety, workflow_json, metadata_json, imported_at
                 FROM images WHERE sha256_hash = :sha
                 """
             ),
@@ -129,6 +150,7 @@ def get_image(sha256: str) -> Image | None:
 
         return Image(
             sha256=row["sha256_hash"],
+            filepath=row["file_path"],
             phash=row["perceptual_hash"],
             width=row["width"],
             height=row["height"],
@@ -142,12 +164,18 @@ def get_image(sha256: str) -> Image | None:
             api_prompt_json=api_prompt_json,
             rating=row["rating"],
             favorite=row["favorite"],
+            safety=row["safety"],
             created_at=row["imported_at"],
         )
 
 
 def list_images(
-    *, tag: str | None, favorite: bool | None, limit: int, offset: int
+    *,
+    tag: str | None,
+    favorite: bool | None,
+    limit: int,
+    offset: int,
+    safety: list[str] | None = None,
 ) -> list[Image]:
     eng = get_engine()
     clauses = ["i.deleted = false"]
@@ -163,6 +191,12 @@ def list_images(
     if favorite is not None:
         clauses.append("i.favorite = :favorite")
         params["favorite"] = favorite
+    if safety:
+        # Multi-select content-safety filter: keep rows whose class is among the
+        # requested set. Unclassified (NULL) rows are excluded by an explicit
+        # filter, which is what the UI's "show these classes" chips intend.
+        clauses.append("i.safety = ANY(:safety)")
+        params["safety"] = list(safety)
 
     where = " AND ".join(clauses)
     with eng.connect() as conn:
@@ -199,6 +233,9 @@ def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
         if patch.favorite is not None:
             sets.append("favorite = :favorite")
             params["favorite"] = patch.favorite
+        if patch.safety is not None:
+            sets.append("safety = :safety")
+            params["safety"] = patch.safety
         if sets:
             conn.execute(
                 text(
@@ -210,6 +247,30 @@ def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
         if patch.tags is not None:
             _set_tags(conn, sha256, patch.tags, replace=True)
     return get_image(sha256)
+
+
+def delete_image(sha256: str) -> bool:
+    """Hard-delete an image and its catalog-owned rows. False if it was absent.
+
+    The image row's FK children (image_tags, generation_params, image_loras,
+    image_variants, image_descriptions) cascade via ``ON DELETE CASCADE``.
+    ``image_references`` is keyed by the cross-service sha256 (no FK to
+    ``images.id``), so it is removed explicitly here. Note / collection
+    membership refs are *user curation* — also keyed by sha256, but intentionally
+    left intact so a later re-ingest re-attaches the image to the same notes and
+    collections. Blob cleanup is the caller's concern (see the router).
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(
+            text("DELETE FROM image_references WHERE sha256 = :sha"),
+            {"sha": sha256},
+        )
+        res = conn.execute(
+            text("DELETE FROM images WHERE sha256_hash = :sha"),
+            {"sha": sha256},
+        )
+        return res.rowcount > 0
 
 
 def set_rating(sha256: str, rating: int) -> bool:
