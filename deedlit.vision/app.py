@@ -540,15 +540,28 @@ def _load_vision_model(preset: str) -> None:
     log.info("loading CLIP vision tower %s onto %s …", preset, DEVICE)
     _load_started = time.perf_counter()
 
-    m = CLIPVisionModelWithProjection(config["vision_config"])
+    # Build the model and load the checkpoint directly on the target device so we
+    # never hold the weights in CPU commit. The old path allocated a full fp32
+    # random-init model on CPU here, then mmapped a second fp32 copy via
+    # load_file — ~2x the checkpoint in CPU commit. On Windows, when the system
+    # commit limit is already near full, that construction exhausts the remaining
+    # commit and the subsequent safetensors mmap fails with "paging file is too
+    # small" (os error 1455) on the large towers (vit_h / big_g). Constructing
+    # under the device context puts the random-init weights straight on the GPU,
+    # and load_file(device=DEVICE) lands the checkpoint there too.
+    with torch.device(DEVICE):
+        m = CLIPVisionModelWithProjection(config["vision_config"])
 
-    state_dict = load_file(str(local_path))
+    state_dict = load_file(str(local_path), device=DEVICE)
     state_dict.pop("vision_model.embeddings.position_ids", None)
     missing, unexpected = m.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         raise RuntimeError(
             f"Unexpected clip_vision state dict layout for {preset!r}. missing={missing} unexpected={unexpected}"
         )
+    # Release the loaded checkpoint copy promptly so peak (GPU) memory during load
+    # stays at ~1x the weights rather than 2x once they're copied into the module.
+    del state_dict
 
     m = m.to(DEVICE).eval()
 

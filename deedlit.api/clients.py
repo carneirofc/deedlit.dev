@@ -15,6 +15,7 @@ factory to install an ``httpx.MockTransport`` and stay offline.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -278,6 +279,87 @@ async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str,
         # hit->card mapper (prompt/tags/rating/...) renders without a second fetch.
         hits.append({"sha256": sha, "score": None, "payload": row})
     return {"fusion": "browse", "hits": hits}
+
+
+# ---------------------------------------------------------------------------
+# Cross-service orchestration (shared by the REST routes and the MCP tools)
+#
+# These compose several owning services into one logical operation. They live
+# here — the downstream boundary — so the route layer (app.py) and the MCP tool
+# layer (mcp.py) call the SAME fan-out instead of each re-implementing it. They
+# return plain data / raise DownstreamError; the HTTP-status mapping stays in
+# the route, the tool-error wrapping stays in mcp.py.
+# ---------------------------------------------------------------------------
+async def image_detail(
+    sha256: str,
+    *,
+    similar_limit: int | None = None,
+    neighbor_limit: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate an image's detail (catalog record + search-similar + graph
+    neighbors) in ONE parallel fan-out.
+
+    catalog (the image record) is REQUIRED: its failure propagates so the caller
+    can map it (404 -> not found, else -> unavailable). The derived projections
+    (similar from search, neighbors from graph) are best-effort — a single
+    downstream miss degrades to an empty list so everything else still returns.
+    """
+    async def get_image() -> Any:
+        return await catalog("GET", f"/images/{sha256}")
+
+    async def get_similar() -> Any:
+        body: dict[str, Any] = {"sha256": sha256}
+        if similar_limit is not None:
+            body["limit"] = similar_limit
+        res = await search("POST", "/similar", json=body)
+        return (res or {}).get("hits", [])
+
+    async def get_neighbors() -> Any:
+        params = {"limit": neighbor_limit} if neighbor_limit is not None else None
+        res = await graph("GET", f"/neighbors/{sha256}", params=params)
+        return (res or {}).get("neighbors", [])
+
+    image_r, similar_r, neighbors_r = await asyncio.gather(
+        get_image(), get_similar(), get_neighbors(), return_exceptions=True
+    )
+    if isinstance(image_r, Exception):
+        raise image_r
+    return {
+        "image": image_r,
+        "similar": [] if isinstance(similar_r, Exception) else similar_r,
+        "neighbors": [] if isinstance(neighbors_r, Exception) else neighbors_r,
+    }
+
+
+async def unindex_image(sha256: str) -> dict[str, Any]:
+    """Delete an image's INDEXATION across the stores (catalog record + search
+    vector + graph node), NOT the source file on disk.
+
+    Catalog (truth) goes FIRST and raises on failure BEFORE the projections are
+    touched, so a failed truth-delete can't strand half-removed state. With the
+    record gone, the derived projections are cleaned best-effort in parallel and
+    each per-store outcome is reported in the result.
+    """
+    await catalog("DELETE", f"/images/{sha256}")
+
+    async def del_search() -> bool:
+        await search("DELETE", f"/points/{sha256}")
+        return True
+
+    async def del_graph() -> bool:
+        await graph("DELETE", f"/images/{sha256}")
+        return True
+
+    search_r, graph_r = await asyncio.gather(
+        del_search(), del_graph(), return_exceptions=True
+    )
+    return {
+        "status": "ok",
+        "sha256": sha256,
+        "catalog": True,
+        "search": search_r is True,
+        "graph": graph_r is True,
+    }
 
 
 # Service -> base URL map, for the health dashboard probe.

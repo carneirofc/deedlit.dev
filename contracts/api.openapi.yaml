@@ -78,6 +78,35 @@ paths:
         "200": { description: OK, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
         "404": { description: blob not found }
         "502": { description: catalog unavailable }
+  /folders:
+    post:
+      summary: Register a source folder (proxy to catalog)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+    get: { summary: List configured folders (proxy to catalog), responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } } } }
+  /folders/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    get: { summary: Read one folder (proxy to catalog), responses: { "200": { description: OK }, "404": { description: not found } } }
+    patch:
+      summary: Update folder controls (proxy to catalog)
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses: { "200": { description: OK }, "404": { description: not found } }
+    delete: { summary: Remove a folder (proxy to catalog), responses: { "200": { description: Deleted }, "404": { description: not found } } }
+  /folders/{id}/scan:
+    post:
+      parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+      summary: Scan now — resolve the folder path and dispatch an ingest job
+      responses:
+        "202": { description: Started, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "404": { description: folder not found }
+        "502": { description: ingest unavailable }
+  /images/unlabeled:
+    get:
+      summary: sha256 of images missing an AI label (proxy to catalog)
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
   /fs/browse:
     get:
       summary: List a directory for the admin folder picker (proxy to ingest)

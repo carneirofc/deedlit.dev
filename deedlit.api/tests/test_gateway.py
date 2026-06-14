@@ -12,6 +12,7 @@ fan-out is parallel, and *how* the gateway degrades when one downstream fails.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import httpx
@@ -555,6 +556,142 @@ def test_mcp_tool_call_downstream_failure_is_tool_error(rec, client):
     # JSON-RPC envelope is still ok; the tool result carries isError=True.
     assert "error" not in body or body.get("error") is None
     assert body["result"]["isError"] is True
+
+
+# ---------------------------------------------------------------------------
+# (7b) Expanded MCP surface — retrieval, library info, agent tasks
+# ---------------------------------------------------------------------------
+def _call(client, name, arguments, rpc_id=100):
+    return client.post("/mcp", json={
+        "jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+
+
+def test_mcp_tools_list_advertises_expanded_surface(rec, client):
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = {t["name"] for t in r.json()["result"]["tools"]}
+    # Retrieval + library info + agent tasks are all exposed.
+    assert {
+        "get_image", "get_image_detail", "get_library_stats",
+        "list_collections", "get_image_collections", "create_collection",
+        "set_collection_images", "list_image_notes",
+        "list_jobs", "browse_folders", "delete_image",
+    } <= names
+
+
+def test_mcp_get_image_returns_image_content_block(rec, client):
+    # Image retrieval: the tool streams the thumbnail bytes from catalog and
+    # emits them as a base64 MCP `image` content block (not JSON text).
+    png = b"\x89PNG\r\n\x1a\nFAKEWEBP"
+    rec.on(
+        "GET", f"/blobs/{SHA}/thumbnail",
+        lambda r: httpx.Response(200, content=png, headers={"content-type": "image/webp"}),
+    )
+    r = _call(client, "get_image", {"image_id": SHA})
+    assert r.status_code == 200
+    result = r.json()["result"]
+    assert result["isError"] is False
+    block = result["content"][0]
+    assert block["type"] == "image"
+    assert block["mimeType"] == "image/webp"
+    assert base64.b64decode(block["data"]) == png
+    assert result["structuredContent"]["bytes"] == len(png)
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_mcp_get_image_detail_fans_out(rec, client):
+    rec.on("GET", f"/images/{SHA}", lambda r: {"sha256": SHA, "prompt": "knight"})
+    rec.on("POST", "/similar", lambda r: {"hits": [{"sha256": "b" * 64, "score": 0.9}]})
+    rec.on("GET", f"/neighbors/{SHA}", lambda r: {"neighbors": [{"sha256": "c" * 64}]})
+
+    r = _call(client, "get_image_detail", {"image_id": SHA})
+    assert r.status_code == 200
+    sc = r.json()["result"]["structuredContent"]
+    assert sc["image"]["prompt"] == "knight"
+    assert sc["similar"][0]["sha256"] == "b" * 64
+    assert sc["neighbors"][0]["sha256"] == "c" * 64
+    assert _bases(rec) == {clients.CATALOG_URL, clients.SEARCH_URL, clients.GRAPH_URL}
+
+
+def test_mcp_get_library_stats(rec, client):
+    rec.on("GET", "/stats", lambda r: {"images": 42, "tags": 7, "collections": 3, "notes": 5})
+    r = _call(client, "get_library_stats", {})
+    assert r.status_code == 200
+    assert r.json()["result"]["structuredContent"]["images"] == 42
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_mcp_list_collections(rec, client):
+    rec.on("GET", "/collections", lambda r: [{"id": "c1", "name": "Knights", "images": []}])
+    r = _call(client, "list_collections", {})
+    assert r.json()["result"]["structuredContent"]["collections"][0]["id"] == "c1"
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_mcp_create_collection_posts_to_catalog(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return {"id": "c9", "name": "Mine", "images": [SHA]}
+
+    rec.on("POST", "/collections", handler)
+    r = _call(client, "create_collection", {"name": "Mine", "image_ids": [SHA]})
+    assert r.json()["result"]["structuredContent"]["id"] == "c9"
+    assert seen["body"] == {"name": "Mine", "images": [SHA]}
+
+
+def test_mcp_set_collection_images_replaces_membership(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(204)
+
+    rec.on("PUT", "/collections/c1/images", handler)
+    r = _call(client, "set_collection_images", {"collection_id": "c1", "image_ids": [SHA]})
+    assert r.json()["result"]["structuredContent"]["status"] == "ok"
+    assert seen["body"] == {"images": [SHA]}
+
+
+def test_mcp_list_image_notes(rec, client):
+    rec.on("GET", f"/notes/by-image/{SHA}", lambda r: [{"id": "n1", "title": "idea"}])
+    r = _call(client, "list_image_notes", {"image_id": SHA})
+    assert r.json()["result"]["structuredContent"]["notes"][0]["id"] == "n1"
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_mcp_list_jobs_proxies_ingest(rec, client):
+    rec.on("GET", "/jobs", lambda r: [{"id": "job1", "status": "running"}])
+    r = _call(client, "list_jobs", {})
+    assert r.json()["result"]["structuredContent"]["jobs"][0]["id"] == "job1"
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+def test_mcp_browse_folders_proxies_ingest(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.params.get("path")
+        return {"path": "/data", "entries": [], "roots": []}
+
+    rec.on("GET", "/fs/browse", handler)
+    r = _call(client, "browse_folders", {"path": "/data"})
+    assert r.json()["result"]["structuredContent"]["path"] == "/data"
+    assert seen["path"] == "/data"
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+def test_mcp_delete_image_unindexes_across_stores(rec, client):
+    rec.on("DELETE", f"/images/{SHA}", lambda r: {"status": "ok", "deleted": 1})
+    rec.on("DELETE", f"/points/{SHA}", lambda r: {"status": "ok"})
+    r = _call(client, "delete_image", {"image_id": SHA})
+    sc = r.json()["result"]["structuredContent"]
+    assert sc == {"status": "ok", "sha256": SHA, "catalog": True, "search": True, "graph": True}
+    assert _bases(rec) == {clients.CATALOG_URL, clients.SEARCH_URL, clients.GRAPH_URL}
+    # Catalog (the source of truth) is deleted FIRST, before the projections.
+    assert rec.calls[0][0] == clients.CATALOG_URL
 
 
 # ---------------------------------------------------------------------------

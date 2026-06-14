@@ -54,6 +54,16 @@ paths:
       summary: Set favorite
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { favorite: { type: boolean } }, required: [favorite] } } } }
       responses: { "200": { description: OK } }
+  /images/unlabeled:
+    get:
+      summary: sha256 of images missing an AI label/description
+      description: >
+        The label-backfill work set: cataloged images with no
+        deedlit.labelagent description. Returns { sha256: [...] }. Paged.
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { sha256: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [sha256] } } } } }
   /blobs/{sha256}/{kind}:
     parameters:
       - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
@@ -89,6 +99,22 @@ paths:
       summary: Set/reorder collection membership (ordered sha256 list)
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { images: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [images] } } } }
       responses: { "200": { description: OK } }
+  /folders:
+    post:
+      summary: Register a source folder (idempotent on path)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolderUpsert" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } } }
+    get: { summary: List configured folders (+ derived coverage), responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/SourceFolder" } } } } } } }
+  /folders/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    get: { summary: Read one folder, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } }, "404": { description: Not found } } }
+    patch:
+      summary: Update folder controls + scan-state (partial)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolderPatch" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } }, "404": { description: Not found } }
+    delete:
+      summary: Remove a folder from the registry (keeps its cataloged images)
+      responses: { "200": { description: Deleted }, "404": { description: Not found } }
   /activity:
     get:
       summary: Live work snapshot (in-flight count, throughput, current op)
@@ -194,4 +220,44 @@ components:
         - { $ref: "#/components/schemas/CollectionUpsert" }
         - type: object
           properties: { id: { type: string } }
+          required: [id]
+    SourceFolderUpsert:
+      type: object
+      description: Writable fields when registering a source folder.
+      properties:
+        path: { type: string, description: "Absolute path on the ingest host" }
+        label: { type: [string, "null"] }
+        enabled: { type: boolean, default: true, description: "Auto-scan on by default" }
+        recursive: { type: boolean, default: true }
+        scan_interval_seconds: { type: integer, default: 900, minimum: 0, description: "Per-folder scan cadence" }
+      required: [path]
+    SourceFolderPatch:
+      type: object
+      description: >-
+        Partial update. Carries both the user controls (enabled/recursive/
+        interval/label) and the scan-state the ingest scheduler writes back.
+      properties:
+        label: { type: [string, "null"] }
+        enabled: { type: [boolean, "null"] }
+        recursive: { type: [boolean, "null"] }
+        scan_interval_seconds: { type: [integer, "null"], minimum: 0 }
+        last_scan_status: { type: [string, "null"] }
+        last_scan_job_id: { type: [string, "null"] }
+        last_error: { type: [string, "null"] }
+        touch_last_scan_at: { type: boolean, default: false, description: "Stamp last_scan_at to now() server-side" }
+    SourceFolder:
+      allOf:
+        - { $ref: "#/components/schemas/SourceFolderUpsert" }
+        - type: object
+          properties:
+            id: { type: string }
+            last_scan_at: { type: [string, "null"], format: date-time }
+            last_scan_status: { type: [string, "null"] }
+            last_scan_job_id: { type: [string, "null"] }
+            last_error: { type: [string, "null"] }
+            created_at: { type: [string, "null"], format: date-time }
+            updated_at: { type: [string, "null"], format: date-time }
+            image_count: { type: integer, description: "Images under this folder (derived)" }
+            labeled_count: { type: integer, description: "Of those, with an AI label" }
+            unlabeled_count: { type: integer }
           required: [id]

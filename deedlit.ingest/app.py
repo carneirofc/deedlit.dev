@@ -40,7 +40,16 @@ from pydantic import BaseModel, model_validator
 
 from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
-from jobs import REINDEX_ONE_IMAGE, JobStore, reconcile_interval_seconds, reconcile_scheduler
+from jobs import (
+    REINDEX_ONE_IMAGE,
+    JobStore,
+    folder_scan_scheduler,
+    folder_scan_tick_seconds,
+    label_backfill_interval_seconds,
+    label_backfill_scheduler,
+    reconcile_interval_seconds,
+    reconcile_scheduler,
+)
 
 store = JobStore()
 
@@ -48,16 +57,23 @@ store = JobStore()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.start_worker()
-    # Opt-in periodic reconcile sweep (#21). Disabled unless
-    # RECONCILE_INTERVAL_SECONDS > 0, so tests never get a surprise scheduler.
-    scheduler: asyncio.Task | None = None
+    # Opt-in background schedulers (all disabled unless their interval env > 0,
+    # so tests never get a surprise scheduler):
+    #   - reconcile sweep (#21)
+    #   - folder scan (per-folder cadence over the configured-folder registry)
+    #   - label backfill (relabel images missing an AI description)
+    schedulers: list[asyncio.Task] = []
     if reconcile_interval_seconds() > 0:
-        scheduler = asyncio.create_task(reconcile_scheduler(store))
+        schedulers.append(asyncio.create_task(reconcile_scheduler(store)))
+    if folder_scan_tick_seconds() > 0:
+        schedulers.append(asyncio.create_task(folder_scan_scheduler(store)))
+    if label_backfill_interval_seconds() > 0:
+        schedulers.append(asyncio.create_task(label_backfill_scheduler(store)))
     try:
         yield
     finally:
-        if scheduler is not None:
-            scheduler.cancel()
+        for task in schedulers:
+            task.cancel()
 
 
 # Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
@@ -112,6 +128,7 @@ class MaintenanceRequest(BaseModel):
         "rebuild-graph",
         "rebuild-thumbnails",
         "reconcile",
+        "label-backfill",
     ]
     sha256: str | None = None
     folderPath: str | None = None

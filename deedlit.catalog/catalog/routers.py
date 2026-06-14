@@ -16,6 +16,9 @@ from catalog.schemas import (
     Note,
     NoteUpsert,
     RatingBody,
+    SourceFolder,
+    SourceFolderPatch,
+    SourceFolderUpsert,
 )
 
 SHA256 = Path(pattern=r"^[a-f0-9]{64}$")
@@ -42,6 +45,17 @@ def list_images(
     return repository.list_images(
         tag=tag, favorite=favorite, safety=safety, limit=limit, offset=offset
     )
+
+
+# Registered BEFORE /images/{sha256}: "unlabeled" is not a 64-hex sha, so the
+# parameterized route would 422 it. The literal path must win.
+@router.get("/images/unlabeled")
+def list_unlabeled(
+    limit: int = Query(default=500), offset: int = Query(default=0)
+) -> dict:
+    """sha256 of images missing a labelagent description — the label-backfill
+    work set for deedlit.ingest. Returns ``{sha256: [...]}``."""
+    return {"sha256": repository.list_unlabeled_sha256(limit=limit, offset=offset)}
 
 
 @router.get("/images/{sha256}", response_model=Image)
@@ -198,4 +212,40 @@ def delete_collection(id: str = Path(...)) -> dict:
 def set_collection_images(payload: CollectionImages, id: str = Path(...)) -> dict:
     if not repository.set_collection_images(id, payload.images):
         raise HTTPException(status_code=404, detail="collection not found")
+    return {"status": "ok"}
+
+
+# --- source folders --------------------------------------------------------
+
+
+@router.post("/folders", response_model=SourceFolder)
+def create_folder(payload: SourceFolderUpsert) -> SourceFolder:
+    return repository.create_folder(payload)
+
+
+@router.get("/folders", response_model=list[SourceFolder])
+def list_folders() -> list[SourceFolder]:
+    return repository.list_folders()
+
+
+@router.get("/folders/{id}", response_model=SourceFolder)
+def read_folder(id: str = Path(...)) -> SourceFolder:
+    folder = repository.get_folder(id)
+    if folder is None:
+        raise HTTPException(status_code=404, detail="folder not found")
+    return folder
+
+
+@router.patch("/folders/{id}", response_model=SourceFolder)
+def patch_folder(payload: SourceFolderPatch, id: str = Path(...)) -> SourceFolder:
+    folder = repository.patch_folder(id, payload)
+    if folder is None:
+        raise HTTPException(status_code=404, detail="folder not found")
+    return folder
+
+
+@router.delete("/folders/{id}")
+def delete_folder(id: str = Path(...)) -> dict:
+    if not repository.delete_folder(id):
+        raise HTTPException(status_code=404, detail="folder not found")
     return {"status": "ok"}

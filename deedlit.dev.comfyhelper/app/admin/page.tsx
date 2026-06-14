@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { PathInput } from "@/components/PathInput";
 import { ServiceStatusBoard } from "@/components/ServiceStatusBoard";
+import { SourceFoldersPanel } from "@/components/SourceFoldersPanel";
 import { useActivity } from "@/lib/store/activity";
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,12 @@ const MAINTENANCE_ACTIONS: MaintenanceAction[] = [
     label: "Rescan files",
     description: "Mark images whose source file vanished as missing.",
     endpoint: "/api/library/maintenance/rescan-files",
+  },
+  {
+    key: "backfill-labels",
+    label: "Backfill labels",
+    description: "Run the labelagent on every image missing an AI description.",
+    endpoint: "/api/library/maintenance/backfill-labels",
   },
 ];
 
@@ -347,6 +354,9 @@ export default function AdminPage() {
           ))}
         </div>
       </section>
+
+      {/* Configured source folders — persistent registry + per-folder auto-scan */}
+      <SourceFoldersPanel />
 
       {/* Maintenance */}
       <section className={cls.card} data-testid="maintenance-panel">

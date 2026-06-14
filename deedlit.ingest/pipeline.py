@@ -360,6 +360,78 @@ def rebuild_graph() -> dict[str, Any]:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Source-folder registry boundary (configured-folders feature) — read the
+# folder list + write scan-state back to catalog (the registry owner). The
+# folder scan scheduler lives here in ingest because ingest owns the host
+# filesystem + the pipeline; catalog just persists the registry. Thin wrappers
+# so tests monkeypatch them and stay offline.
+# ---------------------------------------------------------------------------
+def list_source_folders() -> list[dict[str, Any]]:
+    """GET the configured source folders from catalog (the registry owner)."""
+    resp = httpx.get(f"{CATALOG_URL}/folders", timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    body = resp.json()
+    return body if isinstance(body, list) else []
+
+
+def record_folder_scan(
+    folder_id: str,
+    *,
+    status: str | None = None,
+    job_id: str | None = None,
+    error: str | None = None,
+    touch_last_scan_at: bool = False,
+) -> None:
+    """PATCH a folder's last-scan state on catalog (status/job/error/timestamp).
+
+    Best-effort: a registry write failure must not fail the scan it describes,
+    so transport/HTTP errors are logged and swallowed.
+    """
+    payload: dict[str, Any] = {}
+    if status is not None:
+        payload["last_scan_status"] = status
+    if job_id is not None:
+        payload["last_scan_job_id"] = job_id
+    if error is not None:
+        payload["last_error"] = error
+    if touch_last_scan_at:
+        payload["touch_last_scan_at"] = True
+    if not payload:
+        return
+    try:
+        resp = httpx.patch(
+            f"{CATALOG_URL}/folders/{folder_id}", json=payload, timeout=HTTP_TIMEOUT
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        log.warning("record_folder_scan failed for %s: %s", folder_id, exc)
+
+
+def list_unlabeled_sha256() -> list[str]:
+    """List every cataloged sha256 missing a labelagent description.
+
+    The work set for the label-backfill sweep. Pages catalog
+    ``GET /images/unlabeled`` (which returns ``{sha256: [...]}``) until a short
+    page comes back.
+    """
+    out: list[str] = []
+    offset = 0
+    while True:
+        resp = httpx.get(
+            f"{CATALOG_URL}/images/unlabeled",
+            params={"limit": CATALOG_PAGE_SIZE, "offset": offset},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        shas = (resp.json() or {}).get("sha256", []) or []
+        out.extend(shas)
+        if len(shas) < CATALOG_PAGE_SIZE:
+            break
+        offset += CATALOG_PAGE_SIZE
+    return out
+
+
 def reindex_image(sha256: str) -> None:
     """Targeted per-image repair: re-run the full pipeline for one sha256.
 

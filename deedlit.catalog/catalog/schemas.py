@@ -103,3 +103,59 @@ class CollectionImages(BaseModel):
 
 class CollectionRename(BaseModel):
     name: str
+
+
+# ---------------------------------------------------------------------------
+# source folders — the persistent registry of configured ingest folders.
+#
+# The catalog owns this table because it is the only DB service; deedlit.ingest
+# (stateless) reads the list and writes scan-state back over HTTP. Image / label
+# counts are derived on read (see repository.list_folders), not stored.
+# ---------------------------------------------------------------------------
+class SourceFolderUpsert(BaseModel):
+    """Writable fields when adding a folder (POST /folders).
+
+    Only ``path`` is required; the rest carry the user-confirmed defaults
+    (auto-scan enabled, recursive, 15-min interval).
+    """
+
+    path: str
+    label: str | None = None
+    enabled: bool = True
+    recursive: bool = True
+    scan_interval_seconds: int = Field(default=900, ge=0)
+
+
+class SourceFolderPatch(BaseModel):
+    """Partial update (PATCH /folders/{id}).
+
+    Carries both the user-editable controls (enabled / recursive / interval /
+    label) AND the scan-state fields the ingest scheduler writes back after a
+    scan (status / job id / error / timestamp). All optional — only supplied
+    fields are written.
+    """
+
+    label: str | None = None
+    enabled: bool | None = None
+    recursive: bool | None = None
+    scan_interval_seconds: int | None = Field(default=None, ge=0)
+    last_scan_status: str | None = None
+    last_scan_job_id: str | None = None
+    last_error: str | None = None
+    # When true, stamp last_scan_at to now() server-side (the scheduler can't
+    # know the catalog clock). Not persisted as a column itself.
+    touch_last_scan_at: bool = False
+
+
+class SourceFolder(SourceFolderUpsert):
+    id: str
+    last_scan_at: datetime | None = None
+    last_scan_status: str | None = None
+    last_scan_job_id: str | None = None
+    last_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # Derived coverage (computed on read from images.file_path + descriptions).
+    image_count: int = 0
+    labeled_count: int = 0
+    unlabeled_count: int = 0

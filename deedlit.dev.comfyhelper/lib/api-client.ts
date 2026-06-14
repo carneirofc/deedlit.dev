@@ -348,6 +348,86 @@ export async function browseFs(path: string | null, signal?: AbortSignal): Promi
 }
 
 // ---------------------------------------------------------------------------
+// Source folders — the configured-ingest-folder registry, proxied through the
+// gateway /folders routes (catalog owns the data). The registry persists which
+// folders to scan; a background scheduler in ingest re-walks each on its own
+// interval and writes the last-scan state back, which these reads surface.
+// ---------------------------------------------------------------------------
+
+/** A configured source folder + its derived coverage. */
+export interface SourceFolder {
+  id: string;
+  path: string;
+  label: string | null;
+  enabled: boolean;
+  recursive: boolean;
+  scan_interval_seconds: number;
+  last_scan_at: string | null;
+  last_scan_status: string | null;
+  last_scan_job_id: string | null;
+  last_error: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  /** Images whose source path is under this folder (derived). */
+  image_count: number;
+  /** Of those, how many have an AI label/description. */
+  labeled_count: number;
+  unlabeled_count: number;
+}
+
+/** Writable fields when registering a folder. */
+export interface SourceFolderUpsert {
+  path: string;
+  label?: string | null;
+  enabled?: boolean;
+  recursive?: boolean;
+  scan_interval_seconds?: number;
+}
+
+/** Partial folder update (toggle enabled/recursive, edit interval/label). */
+export interface SourceFolderPatch {
+  label?: string | null;
+  enabled?: boolean;
+  recursive?: boolean;
+  scan_interval_seconds?: number;
+}
+
+export async function listSourceFolders(signal?: AbortSignal): Promise<SourceFolder[]> {
+  const res = await request<unknown>("/folders", { signal });
+  return Array.isArray(res) ? (res as SourceFolder[]) : [];
+}
+
+export async function createSourceFolder(body: SourceFolderUpsert, signal?: AbortSignal): Promise<SourceFolder> {
+  return request<SourceFolder>("/folders", { method: "POST", body, signal });
+}
+
+export async function updateSourceFolder(
+  id: string,
+  body: SourceFolderPatch,
+  signal?: AbortSignal,
+): Promise<SourceFolder> {
+  return request<SourceFolder>(`/folders/${encodeURIComponent(id)}`, { method: "PATCH", body, signal });
+}
+
+export async function deleteSourceFolder(id: string, signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/folders/${encodeURIComponent(id)}`, { method: "DELETE", signal });
+}
+
+/** Dispatch an immediate ingest scan of a configured folder ("Scan now"). */
+export async function scanSourceFolder(id: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/folders/${encodeURIComponent(id)}/scan`, {
+    method: "POST",
+    signal,
+  });
+}
+
+/** sha256 of every cataloged image missing an AI label (library-wide). */
+export async function listUnlabeled(signal?: AbortSignal): Promise<string[]> {
+  const res = await request<{ sha256?: string[] }>("/images/unlabeled", { signal });
+  return Array.isArray(res?.sha256) ? res.sha256 : [];
+}
+
+// ---------------------------------------------------------------------------
 // Notes — the catalog "note" record (Editor.js block document + positive /
 // negative prompt fields + ordered image refs by sha256), proxied through the
 // gateway /notes routes. `blocks` is the raw Editor.js OutputData document; the

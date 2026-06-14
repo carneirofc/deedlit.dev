@@ -77,7 +77,7 @@ components:
     MaintenanceRequest:
       type: object
       properties:
-        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile] }
+        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile, label-backfill] }
         sha256: { type: [string, "null"], pattern: "^[a-f0-9]{64}$", description: "for reindex-one-image" }
       required: [type]
     Job:

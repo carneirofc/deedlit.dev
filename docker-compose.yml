@@ -184,6 +184,11 @@ services:
       GRAPH_URL: http://graph:8000
       # Optional AI labeling enrichment (best-effort; unset => disabled).
       LABELAGENT_URL: http://labelagent:8000
+      # Background schedulers (0/unset disables each). Folder scan re-walks the
+      # configured-folder registry on each folder's own interval; label backfill
+      # periodically relabels images missing an AI description.
+      FOLDER_SCAN_TICK_SECONDS: ${FOLDER_SCAN_TICK_SECONDS:-60}
+      LABEL_BACKFILL_INTERVAL_SECONDS: ${LABEL_BACKFILL_INTERVAL_SECONDS:-0}
       # Browser-reachable base URL of the comfyhelper UI. Embedded into each
       # search point's payload as image_url/thumbnail_url (the image proxy
       # endpoints), so override it to the real public URL in deployment.

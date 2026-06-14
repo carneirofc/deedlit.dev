@@ -148,36 +148,17 @@ async def detail(sha256: str) -> dict[str, Any]:
     catalog (the image record) is REQUIRED — a 404 there is a 404 here. The
     derived projections (similar from search, neighbors from graph) are
     best-effort: if one downstream fails we degrade to an empty list and still
-    return everything that succeeded.
+    return everything that succeeded. The parallel fan-out lives in
+    ``clients.image_detail`` so the MCP ``get_image_detail`` tool reuses it.
     """
-    async def get_image() -> Any:
-        return await clients.catalog("GET", f"/images/{sha256}")
-
-    async def get_similar() -> Any:
-        res = await clients.search("POST", "/similar", json={"sha256": sha256})
-        return (res or {}).get("hits", [])
-
-    async def get_neighbors() -> Any:
-        res = await clients.graph("GET", f"/neighbors/{sha256}")
-        return (res or {}).get("neighbors", [])
-
-    image_r, similar_r, neighbors_r = await asyncio.gather(
-        get_image(), get_similar(), get_neighbors(), return_exceptions=True
-    )
-
-    # catalog is required.
-    if isinstance(image_r, DownstreamError):
-        if image_r.status == 404:
-            raise HTTPException(status_code=404, detail="image not found")
-        raise HTTPException(status_code=502, detail=f"catalog unavailable: {image_r.detail}")
-    if isinstance(image_r, Exception):
-        raise HTTPException(status_code=502, detail="catalog error")
-
-    return {
-        "image": image_r,
-        "similar": [] if isinstance(similar_r, Exception) else similar_r,
-        "neighbors": [] if isinstance(neighbors_r, Exception) else neighbors_r,
-    }
+    try:
+        return await clients.image_detail(sha256)
+    except DownstreamError as exc:
+        if exc.status == 404:
+            raise HTTPException(status_code=404, detail="image not found") from exc
+        raise HTTPException(status_code=502, detail=f"catalog unavailable: {exc.detail}") from exc
+    except Exception as exc:  # non-DownstreamError catalog failure
+        raise HTTPException(status_code=502, detail="catalog error") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -194,35 +175,17 @@ async def delete_image(sha256: str) -> dict[str, Any]:
     half-removed state. With the catalog row gone, the derived projections
     (search point, graph node) are cleaned best-effort IN PARALLEL — a transient
     search/graph failure leaves an orphan a reconcile/rebuild can prune and is
-    reported in the body rather than failing the whole delete.
+    reported in the body rather than failing the whole delete. The fan-out lives
+    in ``clients.unindex_image`` so the MCP ``delete_image`` tool reuses it.
     """
     try:
-        await clients.catalog("DELETE", f"/images/{sha256}")
+        return await clients.unindex_image(sha256)
     except DownstreamError as exc:
         if exc.status == 404:
             raise HTTPException(status_code=404, detail="image not found") from exc
         raise HTTPException(
             status_code=502, detail=f"catalog unavailable: {exc.detail}"
         ) from exc
-
-    async def del_search() -> bool:
-        await clients.search("DELETE", f"/points/{sha256}")
-        return True
-
-    async def del_graph() -> bool:
-        await clients.graph("DELETE", f"/images/{sha256}")
-        return True
-
-    search_r, graph_r = await asyncio.gather(
-        del_search(), del_graph(), return_exceptions=True
-    )
-    return {
-        "status": "ok",
-        "sha256": sha256,
-        "catalog": True,
-        "search": search_r is True,
-        "graph": graph_r is True,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +352,70 @@ async def delete_collection(collection_id: str) -> Any:
 @app.put("/collections/{collection_id}/images")
 async def set_collection_images(collection_id: str, payload: dict[str, Any]) -> Any:
     return await _proxy_catalog("PUT", f"/collections/{collection_id}/images", payload)
+
+
+# ---------------------------------------------------------------------------
+# Source folders — the configured-ingest-folder registry.
+#
+# The registry is catalog-owned (the only DB service), so list/create/patch/
+# delete are thin catalog proxies. "Scan now" is the one composite route: it
+# resolves the folder's path from catalog, then dispatches an ingest job — the
+# UI never has to know the path, only the folder id.
+# ---------------------------------------------------------------------------
+@app.post("/folders")
+async def create_folder(payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("POST", "/folders", payload)
+
+
+@app.get("/folders")
+async def list_folders() -> Any:
+    return await _proxy_catalog("GET", "/folders")
+
+
+@app.get("/folders/{folder_id}")
+async def read_folder(folder_id: str) -> Any:
+    return await _proxy_catalog("GET", f"/folders/{folder_id}")
+
+
+@app.patch("/folders/{folder_id}")
+async def patch_folder(folder_id: str, payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("PATCH", f"/folders/{folder_id}", payload)
+
+
+@app.delete("/folders/{folder_id}")
+async def delete_folder(folder_id: str) -> Any:
+    return await _proxy_catalog("DELETE", f"/folders/{folder_id}")
+
+
+@app.post("/folders/{folder_id}/scan", status_code=202)
+async def scan_folder(folder_id: str) -> JSONResponse:
+    """Dispatch an immediate ingest scan of a configured folder ("Scan now").
+
+    Resolves the folder's path from catalog (404 if unknown), then enqueues an
+    ingest job for that path. The background scheduler in ingest does this on
+    each folder's interval; this is the on-demand button.
+    """
+    folder = await _proxy_catalog("GET", f"/folders/{folder_id}")
+    path = (folder or {}).get("path") if isinstance(folder, dict) else None
+    if not path:
+        raise HTTPException(status_code=404, detail="folder not found")
+    try:
+        res = await clients.ingest("POST", "/ingest", json={"folderPath": path})
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"ingest unavailable: {exc.detail}")
+    return JSONResponse(status_code=202, content=res)
+
+
+@app.get("/images/unlabeled")
+async def list_unlabeled(limit: int = 500, offset: int = 0) -> Any:
+    """sha256 of images missing a labelagent description (catalog proxy).
+
+    Backs the UI's library-wide labeling-coverage readout; ingest's backfill
+    sweep reads the same catalog endpoint directly.
+    """
+    return await _proxy_catalog(
+        "GET", f"/images/unlabeled?limit={int(limit)}&offset={int(offset)}"
+    )
 
 
 # ---------------------------------------------------------------------------

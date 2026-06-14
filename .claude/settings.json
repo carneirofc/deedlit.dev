@@ -6,7 +6,12 @@
       "PowerShell(uv run --directory deedlit.catalog python _verify_safety.py 2>&1)",
       "PowerShell(Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 3000,4318,8000,8001,8002,8003,8004,8005,8006,8080 } | Select-Object LocalAddress,LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table -AutoSize)",
       "Bash(curl -s --max-time 5 http://127.0.0.1:8888/v1/models)",
-      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); m=d['choices'][0]['message']; print\\('finish_reason:', d['choices'][0].get\\('finish_reason'\\)\\); print\\('reasoning_content len:', len\\(m.get\\('reasoning_content'\\) or ''\\)\\); print\\('content:', repr\\(m.get\\('content'\\)\\)[:400]\\)\")"
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); m=d['choices'][0]['message']; print\\('finish_reason:', d['choices'][0].get\\('finish_reason'\\)\\); print\\('reasoning_content len:', len\\(m.get\\('reasoning_content'\\) or ''\\)\\); print\\('content:', repr\\(m.get\\('content'\\)\\)[:400]\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_gateway.py -q)",
+      "Bash(grep -n \"^  /\\\\|^paths:\\\\|^components:\" contracts/catalog.openapi.yaml)",
+      "Bash(./.venv/Scripts/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('app.py','clients.py','mcp.py'\\)]; print\\('compile OK'\\)\")",
+      "Bash(./.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

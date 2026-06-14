@@ -28,6 +28,9 @@ from catalog.schemas import (
     Note,
     NoteUpsert,
     Params,
+    SourceFolder,
+    SourceFolderPatch,
+    SourceFolderUpsert,
 )
 
 # ---------------------------------------------------------------------------
@@ -777,3 +780,203 @@ def _set_collection_images(conn: Connection, cid: str, images: list[str]) -> Non
             ),
             {"cid": cid, "sha": sha, "pos": pos},
         )
+
+
+# ---------------------------------------------------------------------------
+# source folders — the configured-ingest-folder registry (#folders feature).
+#
+# image_count / labeled_count are DERIVED on read from images.file_path prefixes
+# (+ the labelagent description provider), not stored, so there is no folder_id
+# on images to keep in sync. Paths are compared separator-insensitively
+# (ingest may run on Windows and store backslash paths while the folder was
+# registered with forward slashes, or vice-versa).
+# ---------------------------------------------------------------------------
+
+
+def _folder_counts(conn: Connection, path: str) -> tuple[int, int]:
+    """Return ``(image_count, labeled_count)`` for images under ``path``.
+
+    ``starts_with`` (PG11+) avoids LIKE metacharacter/escape issues with the
+    backslashes and ``%``/``_`` that real Windows paths contain. Both sides are
+    normalized to forward slashes so a folder registered with one separator
+    still matches files ingested with the other.
+    """
+    row = conn.execute(
+        text(
+            """
+            SELECT
+              count(*) AS image_count,
+              count(*) FILTER (
+                WHERE EXISTS (
+                  SELECT 1 FROM image_descriptions d
+                  WHERE d.image_id = i.id AND d.provider = :provider
+                )
+              ) AS labeled_count
+            FROM images i
+            WHERE i.deleted = false
+              AND starts_with(replace(i.file_path, '\\', '/'), replace(:path, '\\', '/'))
+            """
+        ),
+        {"path": path, "provider": _DESCRIPTION_PROVIDER},
+    ).mappings().first()
+    if row is None:
+        return 0, 0
+    return int(row["image_count"] or 0), int(row["labeled_count"] or 0)
+
+
+def _folder_from_row(conn: Connection, row: Any) -> SourceFolder:
+    image_count, labeled_count = _folder_counts(conn, row["path"])
+    return SourceFolder(
+        id=str(row["id"]),
+        path=row["path"],
+        label=row["label"],
+        enabled=row["enabled"],
+        recursive=row["recursive"],
+        scan_interval_seconds=row["scan_interval_seconds"],
+        last_scan_at=row["last_scan_at"],
+        last_scan_status=row["last_scan_status"],
+        last_scan_job_id=row["last_scan_job_id"],
+        last_error=row["last_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        image_count=image_count,
+        labeled_count=labeled_count,
+        unlabeled_count=max(image_count - labeled_count, 0),
+    )
+
+
+_FOLDER_COLUMNS = (
+    "id, path, label, enabled, recursive, scan_interval_seconds, "
+    "last_scan_at, last_scan_status, last_scan_job_id, last_error, "
+    "created_at, updated_at"
+)
+
+
+def create_folder(payload: SourceFolderUpsert) -> SourceFolder:
+    """Register a folder. Re-adding the same path updates its settings (the
+    UNIQUE(path) makes this idempotent rather than a 409)."""
+    eng = get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(
+            text(
+                f"""
+                INSERT INTO source_folders
+                    (path, label, enabled, recursive, scan_interval_seconds)
+                VALUES (:path, :label, :enabled, :recursive, :interval)
+                ON CONFLICT (path) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    enabled = EXCLUDED.enabled,
+                    recursive = EXCLUDED.recursive,
+                    scan_interval_seconds = EXCLUDED.scan_interval_seconds,
+                    updated_at = now()
+                RETURNING {_FOLDER_COLUMNS}
+                """
+            ),
+            {
+                "path": payload.path,
+                "label": payload.label,
+                "enabled": payload.enabled,
+                "recursive": payload.recursive,
+                "interval": payload.scan_interval_seconds,
+            },
+        ).mappings().first()
+        return _folder_from_row(conn, row)
+
+
+def list_folders() -> list[SourceFolder]:
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT {_FOLDER_COLUMNS} FROM source_folders "
+                "ORDER BY created_at DESC"
+            )
+        ).mappings().all()
+        return [_folder_from_row(conn, r) for r in rows]
+
+
+def get_folder(folder_id: str) -> SourceFolder | None:
+    eng = get_engine()
+    with eng.connect() as conn:
+        row = conn.execute(
+            text(f"SELECT {_FOLDER_COLUMNS} FROM source_folders WHERE id = :id"),
+            {"id": folder_id},
+        ).mappings().first()
+        if row is None:
+            return None
+        return _folder_from_row(conn, row)
+
+
+def patch_folder(folder_id: str, patch: SourceFolderPatch) -> SourceFolder | None:
+    """Apply a partial update. Supplied fields are written; ``touch_last_scan_at``
+    stamps ``last_scan_at`` to the catalog clock (the ingest scheduler uses this
+    to record when a scan started/finished)."""
+    eng = get_engine()
+    sets: list[str] = []
+    params: dict[str, Any] = {"id": folder_id}
+    for field in (
+        "label",
+        "enabled",
+        "recursive",
+        "scan_interval_seconds",
+        "last_scan_status",
+        "last_scan_job_id",
+        "last_error",
+    ):
+        value = getattr(patch, field)
+        if value is not None:
+            sets.append(f"{field} = :{field}")
+            params[field] = value
+    if patch.touch_last_scan_at:
+        sets.append("last_scan_at = now()")
+    with eng.begin() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM source_folders WHERE id = :id"), {"id": folder_id}
+        ).first()
+        if exists is None:
+            return None
+        if sets:
+            conn.execute(
+                text(
+                    f"UPDATE source_folders SET {', '.join(sets)}, updated_at = now() "
+                    "WHERE id = :id"
+                ),
+                params,
+            )
+    return get_folder(folder_id)
+
+
+def delete_folder(folder_id: str) -> bool:
+    """Remove a folder from the registry. Does NOT delete its images — they stay
+    cataloged (the registry is just the scan config)."""
+    eng = get_engine()
+    with eng.begin() as conn:
+        res = conn.execute(
+            text("DELETE FROM source_folders WHERE id = :id"), {"id": folder_id}
+        )
+        return res.rowcount > 0
+
+
+def list_unlabeled_sha256(limit: int, offset: int) -> list[str]:
+    """sha256 of cataloged images with no labelagent description — the set the
+    label-backfill sweep relabels. Newest-first so a backfill prioritizes recent
+    imports; paged like list_images."""
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT i.sha256_hash
+                FROM images i
+                WHERE i.deleted = false
+                  AND NOT EXISTS (
+                    SELECT 1 FROM image_descriptions d
+                    WHERE d.image_id = i.id AND d.provider = :provider
+                  )
+                ORDER BY i.imported_at DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"provider": _DESCRIPTION_PROVIDER, "limit": limit, "offset": offset},
+        ).all()
+        return [r[0] for r in rows]

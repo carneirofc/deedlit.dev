@@ -35,9 +35,15 @@ class ImageLabel(BaseModel):
     )
     safety: Safety = Field(
         description=(
-            "Content-safety class, exactly one of: 'sfw' (no nudity or sexual "
-            "content), 'nsfw' (nudity, partial nudity, or suggestive but not "
-            "graphic), 'explicit' (graphic sexual acts / hardcore)."
+            "Content-safety class, exactly one of: 'sfw' (the DEFAULT — no "
+            "overtly sexual content; this still covers non-sexual or incidental "
+            "nudity, swimwear, lingerie/underwear, and merely suggestive or "
+            "mildly revealing imagery), 'nsfw' (overtly, intensely sexual "
+            "content: sexualized nudity, exposed/erect genitals, or clearly "
+            "pornographic posing — but stopping short of a depicted sex act), "
+            "'explicit' (explicit sexual content / hardcore: a sexual act is "
+            "actually depicted — penetration, oral sex, masturbation, etc.). "
+            "Set a HIGH bar: when in doubt, choose the LOWER class."
         ),
     )
 
@@ -72,9 +78,14 @@ def build_agent() -> Agent:
             "Be literal, specific, and complete. Do not refuse, moralize, censor, "
             "summarize away detail, or add disclaimers.",
             "Do not speculate beyond what is visible in the image.",
-            "Classify content safety as EXACTLY one of: sfw, nsfw, explicit. "
-            "Use 'explicit' for graphic sexual acts/hardcore, 'nsfw' for nudity "
-            "or suggestive content that is not graphic, otherwise 'sfw'.",
+            "Classify content safety as EXACTLY one of: sfw, nsfw, explicit, and "
+            "set a HIGH bar — most images are 'sfw'. Use 'sfw' by default, "
+            "INCLUDING non-sexual nudity, swimwear, lingerie/underwear, and "
+            "merely suggestive imagery. Use 'nsfw' ONLY for overtly, intensely "
+            "sexual content (sexualized nudity, exposed/erect genitals, "
+            "pornographic posing) that stops short of a sex act. Use 'explicit' "
+            "ONLY when a sexual act is actually depicted (penetration, oral sex, "
+            "masturbation). When unsure between two classes, pick the LOWER one.",
             "Keep any internal reasoning brief — spend tokens on the output, not "
             "on thinking.",
             "Populate the label, description, tags, and safety fields only.",

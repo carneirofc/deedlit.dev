@@ -50,6 +50,12 @@ REBUILD_THUMBNAILS = "rebuild-thumbnails"
 # the eventual-consistency guarantees of the fan-out write model.
 RECONCILE = "reconcile"
 
+# Label backfill (configured-folders feature): find cataloged images with no
+# labelagent description and re-run the pipeline so they get one (+ safety +
+# AI tags), then re-project. The work set comes from catalog
+# /images/unlabeled; each image is repaired via the existing reindex path.
+LABEL_BACKFILL = "label-backfill"
+
 # When the number of drifted images for a projection is at or below this, repair
 # them one-by-one (cheaper, targeted) instead of a full collection rebuild.
 RECONCILE_PER_IMAGE_MAX = int(os.getenv("RECONCILE_PER_IMAGE_MAX", "10"))
@@ -88,6 +94,10 @@ class Job:
     rebuild_func: str | None = None
     per_image_max: int | None = None
     cancel_requested: bool = False
+    # When this job is a scheduled scan of a configured folder, its registry id.
+    # The worker writes the scan outcome back to catalog under this id so the UI
+    # shows each folder's last-scan status/time. None for ad-hoc ingests.
+    source_folder_id: str | None = None
     # Reconcile output: per-image projection status + repair summary (#21).
     report: dict[str, Any] | None = None
     # Live observability: which pipeline stage the worker is in right now
@@ -179,8 +189,15 @@ class JobStore:
         """All jobs, newest first — backs the gateway/dashboard GET /jobs list."""
         return list(reversed(self._jobs.values()))
 
-    def create_ingest_job(self, folder_path: str) -> Job:
-        job = Job(id=str(uuid.uuid4()), type="ingest", folder_path=folder_path)
+    def create_ingest_job(
+        self, folder_path: str, *, source_folder_id: str | None = None
+    ) -> Job:
+        job = Job(
+            id=str(uuid.uuid4()),
+            type="ingest",
+            folder_path=folder_path,
+            source_folder_id=source_folder_id,
+        )
         self._jobs[job.id] = job
         self._queue.put_nowait(job.id)
         return job
@@ -214,6 +231,8 @@ class JobStore:
             job.rebuild_func = REBUILD_FUNCS[mtype]
         elif mtype == RECONCILE:
             return self.create_reconcile_job()
+        # LABEL_BACKFILL needs no extra inputs — its work set is the catalog's
+        # unlabeled set, fetched at run time.
         return self._enqueue(job)
 
     def create_reconcile_job(self, *, per_image_max: int | None = None) -> Job:
@@ -269,6 +288,8 @@ class JobStore:
                 await self._run_reindex_one(job)
             elif job.type == RECONCILE:
                 await self._run_reconcile(job)
+            elif job.type == LABEL_BACKFILL:
+                await self._run_label_backfill(job)
             elif job.type in REBUILD_FUNCS:
                 await self._run_rebuild(job)
             else:
@@ -283,6 +304,20 @@ class JobStore:
         finally:
             # Settled on every path (completed / failed / cancelled mid-run).
             job.finished_at = _now_iso()
+            # If this was a scheduled scan of a configured folder, write its
+            # outcome back to the registry so the UI shows last-scan status/time.
+            # Best-effort: a registry write must never fail the scan it describes.
+            if job.source_folder_id:
+                await asyncio.to_thread(
+                    pipeline.record_folder_scan,
+                    job.source_folder_id,
+                    status=job.status,
+                    job_id=job.id,
+                    # "" (not None) so a successful re-scan CLEARS a prior error;
+                    # record_folder_scan only writes non-None fields.
+                    error=job.error or "",
+                    touch_last_scan_at=True,
+                )
         log.info(
             "job %s (%s) -> %s (total=%d done=%d skipped=%d failed=%d)",
             job.id, job.type, job.status,
@@ -433,6 +468,31 @@ class JobStore:
         }
         job.status = COMPLETED
 
+    async def _run_label_backfill(self, job: Job) -> None:
+        """Re-run the pipeline for every cataloged image missing an AI label.
+
+        Work set = catalog ``/images/unlabeled`` (no labelagent description). Each
+        image is repaired via the existing ``reindex_image`` path, which re-runs
+        the full pipeline (incl. the labelagent when ``LABELAGENT_URL`` is set) and
+        re-projects search/graph — so the description, safety and AI tags all land
+        and the search/sparse side reflects them. Cancellation is checked between
+        images; a per-image failure is counted and skipped rather than aborting.
+        """
+        shas = await asyncio.to_thread(pipeline.list_unlabeled_sha256)
+        job.progress.total = len(shas)
+        for sha in shas:
+            if job.cancel_requested:
+                job.status = CANCELLED
+                return
+            try:
+                await asyncio.to_thread(pipeline.reindex_image, sha)
+                self._seen_sha256.add(sha)
+                job.progress.done += 1
+            except Exception as exc:  # one image failing must not abort the sweep
+                job.progress.failed += 1
+                log.warning("label backfill failed for %s: %s", sha[:12], exc)
+        job.status = COMPLETED
+
     async def _process_one(self, job: Job, path: Path) -> None:
         started = time.perf_counter()
         try:
@@ -524,4 +584,131 @@ async def reconcile_scheduler(store: "JobStore") -> None:
             run_reconcile_tick(store)
         except Exception:
             # A scheduling hiccup must not kill the loop; next tick retries.
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Folder scan scheduler (configured-folders feature) — per-folder cadence
+#
+# Each registered folder carries its own scan_interval_seconds + last_scan_at.
+# Every FOLDER_SCAN_TICK_SECONDS the scheduler asks catalog for the folder list
+# and enqueues an ingest job for each enabled folder that is past due, stamping
+# last_scan_at forward so a folder isn't picked again until a full interval
+# elapses. Disabled (and so silent in tests) when the tick is 0/unset.
+# ---------------------------------------------------------------------------
+def folder_scan_tick_seconds() -> int:
+    """How often (seconds) to evaluate folders for due scans; 0/unset disables."""
+    try:
+        return int(os.getenv("FOLDER_SCAN_TICK_SECONDS", "0"))
+    except ValueError:
+        return 0
+
+
+def _folder_due(folder: dict[str, Any], now: datetime) -> bool:
+    """True when an enabled folder is past its per-folder scan interval (or has
+    never been scanned)."""
+    if not folder.get("enabled"):
+        return False
+    last = folder.get("last_scan_at")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last))
+    except ValueError:
+        return True
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    interval = int(folder.get("scan_interval_seconds") or 0)
+    return (now - last_dt).total_seconds() >= interval
+
+
+def run_folder_scan_tick(store: "JobStore") -> list[Job]:
+    """Enqueue an ingest scan for every enabled, past-due folder.
+
+    Returns the jobs enqueued (tests assert on this without waiting on the
+    clock). Folders already being scanned in this process are skipped so a scan
+    that outruns its interval can't stack up.
+    """
+    try:
+        folders = pipeline.list_source_folders()
+    except Exception as exc:  # catalog down / transport — try again next tick
+        log.warning("folder scan tick: could not list folders: %s", exc)
+        return []
+    now = datetime.now(timezone.utc)
+    active = {
+        j.source_folder_id
+        for j in store.list()
+        if j.source_folder_id and j.status in (QUEUED, RUNNING)
+    }
+    enqueued: list[Job] = []
+    for folder in folders:
+        fid = folder.get("id")
+        path = folder.get("path")
+        if not fid or not path or fid in active:
+            continue
+        if not _folder_due(folder, now):
+            continue
+        job = store.create_ingest_job(path, source_folder_id=fid)
+        # Stamp last_scan_at NOW so the next tick won't re-enqueue this folder
+        # until a full interval after the scan was kicked off (the worker stamps
+        # it again with the final status on completion).
+        pipeline.record_folder_scan(
+            fid, status=QUEUED, job_id=job.id, touch_last_scan_at=True
+        )
+        enqueued.append(job)
+    return enqueued
+
+
+async def folder_scan_scheduler(store: "JobStore") -> None:
+    """Background loop: evaluate folders for due scans every tick (opt-in).
+
+    No-op when FOLDER_SCAN_TICK_SECONDS is 0/unset, so importing the app or
+    running tests never starts a real scheduler.
+    """
+    tick = folder_scan_tick_seconds()
+    if tick <= 0:
+        return
+    while True:
+        await asyncio.sleep(tick)
+        try:
+            run_folder_scan_tick(store)
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Label backfill scheduler (configured-folders feature)
+#
+# Periodically enqueue a single label-backfill job (relabel every cataloged
+# image missing an AI description). Opt-in via LABEL_BACKFILL_INTERVAL_SECONDS;
+# skips a tick when one is already queued/running so backfills never stack.
+# ---------------------------------------------------------------------------
+def label_backfill_interval_seconds() -> int:
+    """Label-backfill schedule interval in seconds; 0/unset disables it."""
+    try:
+        return int(os.getenv("LABEL_BACKFILL_INTERVAL_SECONDS", "0"))
+    except ValueError:
+        return 0
+
+
+def run_label_backfill_tick(store: "JobStore") -> Job:
+    """Enqueue one label-backfill job (tests call this directly)."""
+    return store.create_maintenance_job(LABEL_BACKFILL)
+
+
+async def label_backfill_scheduler(store: "JobStore") -> None:
+    """Background loop: enqueue a label-backfill sweep every interval (opt-in)."""
+    interval = label_backfill_interval_seconds()
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if any(
+                j.type == LABEL_BACKFILL and j.status in (QUEUED, RUNNING)
+                for j in store.list()
+            ):
+                continue
+            run_label_backfill_tick(store)
+        except Exception:
             continue
