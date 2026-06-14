@@ -73,14 +73,22 @@ def mock_outbound(monkeypatch):
 
     def fake_sparse(text):
         calls["sparse"] += 1
+        calls["sparse_text"] = text
         return {"indices": [1, 2], "values": [0.5, 0.7]}
 
-    def fake_fanout(rec):
+    def fake_describe(data, filename, mime, prompt_hint=None):
+        # Default: labelagent disabled (mirrors LABELAGENT_URL unset). Individual
+        # tests monkeypatch this when they want AI enrichment.
+        calls["describe"] = calls.get("describe", 0) + 1
+        return {}
+
+    def fake_fanout(rec, *args):
         calls["fanout"].append(rec)
 
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", fake_image)
     monkeypatch.setattr(pipeline, "embed_sparse", fake_sparse)
+    monkeypatch.setattr(pipeline, "describe_image", fake_describe)
     monkeypatch.setattr(pipeline, "fan_out_writes", fake_fanout)
     return calls
 
@@ -117,6 +125,13 @@ def test_ingest_returns_job_and_processes_files(tmp_path, fresh_store, mock_outb
         assert final["progress"]["skipped"] == 0
         assert final["progress"]["failed"] == 0
     assert len(mock_outbound["fanout"]) == 3
+    # The worker passes each file's real on-disk path through the pipeline, so
+    # every fanned-out record (catalog) and point payload (search) is tagged
+    # with the source filepath for human identification.
+    for rec in mock_outbound["fanout"]:
+        assert rec.record["filepath"] is not None
+        assert str(tmp_path) in rec.record["filepath"]
+        assert rec.point["payload"]["filepath"] == rec.record["filepath"]
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +198,9 @@ def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
 
     processed = {"n": 0}
 
-    # Slow, side-effecting pipeline so cancel can land mid-run.
-    def slow_process(data, filename):
+    # Slow, side-effecting pipeline so cancel can land mid-run. `*args` absorbs
+    # the source_path + on_stage progress hook the real signature now carries.
+    def slow_process(data, filename, *args):
         processed["n"] += 1
         time.sleep(0.05)
         return pipeline.IngestRecord(
@@ -193,7 +209,7 @@ def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
         )
 
     monkeypatch.setattr(pipeline, "process_file", slow_process)
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: None)
+    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: None)
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
@@ -228,20 +244,76 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     with Image.open(io.BytesIO(thumb)) as im:
         assert im.format == "WEBP"
 
-    rec = pipeline.process_file(data, "img.png")
+    rec = pipeline.process_file(data, "img.png", source_path="/library/sub/img.png")
     assert rec.sha256 == pipeline.compute_sha256(data)
     assert rec.record["phash"] == phash
     assert rec.record["width"] == 32 and rec.record["height"] == 32
     assert rec.record["sha256"] == rec.sha256
+    # The original source path rides on the catalog record AND the search payload
+    # so an image stays identifiable by its file when inspecting the system.
+    assert rec.record["filepath"] == "/library/sub/img.png"
+    assert rec.point["payload"]["filepath"] == "/library/sub/img.png"
     assert rec.point["dense"] == [0.1, 0.2, 0.3]
     assert rec.point["sparse"] == {"indices": [1, 2], "values": [0.5, 0.7]}
     # search UpsertPoint is keyed by sha256 (search derives uuid5 itself); the
     # derived point id is surfaced in the payload.
     assert rec.point["sha256"] == rec.sha256
     assert rec.point["payload"]["point_id"] == pipeline.point_id_for_sha256(rec.sha256)
+    # payload carries proxy URLs (with file extensions) so a hit renders straight
+    # from the payload and the Qdrant dashboard shows previews. The full image
+    # keeps the original extension; the thumbnail is always WebP.
+    base = pipeline.COMFYHELPER_PUBLIC_URL
+    assert rec.point["payload"]["image_url"] == f"{base}/api/library/images/{rec.sha256}/file.png"
+    assert rec.point["payload"]["thumbnail_url"] == f"{base}/api/library/images/{rec.sha256}/thumbnail.webp"
     # references flattened to {kind,name,hash}
     assert {"kind": "checkpoint", "name": "sdxl", "hash": None} in rec.record["references"]
     assert rec.thumbnail is not None
+    # labelagent disabled here (fake_describe -> {}): no AI keys clutter the payload.
+    assert "label" not in rec.point["payload"]
+    assert "description" not in rec.point["payload"]
+    assert "safety" not in rec.point["payload"]
+    # record always carries the safety key (None when unclassified; catalog COALESCEs).
+    assert rec.record["safety"] is None
+
+
+# ---------------------------------------------------------------------------
+# (4b) labelagent enrichment folds into tags, sparse text, and the payload
+# ---------------------------------------------------------------------------
+def test_pipeline_folds_labelagent_into_tags_sparse_and_payload(mock_outbound, monkeypatch):
+    """With the labelagent enabled, its description drives the sparse (lexical)
+    text and the point payload, and its tags merge with the extracted tags."""
+
+    def fake_describe(data, filename, mime, prompt_hint=None):
+        # The extracted SD prompt is forwarded as the grounding hint.
+        assert prompt_hint == "a red knight"
+        return {
+            "label": "fantasy character portrait",
+            "description": "A red-armored knight standing in a misty forest.",
+            "tags": ["knight", "armor", "forest"],
+            "safety": "sfw",
+        }
+
+    monkeypatch.setattr(pipeline, "describe_image", fake_describe)
+
+    rec = pipeline.process_file(_png_bytes((10, 20, 30), size=16), "img.png")
+
+    # AI tags merged after the extracted tags, de-duped, order-stable, everywhere.
+    merged = ["red", "knight", "armor", "forest"]
+    assert rec.point["payload"]["tags"] == merged
+    assert rec.record["tags"] == merged
+    assert rec.edges["tags"] == merged
+    # Label + description surfaced in the searchable payload.
+    assert rec.point["payload"]["label"] == "fantasy character portrait"
+    assert (
+        rec.point["payload"]["description"]
+        == "A red-armored knight standing in a misty forest."
+    )
+    # Safety class lands on the catalog record AND the search payload (filterable).
+    assert rec.record["safety"] == "sfw"
+    assert rec.point["payload"]["safety"] == "sfw"
+    # The AI description (and the SD prompt) drive the sparse embedding text.
+    assert "misty forest" in mock_outbound["sparse_text"]
+    assert "a red knight" in mock_outbound["sparse_text"]
 
 
 # ---------------------------------------------------------------------------

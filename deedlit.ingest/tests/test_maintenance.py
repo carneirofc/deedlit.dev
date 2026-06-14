@@ -74,7 +74,7 @@ def mock_outbound(monkeypatch):
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
     monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [1], "values": [0.5]})
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: calls["fanout"].append(rec))
+    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: calls["fanout"].append(rec))
     return calls
 
 
@@ -205,7 +205,7 @@ def test_rebuild_types_drive_owning_service(fresh_store, monkeypatch, rtype, fun
 def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
     _write_pngs(tmp_path, [(i, 0, 0) for i in range(0, 60, 6)])  # 10 distinct images
 
-    def slow_process(data, filename):
+    def slow_process(data, filename, *args):
         time.sleep(0.05)
         return pipeline.IngestRecord(
             sha256=pipeline.compute_sha256(data),
@@ -213,7 +213,7 @@ def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
         )
 
     monkeypatch.setattr(pipeline, "process_file", slow_process)
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: None)
+    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: None)
 
     with TestClient(app_module.app) as client:
         job_id = client.post(

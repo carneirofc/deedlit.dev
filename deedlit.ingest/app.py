@@ -23,6 +23,11 @@ ingest job.
 """
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import asyncio
 import logging
 import os
@@ -33,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
+from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
 from jobs import REINDEX_ONE_IMAGE, JobStore, reconcile_interval_seconds, reconcile_scheduler
 
@@ -83,6 +89,7 @@ if not _ingest_logger.handlers:
 _ingest_logger.setLevel(os.getenv("INGEST_LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="deedlit.ingest", version="0.1.0", lifespan=lifespan)
+install_activity(app)
 
 
 class IngestRequest(BaseModel):

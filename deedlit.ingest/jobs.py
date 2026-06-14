@@ -10,14 +10,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pipeline
 
 log = logging.getLogger("deedlit.ingest.jobs")
+
+
+def _now_iso() -> str:
+    """UTC timestamp in ISO-8601 — the wire format the UI job rows expect."""
+    return datetime.now(timezone.utc).isoformat()
 
 # Job lifecycle states (mirrors contracts/ingest.openapi.yaml).
 QUEUED = "queued"
@@ -82,6 +90,17 @@ class Job:
     cancel_requested: bool = False
     # Reconcile output: per-image projection status + repair summary (#21).
     report: dict[str, Any] | None = None
+    # Live observability: which pipeline stage the worker is in right now
+    # (hash/metadata/label/vision:dense/vision:sparse/catalog/search/graph) and a
+    # per-stage count of files that have REACHED that stage — drives the UI's
+    # "which microservice is active doing what" board + the activity dock.
+    current_stage: str | None = None
+    stage_counts: dict[str, int] = field(default_factory=dict)
+    # Lifecycle timestamps (ISO-8601 UTC). The UI shows created/started/finished
+    # and derives duration/throughput; without these they render "—".
+    created_at: str = field(default_factory=_now_iso)
+    started_at: str | None = None
+    finished_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -100,10 +119,44 @@ class Job:
             "failed_files": self.progress.failed,
             "folder_path": self.folder_path,
             "error_message": self.error,
+            # Live stage + lifecycle timestamps (snake_case; the UI normalizes
+            # both camelCase and snake_case — see lib/store/activity-jobs.ts).
+            "current_stage": self.current_stage,
+            "stage_counts": self.stage_counts,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
         if self.report is not None:
             out["report"] = self.report
         return out
+
+    def stage_callback(self) -> Callable[[str], None]:
+        """A progress hook for the pipeline: record the current stage and bump
+        the per-stage reached-count. Passed into ``pipeline.process_file`` /
+        ``pipeline.fan_out_writes`` so a running ingest reports which service is
+        active right now. Mutates simple fields only (atomic under the GIL), so
+        it is safe to call from the ``asyncio.to_thread`` worker thread."""
+
+        # Per-file timing state: log how long the PREVIOUS stage took as soon as
+        # the next one begins, so a slow service (e.g. the labelagent LLM at the
+        # `label` stage, or `vision:dense` waiting on the GPU) is obvious in the
+        # log. The closure is per-file (one callback is created per _process_one).
+        state: dict[str, Any] = {"prev": None, "since": None}
+
+        def cb(stage: str) -> None:
+            now = time.perf_counter()
+            if state["prev"] is not None:
+                log.info(
+                    "job %s | %-13s %7.0f ms", self.id[:8], state["prev"],
+                    (now - state["since"]) * 1000,
+                )
+            state["prev"] = stage
+            state["since"] = now
+            self.current_stage = stage
+            self.stage_counts[stage] = self.stage_counts.get(stage, 0) + 1
+
+        return cb
 
 
 class JobStore:
@@ -181,9 +234,11 @@ class JobStore:
         if job is None:
             return None
         job.cancel_requested = True
-        # A queued-but-not-started job can be cancelled immediately.
+        # A queued-but-not-started job can be cancelled immediately. It never
+        # enters _run_job (the worker skips CANCELLED), so stamp finished here.
         if job.status == QUEUED:
             job.status = CANCELLED
+            job.finished_at = _now_iso()
         return job
 
     # -- worker -----------------------------------------------------------
@@ -204,8 +259,10 @@ class JobStore:
     async def _run_job(self, job: Job) -> None:
         if job.cancel_requested:
             job.status = CANCELLED
+            job.finished_at = _now_iso()
             return
         job.status = RUNNING
+        job.started_at = _now_iso()
         log.info("job %s (%s) started folder=%s sha256=%s", job.id, job.type, job.folder_path, job.sha256)
         try:
             if job.type == REINDEX_ONE_IMAGE:
@@ -223,6 +280,9 @@ class JobStore:
                 job.status = FAILED
                 job.error = str(exc)
             log.exception("job %s (%s) FAILED: %s", job.id, job.type, exc)
+        finally:
+            # Settled on every path (completed / failed / cancelled mid-run).
+            job.finished_at = _now_iso()
         log.info(
             "job %s (%s) -> %s (total=%d done=%d skipped=%d failed=%d)",
             job.id, job.type, job.status,
@@ -253,11 +313,17 @@ class JobStore:
         sha256 = job.sha256 or ""
         data, mime = await asyncio.to_thread(pipeline.fetch_image_bytes, sha256)
         filename = f"{sha256}{_ext_for_mime(mime)}"
+        # Backfill the source path from catalog so the re-projected search
+        # payload keeps the image's file identity (see pipeline.reindex_image).
+        source_path = await asyncio.to_thread(pipeline.fetch_image_filepath, sha256)
         if job.cancel_requested:
             job.status = CANCELLED
             return
-        rec = await asyncio.to_thread(pipeline.process_file, data, filename)
-        await asyncio.to_thread(pipeline.fan_out_writes, rec)
+        on_stage = job.stage_callback()
+        rec = await asyncio.to_thread(
+            pipeline.process_file, data, filename, source_path, on_stage
+        )
+        await asyncio.to_thread(pipeline.fan_out_writes, rec, on_stage)
         self._seen_sha256.add(rec.sha256)
         job.progress.done += 1
         job.status = COMPLETED
@@ -368,6 +434,7 @@ class JobStore:
         job.status = COMPLETED
 
     async def _process_one(self, job: Job, path: Path) -> None:
+        started = time.perf_counter()
         try:
             data = await asyncio.to_thread(path.read_bytes)
             sha256 = pipeline.compute_sha256(data)
@@ -375,17 +442,29 @@ class JobStore:
                 job.progress.skipped += 1
                 log.debug("skip (already seen) %s -> %s", path.name, sha256[:12])
                 return
-            rec = await asyncio.to_thread(pipeline.process_file, data, path.name)
-            await asyncio.to_thread(pipeline.fan_out_writes, rec)
+            # Mark each file's start so the log shows processing has BEGUN (and on
+            # which file) before the per-stage timings stream out below it.
+            log.info("processing %s -> %s", path.name, sha256[:12])
+            on_stage = job.stage_callback()
+            rec = await asyncio.to_thread(
+                pipeline.process_file, data, path.name, str(path), on_stage
+            )
+            await asyncio.to_thread(pipeline.fan_out_writes, rec, on_stage)
             self._seen_sha256.add(sha256)
             job.progress.done += 1
-            log.info("ingested %s -> %s (%d/%d)", path.name, sha256[:12], job.progress.done, job.progress.total)
-        except Exception:
+            log.info(
+                "ingested %s -> %s in %.0f ms (%d/%d)", path.name, sha256[:12],
+                (time.perf_counter() - started) * 1000, job.progress.done, job.progress.total,
+            )
+        except Exception as exc:
             job.progress.failed += 1
-            # Previously swallowed silently — the #1 reason ingest "fails" with
-            # no trace. Log the offending file + full traceback so a downstream
-            # write rejection (e.g. search/catalog 4xx) is debuggable.
-            log.exception("FAILED to ingest %s", path)
+            # Previously swallowed silently — the #1 reason ingest "fails" with no
+            # trace. Log the offending file, the STAGE it died at (so a slow/failing
+            # downstream is obvious), and the full traceback.
+            log.exception(
+                "FAILED to ingest %s at stage=%s after %.0f ms: %s",
+                path.name, job.current_stage, (time.perf_counter() - started) * 1000, exc,
+            )
 
 
 def _ext_for_mime(mime: str) -> str:

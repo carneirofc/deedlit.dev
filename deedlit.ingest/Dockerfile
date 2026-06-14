@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
     "opentelemetry-exporter-otlp-proto-http>=1.27.0" \
     "opentelemetry-instrumentation-fastapi>=0.48b0" \
     "opentelemetry-instrumentation-httpx>=0.48b0"
-COPY id_scheme.py pipeline.py jobs.py app.py ./
+COPY id_scheme.py pipeline.py jobs.py app.py activity.py ./
 
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --retries=10     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
