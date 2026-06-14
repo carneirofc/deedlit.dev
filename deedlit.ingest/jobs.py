@@ -18,9 +18,53 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import broker
+import ledger
 import pipeline
 
 log = logging.getLogger("deedlit.ingest.jobs")
+
+
+async def _publish_index_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    """Publish an index task, swallowing broker errors (ADR 0001).
+
+    The catalog write is the durability boundary: a publish failure must NEVER
+    fail the fast path. The image stays cataloged-but-unprojected and the
+    reconcile sweep re-enqueues it once the broker is back. Returns True on a
+    successful publish (lets callers/tests assert the happy path).
+    """
+    try:
+        await broker.publish_index_task(sha256, parent_op_id=parent_op_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort by design
+        log.warning(
+            "index publish failed for %s (%s); reconcile will re-enqueue", sha256[:12], exc
+        )
+        return False
+    # Record queued on the ledger best-effort (off the critical path).
+    await asyncio.to_thread(
+        ledger.record_task, sha256, broker.INDEX_QUEUE, "queued", None, None, parent_op_id
+    )
+    return True
+
+
+async def _publish_label_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    """Publish a label task, swallowing broker errors (ADR 0001).
+
+    Best-effort like the index publish: a failure here just means the image is
+    unlabeled until the label-backfill sweep re-enqueues it. Returns True on a
+    successful publish.
+    """
+    try:
+        await broker.publish_label_task(sha256, parent_op_id=parent_op_id)
+    except Exception as exc:  # noqa: BLE001 — best-effort by design
+        log.warning(
+            "label publish failed for %s (%s); backfill will re-enqueue", sha256[:12], exc
+        )
+        return False
+    await asyncio.to_thread(
+        ledger.record_task, sha256, broker.LABEL_QUEUE, "queued", None, None, parent_op_id
+    )
+    return True
 
 
 def _now_iso() -> str:
@@ -364,14 +408,18 @@ class JobStore:
         job.status = COMPLETED
 
     async def _run_rebuild(self, job: Job) -> None:
-        """Drive a store rebuild DIRECTLY against the owning service (#17).
+        """Rebuild a projection (ADR 0001 — coarse op as task producer).
 
-        The rebuild itself is a single opaque unit of work owned by the store
-        (search/graph/catalog); the ingest job wraps it so it gets the standard
-        lifecycle (queued/running/completed + cancellable while queued). The
-        target function is resolved from REBUILD_FUNCS (search/graph POST
-        /rebuild, catalog thumbnail rebuild).
+        ``rebuild-search`` / ``rebuild-graph`` are now BULK PRODUCERS: they publish
+        an index task for every cataloged image (an index task re-projects BOTH the
+        search and graph stores from catalog truth, so the two types are
+        equivalent). ``rebuild-thumbnails`` stays a catalog-owned rebuild
+        (thumbnails are catalog blobs, not a queue projection).
         """
+        if job.type in (REBUILD_SEARCH, REBUILD_GRAPH):
+            await self._run_bulk_index(job)
+            return
+        # rebuild-thumbnails: a single opaque unit of work owned by catalog.
         job.progress.total = 1
         if job.cancel_requested:
             job.status = CANCELLED
@@ -381,25 +429,36 @@ class JobStore:
         job.progress.done += 1
         job.status = COMPLETED
 
-    async def _run_reconcile(self, job: Job) -> None:
-        """Reconcile sweep: catalog coverage vs search + graph projections (#21).
+    async def _run_bulk_index(self, job: Job) -> None:
+        """Publish an index task for every cataloged image (bulk reprojection).
 
-        Steps:
-          1. list every sha256 the catalog holds (the set that SHOULD project);
-          2. probe which of those the search and graph projections cover;
-          3. compute drift (catalog-present-but-missing-in-{search,graph});
-          4. repair drift via the rebuild-from-catalog paths — a full collection
-             rebuild when many images drift, or targeted per-image reindex when
-             only a few do (<= job.per_image_max);
-          5. record a per-image projection status report on the job.
-
-        Progress counts catalog images probed. Cancellation is checked between
-        images (probing) and is honoured before the repair phase.
+        Progress counts images enqueued; cancellation is honoured between
+        publishes. Best-effort publish: a broker hiccup increments ``failed`` but
+        does not abort the sweep.
         """
-        per_image_max = (
-            RECONCILE_PER_IMAGE_MAX if job.per_image_max is None else job.per_image_max
-        )
+        shas = await asyncio.to_thread(pipeline.list_catalog_sha256)
+        job.progress.total = len(shas)
+        for sha in shas:
+            if job.cancel_requested:
+                job.status = CANCELLED
+                return
+            if await _publish_index_best_effort(sha, parent_op_id=job.id):
+                job.progress.done += 1
+            else:
+                job.progress.failed += 1
+        job.status = COMPLETED
 
+    async def _run_reconcile(self, job: Job) -> None:
+        """Reconcile sweep: catalog coverage vs search + graph projections (#21,
+        ADR 0001 — coarse op as task producer).
+
+        Probes which cataloged images are missing from the search and/or graph
+        projection, then PUBLISHES an index task for each drifted image (one task
+        re-projects both stores). This is ALSO the safety net for the best-effort
+        publish model: an image cataloged while the broker was down shows as drift
+        here and gets re-enqueued. Progress counts catalog images probed;
+        cancellation is checked between probes and between publishes.
+        """
         catalog = await asyncio.to_thread(pipeline.list_catalog_sha256)
         job.progress.total = len(catalog)
 
@@ -414,7 +473,7 @@ class JobStore:
                 return
             in_search = await asyncio.to_thread(pipeline.search_has, sha)
             in_graph = await asyncio.to_thread(pipeline.graph_has, sha)
-            images[sha] = {"in_search": in_search, "in_graph": in_graph, "repaired": False}
+            images[sha] = {"in_search": in_search, "in_graph": in_graph, "enqueued": False}
             if not in_search:
                 search_drift.append(sha)
             if not in_graph:
@@ -425,58 +484,34 @@ class JobStore:
             job.status = CANCELLED
             return
 
-        # -- repair drift via rebuild-from-catalog paths --
-        repaired: set[str] = set()
-        strategy = "none"
-        drift_images = set(search_drift) | set(graph_drift)
-        total_drift_images = len(drift_images)
-
-        if total_drift_images == 0:
-            strategy = "none"
-        elif total_drift_images <= per_image_max:
-            # Targeted, image-by-image repair (cheaper than a full rebuild).
-            # A single reindex re-projects BOTH search + graph for that image.
-            strategy = "per-image"
-            for sha in sorted(drift_images):
-                if job.cancel_requested:
-                    job.status = CANCELLED
-                    return
-                await asyncio.to_thread(pipeline.reindex_image, sha)
-                images[sha]["repaired"] = True
-                repaired.add(sha)
-        else:
-            # Full collection rebuild-from-catalog for any drifting projection.
-            strategy = "rebuild"
-            if search_drift:
-                await asyncio.to_thread(pipeline.rebuild_search)
-                for sha in search_drift:
-                    images[sha]["repaired"] = True
-                    repaired.add(sha)
-            if graph_drift:
-                await asyncio.to_thread(pipeline.rebuild_graph)
-                for sha in graph_drift:
-                    images[sha]["repaired"] = True
-                    repaired.add(sha)
+        # -- re-enqueue an index task per drifted image (one task fixes both) --
+        enqueued: list[str] = []
+        for sha in sorted(set(search_drift) | set(graph_drift)):
+            if job.cancel_requested:
+                job.status = CANCELLED
+                return
+            if await _publish_index_best_effort(sha, parent_op_id=job.id):
+                images[sha]["enqueued"] = True
+                enqueued.append(sha)
 
         job.report = {
             "catalog_count": len(catalog),
             "search_drift": search_drift,
             "graph_drift": graph_drift,
-            "repaired": sorted(repaired),
-            "repair_strategy": strategy,
+            "enqueued": sorted(enqueued),
+            "repair_strategy": "enqueue-index",
             "images": images,
         }
         job.status = COMPLETED
 
     async def _run_label_backfill(self, job: Job) -> None:
-        """Re-run the pipeline for every cataloged image missing an AI label.
+        """Publish a label task for every cataloged image missing an AI
+        description (ADR 0001 — coarse op as task producer).
 
-        Work set = catalog ``/images/unlabeled`` (no labelagent description). Each
-        image is repaired via the existing ``reindex_image`` path, which re-runs
-        the full pipeline (incl. the labelagent when ``LABELAGENT_URL`` is set) and
-        re-projects search/graph — so the description, safety and AI tags all land
-        and the search/sparse side reflects them. Cancellation is checked between
-        images; a per-image failure is counted and skipped rather than aborting.
+        Work set = catalog ``/images/unlabeled``. Each image gets a label task
+        (describe -> patch catalog -> re-index). Also the safety net for label
+        publishes missed during a broker outage. Cancellation is checked between
+        publishes; a publish hiccup increments ``failed`` rather than aborting.
         """
         shas = await asyncio.to_thread(pipeline.list_unlabeled_sha256)
         job.progress.total = len(shas)
@@ -484,13 +519,10 @@ class JobStore:
             if job.cancel_requested:
                 job.status = CANCELLED
                 return
-            try:
-                await asyncio.to_thread(pipeline.reindex_image, sha)
-                self._seen_sha256.add(sha)
+            if await _publish_label_best_effort(sha, parent_op_id=job.id):
                 job.progress.done += 1
-            except Exception as exc:  # one image failing must not abort the sweep
+            else:
                 job.progress.failed += 1
-                log.warning("label backfill failed for %s: %s", sha[:12], exc)
         job.status = COMPLETED
 
     async def _process_one(self, job: Job, path: Path) -> None:
@@ -506,14 +538,23 @@ class JobStore:
             # which file) before the per-stage timings stream out below it.
             log.info("processing %s -> %s", path.name, sha256[:12])
             on_stage = job.stage_callback()
-            rec = await asyncio.to_thread(
-                pipeline.process_file, data, path.name, str(path), on_stage
+            # Synchronous fast path: catalog record + thumbnail only (ADR 0001).
+            # Dense/sparse/search/graph projection happens asynchronously in the
+            # index task published below.
+            await asyncio.to_thread(
+                pipeline.ingest_fast, data, path.name, str(path), on_stage
             )
-            await asyncio.to_thread(pipeline.fan_out_writes, rec, on_stage)
+            # Enqueue the async tasks: index (build the projection) AND label
+            # (describe -> patch catalog -> re-index). Best-effort: a broker
+            # outage must not fail the catalog write — reconcile re-enqueues the
+            # index and label-backfill re-enqueues the label once it is back.
+            on_stage("publish")
+            await _publish_index_best_effort(sha256, parent_op_id=job.id)
+            await _publish_label_best_effort(sha256, parent_op_id=job.id)
             self._seen_sha256.add(sha256)
             job.progress.done += 1
             log.info(
-                "ingested %s -> %s in %.0f ms (%d/%d)", path.name, sha256[:12],
+                "ingested(fast) %s -> %s in %.0f ms (%d/%d)", path.name, sha256[:12],
                 (time.perf_counter() - started) * 1000, job.progress.done, job.progress.total,
             )
         except Exception as exc:

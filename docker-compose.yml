@@ -97,6 +97,27 @@ services:
       timeout: 5s
       retries: 20
 
+  # RabbitMQ: durable transport for the async index/label task queues (ADR 0001).
+  # The management plugin (15672) backs the in-app queue visualization (#29) and
+  # is the deep-link target for power debugging. The ingest fast path publishes
+  # tasks here; ingest-worker replicas consume them.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: deedlit
+      RABBITMQ_DEFAULT_PASS: deedlit
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI / HTTP API
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
   # --- Owning services ---------------------------------------------------
   catalog:
     build: { context: ./deedlit.catalog }
@@ -184,6 +205,10 @@ services:
       GRAPH_URL: http://graph:8000
       # Optional AI labeling enrichment (best-effort; unset => disabled).
       LABELAGENT_URL: http://labelagent:8000
+      # RabbitMQ for the async index/label task queues (ADR 0001). The fast path
+      # publishes here best-effort; a publish failure never fails the catalog
+      # write (reconcile/backfill re-enqueue later).
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
       # Background schedulers (0/unset disables each). Folder scan re-walks the
       # configured-folder registry on each folder's own interval; label backfill
       # periodically relabels images missing an AI description.
@@ -195,7 +220,33 @@ services:
       COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
     depends_on:
       metadata: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
     healthcheck: *app-healthcheck
+
+  # Async task worker(s): same image as ingest, run via the worker.py entrypoint
+  # instead of the API. QUEUES selects which queue(s) this replica drains (ADR
+  # 0001) — run dedicated replicas with QUEUES=label to scale LLM/GPU-bound
+  # labelling independently of index. No HTTP server, so no healthcheck.
+  ingest-worker:
+    build: { context: ./deedlit.ingest }
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "python", "worker.py"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest-worker
+      QUEUES: ${INGEST_WORKER_QUEUES:-index,label}
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      METADATA_URL: http://metadata:8000
+      VISION_URL: http://vision:8000
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+      LABELAGENT_URL: http://labelagent:8000
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+      metadata: { condition: service_healthy }
 
   # --- Gateway -----------------------------------------------------------
   api:
@@ -324,6 +375,7 @@ volumes:
   qdrant_data:
   rustfs_data:
   rustfs_logs:
+  rabbitmq_data:
   loki_data:
   tempo_data:
   alloy_data:

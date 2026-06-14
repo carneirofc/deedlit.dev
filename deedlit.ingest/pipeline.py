@@ -34,6 +34,7 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -189,47 +190,66 @@ def embed_sparse(text: str) -> dict[str, list]:
 def describe_image(
     data: bytes, filename: str, mime: str, prompt_hint: str | None = None
 ) -> dict[str, Any]:
-    """POST the image to deedlit.labelagent /describe; return its
-    ``{label, description, tags}`` (or ``{}`` when disabled/failed).
+    """POST the image to deedlit.labelagent /describe; return ``{label,
+    description, tags, safety}``.
 
-    Best-effort enrichment: when ``LABELAGENT_URL`` is unset the call is skipped,
-    and any error degrades to ``{}`` so a labelagent/llama-server outage never
-    fails ingest. ``prompt_hint`` (the extracted SD prompt) grounds the model.
+    Now called ONLY by the async ``label`` task (ADR 0001), so the failure mode is
+    deliberately STRICT: when ``LABELAGENT_URL`` is unset the call is skipped and
+    ``{}`` is returned (a clean no-op the task treats as "nothing to patch"), but
+    any transport/HTTP error PROPAGATES so the broker can retry with backoff and
+    eventually dead-letter (``label.dlq``). ``prompt_hint`` (the extracted SD
+    prompt) grounds the model.
     """
     if not LABELAGENT_URL:
         return {}
     files = {"file": (filename, data, mime)}
     form = {"prompt_hint": prompt_hint} if prompt_hint else None
-    try:
-        resp = httpx.post(
-            f"{LABELAGENT_URL}/describe", files=files, data=form, timeout=HTTP_TIMEOUT
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
-        log.warning("labelagent describe failed for %s (%s); skipping", filename, exc)
-        return {}
+    resp = httpx.post(
+        f"{LABELAGENT_URL}/describe", files=files, data=form, timeout=HTTP_TIMEOUT
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
 # Maintenance boundary (read image bytes / trigger rebuilds) — monkeypatched
 # ---------------------------------------------------------------------------
 def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
-    """GET the raw original bytes of an image by sha256 from catalog (#17).
+    """Read the raw original bytes of an image by sha256 (ADR 0001).
 
-    Used by the ``reindex-one-image`` maintenance job, which re-runs the per-file
-    pipeline for a single already-cataloged image. The cross-service id is the
-    sha256, so the blob read is keyed by it. Returns ``(bytes, mime)``.
+    Used by the index/label workers and the ``reindex-one-image`` job to re-run
+    the pipeline for an already-cataloged image. Catalog stores only
+    ``thumbnail``/``embedding`` blobs (NOT originals), so the original bytes are
+    obtained by resolving the catalog record's stored ``filepath`` and reading
+    from the shared host filesystem that ingest already walks. Returns
+    ``(bytes, mime)``.
 
-    Reads the original bytes from the catalog's sha256-keyed RustFS object store
-    via ``GET /blobs/{sha256}/{CATALOG_ORIGINAL_BLOB_KIND}`` (no longer the TS
-    app). See ``CATALOG_ORIGINAL_BLOB_KIND`` for the blob-kind caveat.
+    Raises if the catalog has no filepath for the sha256 or the file is gone — the
+    task then fails and is retried / dead-lettered by the broker.
     """
-    url = f"{CATALOG_URL}/blobs/{sha256}/{CATALOG_ORIGINAL_BLOB_KIND}"
-    resp = httpx.get(url, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    mime = resp.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-    return resp.content, mime
+    filepath = fetch_image_filepath(sha256)
+    if not filepath:
+        raise FileNotFoundError(f"no catalog filepath for sha256={sha256}")
+    path = Path(filepath)
+    data = path.read_bytes()  # raises FileNotFoundError if the file moved/was deleted
+    mime = _mime_for_extension(path.suffix)
+    return data, mime
+
+
+def fetch_image_record(sha256: str) -> dict[str, Any] | None:
+    """GET the full catalog record (the source of truth) for ``sha256``, or None.
+
+    Used by the index task (to project from catalog truth — description/safety/
+    tags/filepath) and the label task (to read the existing tags to merge into).
+    Best-effort: any read failure degrades to None rather than failing the repair.
+    """
+    try:
+        resp = httpx.get(f"{CATALOG_URL}/images/{sha256}", timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else None
+    except (httpx.HTTPError, ValueError):
+        return None
 
 
 def fetch_image_filepath(sha256: str) -> str | None:
@@ -238,15 +258,10 @@ def fetch_image_filepath(sha256: str) -> str | None:
     The reindex paths re-run the pipeline from stored bytes and have no original
     path of their own, so they backfill it from the catalog (the source of
     truth) — otherwise the re-projected search payload would drop the filepath
-    that identifies the image. Best-effort: any read failure degrades to None
-    rather than failing the repair.
+    that identifies the image. Best-effort: any read failure degrades to None.
     """
-    try:
-        resp = httpx.get(f"{CATALOG_URL}/images/{sha256}", timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json().get("filepath")
-    except (httpx.HTTPError, ValueError):
-        return None
+    record = fetch_image_record(sha256)
+    return record.get("filepath") if record else None
 
 
 def rebuild_thumbnails() -> dict[str, Any]:
@@ -433,21 +448,70 @@ def list_unlabeled_sha256() -> list[str]:
 
 
 def reindex_image(sha256: str) -> None:
-    """Targeted per-image repair: re-run the full pipeline for one sha256.
+    """Index task: (re)build the search+graph projection for one sha256 from
+    catalog TRUTH (ADR 0001).
 
-    Used when only a few images drift (cheaper than a full collection rebuild).
-    Fetches the original bytes, runs the per-file pipeline, and fans the writes
-    back out — the same path :class:`reindex-one-image` takes — so both the
-    search point and graph edges for that image are re-projected.
+    Reads the catalog record (description/safety/tags/filepath — whatever the
+    label task has patched so far), fetches the bytes, runs the per-file pipeline
+    (NO labelling), and fans the writes back out so the search point + graph edges
+    reflect the current catalog truth. Idempotent: running it twice converges, so
+    it is safe to re-enqueue after a label patch or from reconcile.
     """
     data, mime = fetch_image_bytes(sha256)
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
-    # Backfill the source path from catalog so the re-projected search payload
-    # keeps the file identity (catalog's file_path is INSERT-only, so it already
-    # survives the upsert; the payload would otherwise be wiped to None).
-    source_path = fetch_image_filepath(sha256)
-    rec = process_file(data, filename, source_path=source_path)
+    # Project from catalog truth: the AI fields (description/safety/tags) the
+    # label task patched flow into the sparse text + payload + graph edges. The
+    # source path keeps the file identity on the re-projected payload.
+    record = fetch_image_record(sha256) or {}
+    rec = process_file(
+        data,
+        filename,
+        source_path=record.get("filepath"),
+        description=record.get("description"),
+        safety=record.get("safety"),
+        tags=record.get("tags"),
+    )
     fan_out_writes(rec)
+
+
+def label_image(sha256: str) -> bool:
+    """Label task: describe one image and PATCH the catalog truth (ADR 0001).
+
+    Reads the bytes + catalog record, calls the labelagent (grounded with the
+    extracted prompt), merges the AI tags into the catalog's tags, and writes the
+    full catalog record back (COALESCE-friendly upsert — a full record, so no
+    field is wiped). Returns True when the catalog was patched (the caller then
+    re-enqueues an ``index`` task to re-project), or False when labelling is
+    disabled / produced nothing (a clean no-op — no re-index needed).
+
+    A labelagent transport/HTTP error propagates (``describe_image`` is strict),
+    so the broker retries with backoff and eventually dead-letters to
+    ``label.dlq``.
+    """
+    data, mime = fetch_image_bytes(sha256)
+    filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
+    record = fetch_image_record(sha256) or {}
+    extract = extract_metadata(data, filename, mime)
+    describe = describe_image(data, filename, mime, prompt_hint=extract.get("prompt"))
+    if not describe:
+        return False  # labelagent disabled (or empty result) -> nothing to patch
+    # Merge the AI tags into the existing catalog tags (AI appended, de-duped,
+    # order-stable), falling back to the freshly extracted tags.
+    base_tags = record.get("tags") or extract.get("tags") or []
+    merged = list(dict.fromkeys([*base_tags, *(describe.get("tags") or [])]))
+    patched = build_catalog_record(
+        sha256=sha256,
+        phash=compute_phash(data),
+        width=compute_dims(data)[0],
+        height=compute_dims(data)[1],
+        extract=extract,
+        source_path=record.get("filepath"),
+        tags=merged,
+        description=describe.get("description"),
+        safety=describe.get("safety"),
+    )
+    _post_with_retry(f"{CATALOG_URL}/images", patched)
+    return True
 
 
 def _reconcile_ext_for_mime(mime: str) -> str:
@@ -510,6 +574,57 @@ class IngestRecord:
     thumbnail: bytes | None = None
 
 
+def build_catalog_record(
+    *,
+    sha256: str,
+    phash: str | None,
+    width: int | None,
+    height: int | None,
+    extract: dict[str, Any],
+    source_path: str | None = None,
+    tags: list[str] | None = None,
+    description: str | None = None,
+    safety: str | None = None,
+) -> dict[str, Any]:
+    """Build the catalog ImageUpsert record (the source-of-truth row).
+
+    Shared by the synchronous fast path (:func:`ingest_fast`, which has no dense/
+    sparse vectors) and the full projection pipeline (:func:`assemble_record`).
+    None for ``description``/``safety`` is safe: catalog COALESCEs them so a later
+    write never wipes an AI value that an earlier label task already stored.
+    """
+    return {
+        "sha256": sha256,
+        # Original on-disk path of the source file (folder-walk ingests). The
+        # cross-service id is the opaque sha256, so carrying the source path lets
+        # a human tell which file a record came from when inspecting the system.
+        # None for paths-unknown ingests (e.g. reindex from stored bytes, where
+        # the caller backfills it from the catalog record).
+        "filepath": source_path,
+        "phash": phash,
+        "width": width,
+        "height": height,
+        "sourceTool": (
+            None if extract.get("sourceTool") in (None, "unknown") else extract.get("sourceTool")
+        ),
+        "prompt": extract.get("prompt"),
+        "negative": extract.get("negative"),
+        "tags": tags if tags is not None else (extract.get("tags") or []),
+        "params": extract.get("params") or {},
+        "references": _references_list(extract.get("references")),
+        "workflow_json": extract.get("workflow_json"),
+        "api_prompt_json": extract.get("api_prompt_json"),
+        # AI content-safety class (deedlit.labelagent); None when the labelagent
+        # is disabled — catalog COALESCEs None so a reindex never wipes it.
+        "safety": safety,
+        # AI description (deedlit.labelagent). An expensive vision-LLM result, so
+        # it is persisted in the catalog (image_descriptions) — not just the
+        # search payload — to stay retrievable/viewable. None when the labelagent
+        # is disabled; catalog keeps the existing one so a reindex never wipes it.
+        "description": description,
+    }
+
+
 def assemble_record(
     *,
     sha256: str,
@@ -531,38 +646,18 @@ def assemble_record(
     # ``tags`` is the (already merged) extracted + AI-label tag list; falls back
     # to the extracted tags when the labelagent enrichment is disabled.
     tags = tags if tags is not None else (extract.get("tags") or [])
-    params = extract.get("params") or {}
 
-    record = {
-        "sha256": sha256,
-        # Original on-disk path of the source file (folder-walk ingests). The
-        # cross-service id is the opaque sha256, so carrying the source path lets
-        # a human tell which file a record came from when inspecting the system.
-        # None for paths-unknown ingests (e.g. reindex from stored bytes, where
-        # the caller backfills it from the catalog record).
-        "filepath": source_path,
-        "phash": phash,
-        "width": width,
-        "height": height,
-        "sourceTool": (
-            None if extract.get("sourceTool") in (None, "unknown") else extract.get("sourceTool")
-        ),
-        "prompt": extract.get("prompt"),
-        "negative": extract.get("negative"),
-        "tags": tags,
-        "params": params,
-        "references": references,
-        "workflow_json": extract.get("workflow_json"),
-        "api_prompt_json": extract.get("api_prompt_json"),
-        # AI content-safety class (deedlit.labelagent); None when the labelagent
-        # is disabled — catalog COALESCEs None so a reindex never wipes it.
-        "safety": safety,
-        # AI description (deedlit.labelagent). An expensive vision-LLM result, so
-        # it is persisted in the catalog (image_descriptions) — not just the
-        # search payload — to stay retrievable/viewable. None when the labelagent
-        # is disabled; catalog keeps the existing one so a reindex never wipes it.
-        "description": description,
-    }
+    record = build_catalog_record(
+        sha256=sha256,
+        phash=phash,
+        width=width,
+        height=height,
+        extract=extract,
+        source_path=source_path,
+        tags=tags,
+        description=description,
+        safety=safety,
+    )
 
     # search UpsertPoint: {sha256, dense, sparse?, payload?}. Search keys the
     # Qdrant point by uuid5(sha256) itself; we surface the derived id in the
@@ -625,22 +720,27 @@ def process_file(
     filename: str,
     source_path: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    *,
+    description: str | None = None,
+    safety: str | None = None,
+    tags: list[str] | None = None,
 ) -> IngestRecord:
-    """Run the full single-file pipeline over raw image bytes.
+    """Build the search+graph projection (record/point/edges) from raw bytes.
 
-    Computes sha256/phash/dims/thumbnail locally, then calls metadata + vision,
-    then assembles the record/point/edges. Does NOT persist — see
-    :func:`fan_out_writes`.
+    Computes sha256/phash/dims/thumbnail + metadata, embeds dense+sparse, then
+    assembles record/point/edges. Does NOT label (labelling is the async ``label``
+    task, #26 / ADR 0001) and does NOT persist (see :func:`fan_out_writes`).
 
-    ``source_path`` is the original on-disk path of the file (folder-walk
-    ingests pass it so the record/payload stay identifiable); it is independent
-    of ``filename``, which is only the upload label used for mime detection.
+    ``description``/``safety``/``tags`` carry the catalog TRUTH for the AI-derived
+    fields: the label task patches them onto the catalog, and the index task reads
+    them back and passes them in here so the projection (sparse text + payload +
+    graph edges) reflects them. When omitted (a first-pass before any label, or a
+    direct caller), the sparse text falls back to prompt + extracted tags only.
 
-    ``on_stage`` is an optional progress hook the ingest job uses for the live
-    "which service is active" dashboard: it is called with a stage label
-    (``hash`` / ``metadata`` / ``label`` / ``vision:dense`` / ``vision:sparse``)
-    as the pipeline ENTERS each step. Defaults to a no-op so direct callers and
-    tests are unaffected.
+    ``source_path`` is the original on-disk path (kept on the record/payload for
+    identification); ``filename`` is only the upload label used for mime
+    detection. ``on_stage`` reports the active stage (``hash`` / ``metadata`` /
+    ``vision:dense`` / ``vision:sparse``) for the live dashboard.
     """
     stage = on_stage if on_stage is not None else lambda _name: None
 
@@ -655,26 +755,19 @@ def process_file(
 
     stage("metadata")
     extract = extract_metadata(data, filename, mime)
-    # Optional AI label/description (deedlit.labelagent) — {} when disabled/failed.
-    # Grounded with the extracted SD prompt as a hint.
-    stage("label")
-    describe = describe_image(data, filename, mime, prompt_hint=extract.get("prompt"))
-    label = describe.get("label")
-    description = describe.get("description")
-    safety = describe.get("safety")
-    # Merge extracted tags with the AI label tags (AI tags appended, de-duped,
-    # order-stable). Flows to the catalog record, search payload, and graph edges.
-    tags = list(dict.fromkeys([*(extract.get("tags") or []), *(describe.get("tags") or [])]))
+    # Tags: prefer the explicit catalog-truth list (already merged with AI tags by
+    # the label task); fall back to the freshly extracted tags on a first pass.
+    final_tags = list(tags) if tags is not None else list(extract.get("tags") or [])
 
     log.debug("%s sha=%s tool=%s dims=%sx%s", filename, sha256[:12], extract.get("sourceTool"), width, height)
     stage("vision:dense")
     dense = embed_image(data, filename, mime)
     # Sparse vector is over the lexical text: SD prompt + AI description + tags
-    # (term weights for the hybrid sparse leg). The AI description lets images
-    # with thin/absent embedded metadata still index on the sparse side.
+    # (term weights for the hybrid sparse leg). The AI description (catalog truth)
+    # lets images with thin/absent embedded metadata still index on the sparse side.
     stage("vision:sparse")
     sparse_text = " ".join(
-        s.strip() for s in (extract.get("prompt"), description, " ".join(tags)) if s and s.strip()
+        s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
     )
     sparse = embed_sparse(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
     log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
@@ -690,11 +783,65 @@ def process_file(
         thumbnail=thumbnail,
         ext=ext,
         source_path=source_path,
-        tags=tags,
+        tags=final_tags,
         description=description,
-        label=label,
+        label=None,
         safety=safety,
     )
+
+
+# ---------------------------------------------------------------------------
+# Synchronous fast path (ADR 0001)
+# ---------------------------------------------------------------------------
+def ingest_fast(
+    data: bytes,
+    filename: str,
+    source_path: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
+) -> str:
+    """Run ONLY the synchronous fast path for one image and return its sha256.
+
+    Local pixel work (sha256/phash/dims/WebP-thumbnail) + metadata extract +
+    write the catalog record and thumbnail blob. No GPU, no LLM, no
+    search/graph projection — those are done asynchronously by the ``index``
+    task the caller publishes once this returns (ADR 0001). The image is in the
+    catalog (and renderable via its thumbnail) the moment this completes.
+
+    ``on_stage`` mirrors :func:`process_file`'s progress hook; it is called as the
+    pipeline enters each step (``hash`` / ``metadata`` / ``catalog``).
+    """
+    stage = on_stage if on_stage is not None else lambda _name: None
+
+    ext = os.path.splitext(filename)[1].lower()
+    mime = _mime_for_extension(ext)
+
+    stage("hash")
+    sha256 = compute_sha256(data)
+    phash = compute_phash(data)
+    width, height = compute_dims(data)
+    thumbnail = make_webp_thumbnail(data)
+
+    stage("metadata")
+    extract = extract_metadata(data, filename, mime)
+
+    # Catalog truth only — extracted tags, no AI fields (the label task fills
+    # description/safety/AI-tags later, and catalog COALESCEs the None values).
+    record = build_catalog_record(
+        sha256=sha256,
+        phash=phash,
+        width=width,
+        height=height,
+        extract=extract,
+        source_path=source_path,
+    )
+
+    stage("catalog")
+    _post_with_retry(f"{CATALOG_URL}/images", record)
+    if thumbnail is not None:
+        _put_blob_with_retry(
+            f"{CATALOG_URL}/blobs/{sha256}/thumbnail", thumbnail, "image/webp"
+        )
+    return sha256
 
 
 # ---------------------------------------------------------------------------

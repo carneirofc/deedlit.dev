@@ -159,3 +159,38 @@ class SourceFolder(SourceFolderUpsert):
     image_count: int = 0
     labeled_count: int = 0
     unlabeled_count: int = 0
+
+
+# Async task ledger (ADR 0001). Best-effort history of the per-image queue tasks;
+# RabbitMQ stays the source of truth for outstanding work.
+TaskType = Literal["index", "label"]
+TaskStatus = Literal["queued", "running", "done", "failed", "dlq"]
+
+
+class TaskUpsert(BaseModel):
+    """A lifecycle transition written by the ingest publisher/workers (POST
+    /tasks). Upserts the one row per ``(sha256, type)`` to its latest state.
+
+    ``attempts`` is optional: when omitted the existing count is kept (a publisher
+    recording ``queued`` doesn't reset the retry chain). ``error`` is written as
+    given, so passing null clears a prior error on success.
+    """
+
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    type: TaskType
+    status: TaskStatus
+    attempts: int | None = Field(default=None, ge=0)
+    error: str | None = None
+    parent_op_id: str | None = None
+
+
+class Task(BaseModel):
+    id: str
+    sha256: str
+    type: TaskType
+    status: TaskStatus
+    attempts: int = 0
+    error: str | None = None
+    parent_op_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

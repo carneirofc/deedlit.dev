@@ -19,6 +19,8 @@ from catalog.schemas import (
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
+    Task,
+    TaskUpsert,
 )
 
 SHA256 = Path(pattern=r"^[a-f0-9]{64}$")
@@ -249,3 +251,31 @@ def delete_folder(id: str = Path(...)) -> dict:
     if not repository.delete_folder(id):
         raise HTTPException(status_code=404, detail="folder not found")
     return {"status": "ok"}
+
+
+# --- tasks ledger (ADR 0001) -----------------------------------------------
+@router.post("/tasks", response_model=Task)
+def upsert_task(payload: TaskUpsert) -> Task:
+    """Record an async task lifecycle transition (best-effort, called by ingest)."""
+    return repository.upsert_task(payload)
+
+
+@router.get("/tasks", response_model=list[Task])
+def list_tasks(
+    sha256: str | None = Query(default=None),
+    type: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[Task]:
+    return repository.list_tasks(
+        sha256=sha256, type=type, status=status, limit=limit, offset=offset
+    )
+
+
+@router.get("/tasks/{id}", response_model=Task)
+def read_task(id: str = Path(...)) -> Task:
+    task = repository.get_task(id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task

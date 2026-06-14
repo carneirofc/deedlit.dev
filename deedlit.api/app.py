@@ -419,6 +419,44 @@ async def list_unlabeled(limit: int = 500, offset: int = 0) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# /tasks — async queue ledger (catalog proxy), for the queue visualization page
+#
+# The catalog `tasks` table is the queryable history of the async index/label
+# tasks (ADR 0001). The list degrades to [] when catalog is down (the dashboard
+# stays usable); a single-task lookup passes a 404 through and 502s when down.
+# ---------------------------------------------------------------------------
+@app.get("/tasks")
+async def list_tasks(
+    sha256: str | None = None,
+    type: str | None = None,
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> Any:
+    params = {
+        "limit": str(int(limit)),
+        "offset": str(int(offset)),
+    }
+    if sha256:
+        params["sha256"] = sha256
+    if type:
+        params["type"] = type
+    if status:
+        params["status"] = status
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    try:
+        res = await clients.catalog("GET", f"/tasks?{qs}")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
+
+
+@app.get("/tasks/{task_id}")
+async def read_task(task_id: str) -> Any:
+    return await _proxy_catalog("GET", f"/tasks/{task_id}")
+
+
+# ---------------------------------------------------------------------------
 # GET /blobs/{sha256}/{kind} — stream image bytes from catalog
 #
 # comfyhelper is UI-only and holds no object store, so it proxies thumbnail /

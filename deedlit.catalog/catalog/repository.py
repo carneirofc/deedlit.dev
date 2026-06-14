@@ -31,6 +31,8 @@ from catalog.schemas import (
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
+    Task,
+    TaskUpsert,
 )
 
 # ---------------------------------------------------------------------------
@@ -955,6 +957,115 @@ def delete_folder(folder_id: str) -> bool:
             text("DELETE FROM source_folders WHERE id = :id"), {"id": folder_id}
         )
         return res.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# tasks — the async queue ledger (ADR 0001).
+#
+# Best-effort history projection of the per-image index/label tasks. One row per
+# (sha256, type), UPSERTed to its latest lifecycle state; the broker remains the
+# source of truth for outstanding work.
+# ---------------------------------------------------------------------------
+_TASK_COLUMNS = (
+    "id, sha256, type, status, attempts, error, parent_op_id, created_at, updated_at"
+)
+
+
+def _task_from_row(row: Any) -> Task:
+    return Task(
+        id=str(row["id"]),
+        sha256=row["sha256"],
+        type=row["type"],
+        status=row["status"],
+        attempts=int(row["attempts"] or 0),
+        error=row["error"],
+        parent_op_id=row["parent_op_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def upsert_task(payload: TaskUpsert) -> Task:
+    """Record a lifecycle transition for ``(sha256, type)``, upserting one row.
+
+    ``attempts`` keeps the existing value when not supplied (publishers don't
+    reset the retry chain); ``error`` is written as given (null clears it on
+    success); ``parent_op_id`` is sticky (a later update without one keeps the
+    original producer).
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(
+            text(
+                f"""
+                INSERT INTO tasks (sha256, type, status, attempts, error, parent_op_id)
+                VALUES (:sha256, :type, :status, COALESCE(:attempts, 0), :error, :parent_op_id)
+                ON CONFLICT (sha256, type) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    attempts = COALESCE(:attempts, tasks.attempts),
+                    error = EXCLUDED.error,
+                    parent_op_id = COALESCE(EXCLUDED.parent_op_id, tasks.parent_op_id),
+                    updated_at = now()
+                RETURNING {_TASK_COLUMNS}
+                """
+            ),
+            {
+                "sha256": payload.sha256,
+                "type": payload.type,
+                "status": payload.status,
+                "attempts": payload.attempts,
+                "error": payload.error,
+                "parent_op_id": payload.parent_op_id,
+            },
+        ).mappings().first()
+        return _task_from_row(row)
+
+
+def list_tasks(
+    *,
+    sha256: str | None = None,
+    type: str | None = None,
+    status: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[Task]:
+    """List tasks (newest-updated first), filtered by sha256/type/status."""
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if sha256:
+        clauses.append("sha256 = :sha256")
+        params["sha256"] = sha256
+    if type:
+        clauses.append("type = :type")
+        params["type"] = type
+    if status:
+        clauses.append("status = :status")
+        params["status"] = status
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT {_TASK_COLUMNS} FROM tasks {where} "
+                "ORDER BY updated_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).mappings().all()
+        return [_task_from_row(r) for r in rows]
+
+
+def get_task(task_id: str) -> Task | None:
+    """Fetch a single task by row id, or None (also None on a malformed id)."""
+    eng = get_engine()
+    try:
+        with eng.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT {_TASK_COLUMNS} FROM tasks WHERE id = :id"),
+                {"id": task_id},
+            ).mappings().first()
+    except Exception:  # malformed UUID etc. -> treat as not found
+        return None
+    return _task_from_row(row) if row is not None else None
 
 
 def list_unlabeled_sha256(limit: int, offset: int) -> list[str]:

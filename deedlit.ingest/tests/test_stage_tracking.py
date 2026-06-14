@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 from activity import ActivityTracker
@@ -63,14 +64,15 @@ def test_activity_endpoint_excludes_probes_and_reports_last_real_op():
 # Pipeline stage emissions (which microservice is active, in order)
 # ---------------------------------------------------------------------------
 def test_process_file_emits_stages_in_order(monkeypatch):
+    # process_file no longer labels (labelling is the async label task, ADR 0001),
+    # so the staircase drops the "label" stage.
     monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "x", "tags": []})
-    monkeypatch.setattr(pipeline, "describe_image", lambda d, f, m, prompt_hint=None: {})
     monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1])
     monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [], "values": []})
 
     stages: list[str] = []
     pipeline.process_file(_png_bytes(), "img.png", None, stages.append)
-    assert stages == ["hash", "metadata", "label", "vision:dense", "vision:sparse"]
+    assert stages == ["hash", "metadata", "vision:dense", "vision:sparse"]
 
 
 def test_fan_out_writes_emits_stages_in_order(monkeypatch):
@@ -108,17 +110,22 @@ def test_job_stage_callback_records_current_and_counts():
 # ---------------------------------------------------------------------------
 # End-to-end: a real ingest sets timestamps + the full per-stage staircase
 # ---------------------------------------------------------------------------
-def test_ingest_run_sets_timestamps_and_full_stage_staircase(tmp_path, monkeypatch):
+def test_ingest_run_sets_timestamps_and_fast_path_staircase(tmp_path, monkeypatch):
     store = jobs_module.JobStore()
     monkeypatch.setattr(app_module, "store", store)
-    # Stub only the outbound clients; keep the REAL process_file + fan_out_writes
-    # so every stage (including catalog/search/graph) is exercised offline.
+    # Keep the REAL ingest_fast (fast path), stubbing only its outbound calls, so
+    # the per-file fast-path stages are exercised offline. Projection (dense/
+    # sparse/search/graph) now happens async in the index worker (ADR 0001), so
+    # it is NOT part of the folder-walk job's staircase.
     monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "p", "tags": ["t"]})
-    monkeypatch.setattr(pipeline, "describe_image", lambda d, f, m, prompt_hint=None: {})
-    monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
-    monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [1], "values": [0.5]})
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_put_blob_with_retry", lambda *a, **k: None)
+
+    async def noop_publish(sha256, parent_op_id=None):
+        return None
+
+    monkeypatch.setattr(broker_module, "publish_index_task", noop_publish)
+    monkeypatch.setattr(broker_module, "publish_label_task", noop_publish)
 
     (tmp_path / "a.png").write_bytes(_png_bytes((1, 2, 3)))
     (tmp_path / "b.png").write_bytes(_png_bytes((4, 5, 6)))
@@ -136,18 +143,13 @@ def test_ingest_run_sets_timestamps_and_full_stage_staircase(tmp_path, monkeypat
     assert final is not None and final["status"] == "completed"
     # Lifecycle timestamps populated (the UI shows created/started/finished).
     assert final["created_at"] and final["started_at"] and final["finished_at"]
-    # Every microservice stage was reached once per file (2 files).
+    # Fast-path stage reached once per file (2 files): hash/metadata/catalog +
+    # the index-task publish.
     sc = final["stage_counts"]
-    for stage in [
-        "hash",
-        "metadata",
-        "label",
-        "vision:dense",
-        "vision:sparse",
-        "catalog",
-        "search",
-        "graph",
-    ]:
+    for stage in ["hash", "metadata", "catalog", "publish"]:
         assert sc.get(stage) == 2, f"stage {stage}: {sc.get(stage)}"
-    # The final stage of the last file is the graph write.
-    assert final["current_stage"] == "graph"
+    # The heavy projection stages no longer run on the fast path.
+    for stage in ["vision:dense", "vision:sparse", "search", "graph"]:
+        assert stage not in sc, f"unexpected fast-path stage {stage}"
+    # The final stage of the last file is the index-task publish.
+    assert final["current_stage"] == "publish"

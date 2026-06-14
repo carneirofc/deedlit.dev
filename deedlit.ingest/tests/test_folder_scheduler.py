@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 from jobs import QUEUED, RUNNING, Job, JobStore
@@ -199,11 +200,15 @@ def test_scheduled_scan_records_completion(fresh_store, monkeypatch):
     assert records[-1]["touch_last_scan_at"] is True
 
 
-# (6) label-backfill pages the unlabeled set + reindexes each image.
-def test_label_backfill_reindexes_unlabeled(fresh_store, monkeypatch):
+# (6) label-backfill pages the unlabeled set + PUBLISHES a label task each (#28).
+def test_label_backfill_publishes_label_tasks(fresh_store, monkeypatch):
     monkeypatch.setattr(pipeline, "list_unlabeled_sha256", lambda: [SHA_A, SHA_B])
-    reindexed: list[str] = []
-    monkeypatch.setattr(pipeline, "reindex_image", lambda sha: reindexed.append(sha))
+    published: list[str] = []
+
+    async def fake_publish_label(sha256, parent_op_id=None):
+        published.append(sha256)
+
+    monkeypatch.setattr(broker_module, "publish_label_task", fake_publish_label)
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": "label-backfill"})
@@ -212,25 +217,25 @@ def test_label_backfill_reindexes_unlabeled(fresh_store, monkeypatch):
         final = _wait_for(client, job_id, {"completed", "failed"})
 
     assert final["status"] == "completed"
-    assert reindexed == [SHA_A, SHA_B]
+    assert published == [SHA_A, SHA_B]
     assert final["progress"]["total"] == 2
     assert final["progress"]["done"] == 2
 
 
-def test_label_backfill_counts_per_image_failures(fresh_store, monkeypatch):
+def test_label_backfill_counts_publish_failures(fresh_store, monkeypatch):
     monkeypatch.setattr(pipeline, "list_unlabeled_sha256", lambda: [SHA_A, SHA_B])
 
-    def flaky(sha):
-        if sha == SHA_A:
-            raise RuntimeError("labelagent down")
+    async def flaky(sha256, parent_op_id=None):
+        if sha256 == SHA_A:
+            raise RuntimeError("broker down")
 
-    monkeypatch.setattr(pipeline, "reindex_image", flaky)
+    monkeypatch.setattr(broker_module, "publish_label_task", flaky)
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/jobs", json={"type": "label-backfill"}).json()["id"]
         final = _wait_for(client, job_id, {"completed", "failed"})
 
-    # One image failing doesn't abort the sweep.
+    # One publish failing doesn't abort the sweep (best-effort).
     assert final["status"] == "completed"
     assert final["progress"]["failed"] == 1
     assert final["progress"]["done"] == 1

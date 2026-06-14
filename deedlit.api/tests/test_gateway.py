@@ -398,6 +398,32 @@ def test_jobs_get_degrades_to_empty_when_ingest_down(rec, client):
 
 
 # ---------------------------------------------------------------------------
+# (5b) GET /tasks — async queue ledger proxy to catalog (#27)
+# ---------------------------------------------------------------------------
+def test_tasks_get_proxies_list_to_catalog(rec, client):
+    rec.on("GET", "/tasks", lambda r: [{"id": "t1", "sha256": SHA, "type": "index", "status": "dlq"}])
+    r = client.get("/tasks", params={"status": "dlq"})
+    assert r.status_code == 200
+    assert r.json()[0]["id"] == "t1"
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_tasks_get_degrades_to_empty_when_catalog_down(rec, client):
+    rec.on("GET", "/tasks", lambda r: httpx.Response(503))
+    r = client.get("/tasks")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_task_by_id_proxies_and_passes_404(rec, client):
+    rec.on("GET", "/tasks/t1", lambda r: {"id": "t1", "sha256": SHA, "type": "label", "status": "done"})
+    assert client.get("/tasks/t1").json()["status"] == "done"
+
+    rec.on("GET", "/tasks/missing", lambda r: httpx.Response(404, json={"detail": "task not found"}))
+    assert client.get("/tasks/missing").status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # (6b) GET /fs/browse proxies the folder picker listing to ingest
 # ---------------------------------------------------------------------------
 def test_fs_browse_proxies_to_ingest_with_path(rec, client):

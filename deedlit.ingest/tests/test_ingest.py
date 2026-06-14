@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 
@@ -52,7 +53,10 @@ def mock_outbound(monkeypatch):
     Returns a dict recording the fan-out calls in order so tests can assert
     catalog-first ordering and retry behavior.
     """
-    calls: dict = {"fanout": [], "extract": 0, "image": 0, "sparse": 0}
+    calls: dict = {
+        "fanout": [], "extract": 0, "image": 0, "sparse": 0,
+        "fast": [], "published": [], "published_label": [],
+    }
 
     def fake_extract(data, filename, mime):
         calls["extract"] += 1
@@ -85,11 +89,28 @@ def mock_outbound(monkeypatch):
     def fake_fanout(rec, *args):
         calls["fanout"].append(rec)
 
+    # Fast path (folder-walk ingest): catalog write + index-task publish, with the
+    # heavy projection deferred to the index worker (ADR 0001). Record both so the
+    # folder-walk tests can assert per-file fast-path + enqueue.
+    def fake_ingest_fast(data, filename, source_path=None, on_stage=None):
+        sha = pipeline.compute_sha256(data)
+        calls["fast"].append({"sha256": sha, "filename": filename, "source_path": source_path})
+        return sha
+
+    async def fake_publish(sha256, parent_op_id=None):
+        calls["published"].append(sha256)
+
+    async def fake_publish_label(sha256, parent_op_id=None):
+        calls["published_label"].append(sha256)
+
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", fake_image)
     monkeypatch.setattr(pipeline, "embed_sparse", fake_sparse)
     monkeypatch.setattr(pipeline, "describe_image", fake_describe)
     monkeypatch.setattr(pipeline, "fan_out_writes", fake_fanout)
+    monkeypatch.setattr(pipeline, "ingest_fast", fake_ingest_fast)
+    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish)
+    monkeypatch.setattr(broker_module, "publish_label_task", fake_publish_label)
     return calls
 
 
@@ -124,14 +145,20 @@ def test_ingest_returns_job_and_processes_files(tmp_path, fresh_store, mock_outb
         assert final["progress"]["done"] == 3
         assert final["progress"]["skipped"] == 0
         assert final["progress"]["failed"] == 0
-    assert len(mock_outbound["fanout"]) == 3
-    # The worker passes each file's real on-disk path through the pipeline, so
-    # every fanned-out record (catalog) and point payload (search) is tagged
-    # with the source filepath for human identification.
-    for rec in mock_outbound["fanout"]:
-        assert rec.record["filepath"] is not None
-        assert str(tmp_path) in rec.record["filepath"]
-        assert rec.point["payload"]["filepath"] == rec.record["filepath"]
+    # Fast path: each file is cataloged synchronously and BOTH an index and a
+    # label task are published (projection + labelling happen async in the
+    # worker) — no inline fan-out.
+    assert len(mock_outbound["fast"]) == 3
+    assert len(mock_outbound["published"]) == 3
+    assert len(mock_outbound["published_label"]) == 3
+    assert mock_outbound["fanout"] == []
+    # Each file's real on-disk path is carried into the fast path (so the catalog
+    # record stays identifiable by its source file).
+    for entry in mock_outbound["fast"]:
+        assert entry["source_path"] is not None
+        assert str(tmp_path) in entry["source_path"]
+    # The published index tasks correspond to the cataloged images.
+    assert set(mock_outbound["published"]) == {e["sha256"] for e in mock_outbound["fast"]}
 
 
 # ---------------------------------------------------------------------------
@@ -150,8 +177,10 @@ def test_dedup_skips_unchanged_on_rerun(tmp_path, fresh_store, mock_outbound):
         assert f2["progress"]["total"] == 2
         assert f2["progress"]["done"] == 0
         assert f2["progress"]["skipped"] == 2
-    # Only the first run fanned out (2 files); the re-run skipped both.
-    assert len(mock_outbound["fanout"]) == 2
+    # Only the first run ran the fast path + published (2 files); the re-run
+    # skipped both (process-local sha256 dedup).
+    assert len(mock_outbound["fast"]) == 2
+    assert len(mock_outbound["published"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -198,18 +227,19 @@ def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
 
     processed = {"n": 0}
 
-    # Slow, side-effecting pipeline so cancel can land mid-run. `*args` absorbs
-    # the source_path + on_stage progress hook the real signature now carries.
-    def slow_process(data, filename, *args):
+    # Slow fast path so cancel can land mid-run. `source_path`/`on_stage` mirror
+    # the real ingest_fast signature the worker calls.
+    def slow_fast(data, filename, source_path=None, on_stage=None):
         processed["n"] += 1
         time.sleep(0.05)
-        return pipeline.IngestRecord(
-            sha256=pipeline.compute_sha256(data),
-            record={}, point={}, edges={}, thumbnail=None,
-        )
+        return pipeline.compute_sha256(data)
 
-    monkeypatch.setattr(pipeline, "process_file", slow_process)
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: None)
+    async def noop_publish(sha256, parent_op_id=None):
+        return None
+
+    monkeypatch.setattr(pipeline, "ingest_fast", slow_fast)
+    monkeypatch.setattr(broker_module, "publish_index_task", noop_publish)
+    monkeypatch.setattr(broker_module, "publish_label_task", noop_publish)
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
@@ -279,39 +309,29 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
 
 
 # ---------------------------------------------------------------------------
-# (4b) labelagent enrichment folds into tags, sparse text, and the payload
+# (4b) process_file folds catalog TRUTH (description/safety/tags) into the
+# sparse text, the point payload, the record, and the graph edges (ADR 0001).
+# The index task supplies these from the catalog after a label task patches it.
 # ---------------------------------------------------------------------------
-def test_pipeline_folds_labelagent_into_tags_sparse_and_payload(mock_outbound, monkeypatch):
-    """With the labelagent enabled, its description drives the sparse (lexical)
-    text and the point payload, and its tags merge with the extracted tags."""
+def test_process_file_folds_catalog_truth_into_tags_sparse_and_payload(mock_outbound):
+    rec = pipeline.process_file(
+        _png_bytes((10, 20, 30), size=16),
+        "img.png",
+        description="A red-armored knight standing in a misty forest.",
+        safety="sfw",
+        tags=["red", "knight", "armor", "forest"],
+    )
 
-    def fake_describe(data, filename, mime, prompt_hint=None):
-        # The extracted SD prompt is forwarded as the grounding hint.
-        assert prompt_hint == "a red knight"
-        return {
-            "label": "fantasy character portrait",
-            "description": "A red-armored knight standing in a misty forest.",
-            "tags": ["knight", "armor", "forest"],
-            "safety": "sfw",
-        }
-
-    monkeypatch.setattr(pipeline, "describe_image", fake_describe)
-
-    rec = pipeline.process_file(_png_bytes((10, 20, 30), size=16), "img.png")
-
-    # AI tags merged after the extracted tags, de-duped, order-stable, everywhere.
+    # Passed-in (catalog-truth) tags flow everywhere, replacing the extracted set.
     merged = ["red", "knight", "armor", "forest"]
     assert rec.point["payload"]["tags"] == merged
     assert rec.record["tags"] == merged
     assert rec.edges["tags"] == merged
-    # Label + description surfaced in the searchable payload.
-    assert rec.point["payload"]["label"] == "fantasy character portrait"
+    # Description surfaced in the searchable payload AND persisted on the record.
     assert (
         rec.point["payload"]["description"]
         == "A red-armored knight standing in a misty forest."
     )
-    # The (expensive) AI description is ALSO persisted on the catalog record so it
-    # is retrievable/viewable without re-running the model — not only in search.
     assert (
         rec.record["description"]
         == "A red-armored knight standing in a misty forest."
@@ -319,7 +339,7 @@ def test_pipeline_folds_labelagent_into_tags_sparse_and_payload(mock_outbound, m
     # Safety class lands on the catalog record AND the search payload (filterable).
     assert rec.record["safety"] == "sfw"
     assert rec.point["payload"]["safety"] == "sfw"
-    # The AI description (and the SD prompt) drive the sparse embedding text.
+    # The description (and the extracted SD prompt) drive the sparse embedding text.
     assert "misty forest" in mock_outbound["sparse_text"]
     assert "a red knight" in mock_outbound["sparse_text"]
 
