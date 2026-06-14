@@ -16,6 +16,16 @@ x-app-healthcheck: &app-healthcheck
   retries: 20
   start_period: 10s
 
+# OpenTelemetry export target for the Python services (zero-code tracing via the
+# opentelemetry-instrument entrypoint in each Dockerfile). Spans go to the Alloy
+# OTLP/http receiver, which forwards to Tempo. Alloy is profile-gated, so when it
+# isn't running the exporter just drops spans (no startup dependency). Each
+# service adds its own OTEL_SERVICE_NAME so Tempo separates them. Merge with
+# `<<: *otel-env` into a service's environment.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
 services:
   # --- Datastores --------------------------------------------------------
   postgres:
@@ -93,6 +103,8 @@ services:
     restart: unless-stopped
     ports: ["8001:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-catalog
       DATABASE_URL: postgresql://imageapp:imageapp@postgres:5432/imageapp
       OBJECT_STORE_ENDPOINT: http://rustfs:9000
       OBJECT_STORE_ACCESS_KEY: rustfsadmin
@@ -108,6 +120,8 @@ services:
     restart: unless-stopped
     ports: ["8002:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-search
       QDRANT_URL: http://qdrant:6333
     depends_on:
       qdrant: { condition: service_healthy }
@@ -118,6 +132,8 @@ services:
     restart: unless-stopped
     ports: ["8003:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-graph
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: password
@@ -130,6 +146,28 @@ services:
     build: { context: ./deedlit.metadata }
     restart: unless-stopped
     ports: ["8005:8000"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-metadata
+    healthcheck: *app-healthcheck
+
+  # Agno AgentOS image-labeling agent. Talks to a llama-server (vision GGUF) on
+  # the HOST — reached via host.docker.internal, not a compose service. Readiness
+  # depends on that external server, so nothing hard-depends on it (the ingest
+  # hook degrades gracefully when it's unreachable).
+  labelagent:
+    build: { context: ./deedlit.labelagent }
+    restart: unless-stopped
+    ports: ["8006:8000"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-labelagent
+      LABELAGENT_LLM_BASE_URL: ${LABELAGENT_LLM_BASE_URL:-http://host.docker.internal:8888/v1}
+      LABELAGENT_MODEL_ID: ${LABELAGENT_MODEL_ID:-local-vlm}
+      LABELAGENT_MAX_TOKENS: ${LABELAGENT_MAX_TOKENS:-1024}
+      LABELAGENT_THINKING_BUDGET: ${LABELAGENT_THINKING_BUDGET:-256}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck: *app-healthcheck
 
   ingest:
@@ -137,11 +175,19 @@ services:
     restart: unless-stopped
     ports: ["8004:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest
       METADATA_URL: http://metadata:8000
       VISION_URL: http://vision:8000
       CATALOG_URL: http://catalog:8000
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
+      # Optional AI labeling enrichment (best-effort; unset => disabled).
+      LABELAGENT_URL: http://labelagent:8000
+      # Browser-reachable base URL of the comfyhelper UI. Embedded into each
+      # search point's payload as image_url/thumbnail_url (the image proxy
+      # endpoints), so override it to the real public URL in deployment.
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
     depends_on:
       metadata: { condition: service_healthy }
     healthcheck: *app-healthcheck
@@ -150,8 +196,10 @@ services:
   api:
     build: { context: ./deedlit.api }
     restart: unless-stopped
-    ports: ["8080:8000"]
+    ports: ["8088:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-api
       CATALOG_URL: http://catalog:8000
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
@@ -170,6 +218,8 @@ services:
     restart: unless-stopped
     ports: ["8000:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-vision
       COMFYUI_ROOT: /comfyui
       CLIP_DEVICE: cuda
       CLIP_MODEL_PRESET: vit_h
