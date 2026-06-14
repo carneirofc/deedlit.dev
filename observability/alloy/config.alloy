@@ -72,7 +72,10 @@ loki.write "default" {
 // TRACES
 // ---------------------------------------------------------------------------
 
-// OTLP entry point for the Next.js app (gRPC 4317, HTTP 4318).
+// OTLP entry point for all instrumented services — the Next.js comfyhelper app
+// AND the Python services (catalog/search/graph/ingest/vision/metadata/labelagent
+// /api), which export over OTLP/http per their OTEL_* env in docker-compose
+// (gRPC 4317, HTTP 4318).
 otelcol.receiver.otlp "default" {
   grpc {
     endpoint = "0.0.0.0:4317"
