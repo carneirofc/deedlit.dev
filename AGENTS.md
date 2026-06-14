@@ -45,8 +45,9 @@ Don't go hunting for these every session — they are version-managed, not on th
 
 ## Command Reference
 - Build shared UI: `npm run build:ui`
-- Run landing app: `npm run dev:dev`
-- Run comfyhelper: `npm run dev:comfyhelper`
+- Run everything (orchestrated): `npm run dev` — starts all services via `mprocs` (see `mprocs.yaml`); one pane per service, `r` restarts one, `q` tears everything down with clean process-tree kill (no orphaned ports on Windows). Start datastores first with `npm run infra:up`.
+- Run landing app only: `npm run dev:dev`
+- Run comfyhelper only: `npm run dev:comfyhelper`
 - Build all workspaces: `npm run build`
 
 ## Commit Convention

@@ -8,6 +8,7 @@
     "deedlit.dev.comfyhelper"
   ],
   "scripts": {
+    "dev": "mprocs",
     "build:ui": "npm run build -w @deedlit.dev/ui",
     "build:dev": "npm run build:ui && npm run build -w deedlit.dev",
     "build:comfyhelper": "npm run build:ui && npm run build -w deedlit.dev.comfyhelper",

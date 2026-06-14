@@ -1,0 +1,33 @@
+# Local dev orchestrator. `mprocs` wraps each child in a Win32 Job Object,
+# so quitting (q) or restarting (r) a process kills its ENTIRE tree — the
+# uvicorn --reload worker grandchild dies with it instead of orphaning and
+# holding its port. One pane per service; arrows to switch, r to restart one,
+# q to tear everything down cleanly.
+#
+#   npm run dev            # start everything (datastores must already be up)
+#   npm run infra:up       # start postgres/neo4j/qdrant/rustfs first
+#
+# Datastores are intentionally NOT managed here — Docker owns their lifecycle.
+
+procs:
+  ui:
+    shell: "npm run dev:dev"        # Next landing app  -> :3001
+  comfyhelper:
+    shell: "npm run dev:comfyhelper" # Next comfyhelper -> :3000
+  api:
+    shell: "npm run dev:api"        # BFF gateway       -> :8080
+  catalog:
+    shell: "npm run dev:catalog"    # -> :8001
+  search:
+    shell: "npm run dev:search"     # -> :8002
+  graph:
+    shell: "npm run dev:graph"      # -> :8003
+  ingest:
+    shell: "npm run dev:ingest"     # -> :8004
+  metadata:
+    shell: "npm run dev:metadata"   # -> :8005
+
+  # GPU vision service — off by default; press `s` in its pane to start.
+  vision:
+    shell: "npm run dev:vision"     # -> :8000
+    autostart: false
