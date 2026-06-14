@@ -1,6 +1,5 @@
 # Tempo single-binary config for local debugging.
-# Receives OTLP directly from the FastAPI services (no collector in front),
-# stores trace blocks on the local filesystem.
+# Receives OTLP from Alloy, stores trace blocks on the local filesystem.
 stream_over_http_enabled: true
 
 server:

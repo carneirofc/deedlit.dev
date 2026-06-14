@@ -16,16 +16,6 @@ x-app-healthcheck: &app-healthcheck
   retries: 20
   start_period: 10s
 
-# OTLP export shared by every instrumented FastAPI service. Traces go straight to
-# Tempo over OTLP/http; metrics + logs exporters are disabled (Tempo is traces-only).
-# Each service merges this and adds its own OTEL_SERVICE_NAME.
-x-otel-env: &otel-env
-  OTEL_TRACES_EXPORTER: otlp
-  OTEL_METRICS_EXPORTER: none
-  OTEL_LOGS_EXPORTER: none
-  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-
 services:
   # --- Datastores --------------------------------------------------------
   postgres:
@@ -97,86 +87,12 @@ services:
       timeout: 5s
       retries: 20
 
-  # --- Observability -----------------------------------------------------
-  # Tempo: distributed trace storage. Receives OTLP directly from the FastAPI
-  # services on 4317/4318; explore traces in Grafana. Services ship traces only
-  # when OTEL_EXPORTER_OTLP_ENDPOINT is set (point it at http://tempo:4318).
-  tempo:
-    image: grafana/tempo:2.6.1
-    restart: unless-stopped
-    command: -config.file=/etc/tempo/tempo-config.yaml
-    ports:
-      - "3200:3200" # Tempo API (queried by Grafana)
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
-    volumes:
-      - ./observability/tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
-      - tempo_data:/var/tempo
-
-  # Loki: log aggregation. Stores logs on the local filesystem; Alloy ships
-  # container logs in, and Grafana queries them alongside Tempo traces.
-  loki:
-    image: grafana/loki:3.3.2
-    restart: unless-stopped
-    command: -config.file=/etc/loki/loki-config.yaml
-    ports:
-      - "3100:3100" # Loki API (push from Alloy + query from Grafana)
-    volumes:
-      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
-      - loki_data:/loki
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-
-  # Alloy: collects Docker container logs and forwards them to Loki. Reads the
-  # Docker socket for both discovery and log tailing (portable across Docker
-  # Desktop / Linux). Captures every container's stdout — no per-service config.
-  alloy:
-    image: grafana/alloy:v1.5.1
-    restart: unless-stopped
-    command:
-      - run
-      - --server.http.listen-addr=0.0.0.0:12345
-      - --storage.path=/var/lib/alloy/data
-      - /etc/alloy/config.alloy
-    ports:
-      - "12345:12345" # Alloy UI (component graph / debugging)
-    volumes:
-      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - alloy_data:/var/lib/alloy/data
-    depends_on:
-      - loki
-
-  # Grafana: UI for Tempo (traces) + Loki (logs); datasources pre-provisioned,
-  # anonymous admin, no login.
-  grafana:
-    image: grafana/grafana:11.4.0
-    restart: unless-stopped
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
-    ports:
-      - "3001:3000" # 3000 is taken by the UI, so map Grafana to 3001
-    volumes:
-      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana_data:/var/lib/grafana
-    depends_on:
-      - tempo
-      - loki
-
   # --- Owning services ---------------------------------------------------
   catalog:
     build: { context: ./deedlit.catalog }
     restart: unless-stopped
     ports: ["8001:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.catalog
       DATABASE_URL: postgresql://imageapp:imageapp@postgres:5432/imageapp
       OBJECT_STORE_ENDPOINT: http://rustfs:9000
       OBJECT_STORE_ACCESS_KEY: rustfsadmin
@@ -192,8 +108,6 @@ services:
     restart: unless-stopped
     ports: ["8002:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.search
       QDRANT_URL: http://qdrant:6333
     depends_on:
       qdrant: { condition: service_healthy }
@@ -204,8 +118,6 @@ services:
     restart: unless-stopped
     ports: ["8003:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.graph
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: password
@@ -218,9 +130,6 @@ services:
     build: { context: ./deedlit.metadata }
     restart: unless-stopped
     ports: ["8005:8000"]
-    environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.metadata
     healthcheck: *app-healthcheck
 
   ingest:
@@ -228,8 +137,6 @@ services:
     restart: unless-stopped
     ports: ["8004:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.ingest
       METADATA_URL: http://metadata:8000
       VISION_URL: http://vision:8000
       CATALOG_URL: http://catalog:8000
@@ -245,8 +152,6 @@ services:
     restart: unless-stopped
     ports: ["8080:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.api
       CATALOG_URL: http://catalog:8000
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
@@ -265,8 +170,6 @@ services:
     restart: unless-stopped
     ports: ["8000:8000"]
     environment:
-      <<: *otel-env
-      OTEL_SERVICE_NAME: deedlit.vision
       COMFYUI_ROOT: /comfyui
       CLIP_DEVICE: cuda
       CLIP_MODEL_PRESET: vit_h
@@ -287,6 +190,78 @@ services:
       retries: 20
       start_period: 60s
 
+  # --- Observability (profile-gated) -------------------------------------
+  # Relocated here from deedlit.dev.comfyhelper/docker-compose.yml (deleted in
+  # 4fbf4cc when comfyhelper became UI-only). Configs live in ./observability/.
+  #   docker compose --profile observability up -d
+  # Grafana http://localhost:3002 (3001 is the landing dev app's port).
+
+  # Loki: log aggregation (filesystem-backed, 7-day retention).
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+
+  # Tempo: distributed trace storage; OTLP receivers on 4317/4318.
+  tempo:
+    image: grafana/tempo:2.6.1
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command: -config.file=/etc/tempo/tempo-config.yaml
+    ports:
+      - "3200:3200" # Tempo API (queried by Grafana)
+    volumes:
+      - ./observability/tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
+      - tempo_data:/var/tempo
+
+  # Alloy: collector. Scrapes Docker logs -> Loki, receives OTLP -> Tempo.
+  # Needs the Docker socket to discover and tail container logs.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    ports:
+      - "12345:12345" # Alloy UI
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+      - tempo
+
+  # Grafana: UI for Loki + Tempo (datasources pre-provisioned, anonymous admin).
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    ports:
+      - "3002:3000" # 3000=comfyhelper app, 3001=landing dev app, so Grafana on 3002
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - loki
+      - tempo
+
 volumes:
   postgres_data:
   neo4j_data:
@@ -294,7 +269,7 @@ volumes:
   qdrant_data:
   rustfs_data:
   rustfs_logs:
-  tempo_data:
   loki_data:
+  tempo_data:
   alloy_data:
   grafana_data:

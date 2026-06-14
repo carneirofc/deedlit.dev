@@ -1,11 +1,10 @@
-# Loki single-binary config for local debugging — the logs counterpart to the
-# Tempo trace store. Container logs are shipped in by Grafana Alloy (see
-# observability/alloy/config.alloy) and explored in Grafana alongside traces.
+# Loki single-binary config for local debugging.
+# Filesystem storage, no auth, 7-day retention. Not for production scale.
 auth_enabled: false
 
 server:
   http_listen_port: 3100
-  grpc_listen_port: 9095
+  grpc_listen_port: 9096
   log_level: warn
 
 common:
@@ -31,10 +30,10 @@ schema_config:
         period: 24h
 
 limits_config:
-  # Allow OTLP structured metadata (trace_id etc.) and keep 7 days, matching the
-  # Tempo block_retention so traces and their logs age out together.
-  allow_structured_metadata: true
   retention_period: 168h
+  # Structured metadata lets us attach trace_id to log lines without making it a
+  # high-cardinality label — required for the Loki -> Tempo "derived field" jump.
+  allow_structured_metadata: true
   volume_enabled: true
 
 compactor:
@@ -42,5 +41,8 @@ compactor:
   retention_enabled: true
   delete_request_store: filesystem
 
-analytics:
-  reporting_enabled: false
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
