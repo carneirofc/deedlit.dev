@@ -193,7 +193,7 @@ export function AppSidebar() {
           <NavIconLink
             href="/admin"
             label="Backend Admin"
-            isActive={pathname.startsWith("/admin")}
+            isActive={pathname === "/admin"}
             testId="admin"
             onNavigate={() => setIsMobileNavExpanded(false)}
             icon={
@@ -207,6 +207,49 @@ export function AppSidebar() {
               >
                 <path d="M12 2 4 5v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V5l-8-3z" />
                 <path d="m9 12 2 2 4-4" />
+              </svg>
+            }
+          />
+
+          <NavIconLink
+            href="/admin/queues"
+            label="Queues"
+            isActive={pathname.startsWith("/admin/queues")}
+            testId="queues"
+            onNavigate={() => setIsMobileNavExpanded(false)}
+            icon={
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-5 w-5 fill-none stroke-current"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M4 7h16M4 12h16M4 17h10" />
+                <circle cx="19" cy="17" r="2" />
+              </svg>
+            }
+          />
+
+          <NavIconLink
+            href="/admin/db"
+            label="Database (power tools)"
+            isActive={pathname.startsWith("/admin/db")}
+            testId="db"
+            onNavigate={() => setIsMobileNavExpanded(false)}
+            icon={
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-5 w-5 fill-none stroke-current"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <ellipse cx="12" cy="5" rx="8" ry="3" />
+                <path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5" />
+                <path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" />
               </svg>
             }
           />

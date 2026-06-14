@@ -428,6 +428,81 @@ export async function listUnlabeled(signal?: AbortSignal): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Async task queues + ledger (ADR 0001) — backs the queue visualization page.
+// Live queue stats + DLQ ops come from the gateway's RabbitMQ management proxy;
+// per-image task history comes from the catalog tasks ledger (/tasks).
+// ---------------------------------------------------------------------------
+
+/** Live stats for one RabbitMQ queue (from the gateway mgmt proxy). */
+export interface QueueStat {
+  name: string;
+  reachable: boolean;
+  messages: number;
+  messages_ready: number;
+  messages_unacknowledged: number;
+  consumers: number;
+  publish_rate: number;
+  deliver_rate: number;
+}
+
+export async function listQueues(signal?: AbortSignal): Promise<QueueStat[]> {
+  const res = await request<{ queues?: QueueStat[] }>("/queues", { signal });
+  return Array.isArray(res?.queues) ? res.queues : [];
+}
+
+/** One peeked message (non-destructive) — payload + AMQP headers (incl. x-error). */
+export interface QueueMessage {
+  payload: string | null;
+  headers: Record<string, unknown>;
+}
+
+export async function peekQueueMessages(
+  name: string,
+  limit = 20,
+  signal?: AbortSignal,
+): Promise<QueueMessage[]> {
+  const res = await request<{ messages?: QueueMessage[] }>(
+    `/queues/${encodeURIComponent(name)}/messages`,
+    { query: { limit }, signal },
+  );
+  return Array.isArray(res?.messages) ? res.messages : [];
+}
+
+/** Purge all messages from a queue (destructive). */
+export async function purgeQueue(name: string, signal?: AbortSignal): Promise<void> {
+  await request(`/queues/${encodeURIComponent(name)}/purge`, { method: "POST", signal });
+}
+
+/** Requeue the DLQ of a base queue (index|label) back to the main queue. */
+export async function requeueDlq(base: string, signal?: AbortSignal): Promise<{ count: number }> {
+  return request<{ count: number }>(`/dlq/${encodeURIComponent(base)}/requeue`, {
+    method: "POST",
+    signal,
+  });
+}
+
+/** A row from the catalog tasks ledger (per-image async task history). */
+export interface Task {
+  id: string;
+  sha256: string;
+  type: "index" | "label";
+  status: "queued" | "running" | "done" | "failed" | "dlq";
+  attempts: number;
+  error: string | null;
+  parent_op_id: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export async function listTasks(
+  params: { sha256?: string; type?: string; status?: string; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<Task[]> {
+  const res = await request<unknown>("/tasks", { query: params, signal });
+  return Array.isArray(res) ? (res as Task[]) : [];
+}
+
+// ---------------------------------------------------------------------------
 // Notes — the catalog "note" record (Editor.js block document + positive /
 // negative prompt fields + ordered image refs by sha256), proxied through the
 // gateway /notes routes. `blocks` is the raw Editor.js OutputData document; the

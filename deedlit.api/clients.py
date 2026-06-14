@@ -35,6 +35,14 @@ INGEST_URL = os.getenv("INGEST_URL", "http://localhost:8004").rstrip("/")
 VISION_URL = os.getenv("VISION_URL", "http://localhost:8000").rstrip("/")
 METADATA_URL = os.getenv("METADATA_URL", "http://localhost:8005").rstrip("/")
 
+# RabbitMQ management HTTP API — backs the queue visualization page (#29). Creds
+# are held HERE (server-side) and never exposed to the browser; the gateway is
+# the only thing that talks to the management API.
+RABBITMQ_MGMT_URL = os.getenv("RABBITMQ_MGMT_URL", "http://localhost:15672").rstrip("/")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "deedlit")
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "deedlit")
+RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
+
 HTTP_TIMEOUT = float(os.getenv("API_HTTP_TIMEOUT", "15.0"))
 
 
@@ -147,6 +155,31 @@ async def ingest(method: str, path: str, **kw: Any) -> Any:
 
 async def vision(method: str, path: str, **kw: Any) -> Any:
     return await request("vision", method, VISION_URL, path, **kw)
+
+
+async def rabbitmq_mgmt(method: str, path: str, *, json: Any | None = None) -> Any:
+    """Call the RabbitMQ management HTTP API with the server-held credentials.
+
+    Backs the queue visualization page (#29). Raises :class:`DownstreamError` on
+    transport error / non-2xx so callers degrade (the dashboard stays usable when
+    the broker is down). Returns decoded JSON, or None for an empty body.
+    """
+    url = f"{RABBITMQ_MGMT_URL}{path}"
+    try:
+        async with make_async_client() as client:
+            resp = await client.request(
+                method, url, json=json, auth=(RABBITMQ_USER, RABBITMQ_PASSWORD)
+            )
+    except httpx.HTTPError as exc:
+        raise DownstreamError("rabbitmq", None, str(exc)) from exc
+    if resp.status_code >= 400:
+        raise DownstreamError("rabbitmq", resp.status_code, _safe_detail(resp))
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------

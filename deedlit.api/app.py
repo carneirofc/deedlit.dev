@@ -457,6 +457,138 @@ async def read_task(task_id: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# /queues — RabbitMQ management proxy for the queue visualization page (#29)
+#
+# The gateway holds the management creds; the browser never sees them. Live
+# depth/consumers/rates come from the management API; the per-image task HISTORY
+# comes from the catalog tasks ledger (GET /tasks above). Destructive actions
+# (purge, requeue) are confirmed in the UI and assume localhost binding.
+# ---------------------------------------------------------------------------
+# The async task queues + their retry/dlq companions (mirror deedlit.ingest).
+QUEUE_NAMES = ["index", "index.retry", "index.dlq", "label", "label.retry", "label.dlq"]
+TASK_QUEUE_BASES = ["index", "label"]
+
+
+def _vhost() -> str:
+    from urllib.parse import quote
+
+    return quote(clients.RABBITMQ_VHOST, safe="")
+
+
+def _idle_queue(name: str) -> dict[str, Any]:
+    return {
+        "name": name, "reachable": False, "messages": 0, "messages_ready": 0,
+        "messages_unacknowledged": 0, "consumers": 0, "publish_rate": 0.0, "deliver_rate": 0.0,
+    }
+
+
+@app.get("/queues")
+async def list_queues() -> dict[str, Any]:
+    """Live stats for the task queues (depth / ready / unacked / consumers /
+    rates), probed in parallel. A queue the broker can't report degrades to an
+    idle, unreachable row so the board still renders."""
+    vhost = _vhost()
+
+    async def one(name: str) -> dict[str, Any]:
+        try:
+            body = await clients.rabbitmq_mgmt("GET", f"/api/queues/{vhost}/{name}")
+        except DownstreamError:
+            return _idle_queue(name)
+        b = body if isinstance(body, dict) else {}
+        stats = b.get("message_stats") or {}
+        return {
+            "name": name,
+            "reachable": True,
+            "messages": int(b.get("messages", 0) or 0),
+            "messages_ready": int(b.get("messages_ready", 0) or 0),
+            "messages_unacknowledged": int(b.get("messages_unacknowledged", 0) or 0),
+            "consumers": int(b.get("consumers", 0) or 0),
+            "publish_rate": float((stats.get("publish_details") or {}).get("rate", 0.0) or 0.0),
+            "deliver_rate": float((stats.get("deliver_get_details") or {}).get("rate", 0.0) or 0.0),
+        }
+
+    rows = await asyncio.gather(*(one(n) for n in QUEUE_NAMES))
+    return {"queues": list(rows)}
+
+
+@app.get("/queues/{name}/messages")
+async def peek_queue(name: str, limit: int = 20) -> dict[str, Any]:
+    """Non-destructively peek messages in a queue (ack_requeue_true), for
+    inspecting the DLQ contents. Each item is {payload, headers}."""
+    if name not in QUEUE_NAMES:
+        raise HTTPException(status_code=404, detail="unknown queue")
+    body = {
+        "count": int(limit), "ackmode": "ack_requeue_true",
+        "encoding": "auto", "truncate": 50000,
+    }
+    try:
+        msgs = await clients.rabbitmq_mgmt(
+            "POST", f"/api/queues/{_vhost()}/{name}/get", json=body
+        )
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"rabbitmq unavailable: {exc.detail}")
+    out = [
+        {
+            "payload": m.get("payload"),
+            "headers": (m.get("properties") or {}).get("headers", {}),
+        }
+        for m in (msgs or [])
+        if isinstance(m, dict)
+    ]
+    return {"queue": name, "messages": out}
+
+
+@app.post("/queues/{name}/purge")
+async def purge_queue(name: str) -> dict[str, Any]:
+    """Purge all messages from a queue (destructive — UI confirms)."""
+    if name not in QUEUE_NAMES:
+        raise HTTPException(status_code=404, detail="unknown queue")
+    try:
+        await clients.rabbitmq_mgmt("DELETE", f"/api/queues/{_vhost()}/{name}/contents")
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"rabbitmq unavailable: {exc.detail}")
+    return {"status": "purged", "queue": name}
+
+
+@app.post("/dlq/{base}/requeue")
+async def requeue_dlq(base: str, limit: int = 100) -> dict[str, Any]:
+    """Drain up to ``limit`` messages from ``<base>.dlq`` and republish them to
+    the main ``<base>`` queue (the in-app "retry failed" action). Messages are
+    removed from the DLQ (ack_requeue_false) then published to the default
+    exchange with routing key == base; the attempt header is dropped so they get
+    a fresh retry budget."""
+    if base not in TASK_QUEUE_BASES:
+        raise HTTPException(status_code=404, detail="unknown queue")
+    vhost = _vhost()
+    dlq = f"{base}.dlq"
+    get_body = {
+        "count": int(limit), "ackmode": "ack_requeue_false",
+        "encoding": "auto", "truncate": 1_000_000,
+    }
+    try:
+        msgs = await clients.rabbitmq_mgmt(
+            "POST", f"/api/queues/{vhost}/{dlq}/get", json=get_body
+        )
+        requeued = 0
+        for m in (msgs or []):
+            if not isinstance(m, dict):
+                continue
+            pub = {
+                "properties": {},  # drop headers (incl. x-attempt) -> fresh retries
+                "routing_key": base,
+                "payload": m.get("payload", ""),
+                "payload_encoding": m.get("payload_encoding", "string"),
+            }
+            await clients.rabbitmq_mgmt(
+                "POST", f"/api/exchanges/{vhost}/amq.default/publish", json=pub
+            )
+            requeued += 1
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"rabbitmq unavailable: {exc.detail}")
+    return {"status": "requeued", "queue": base, "count": requeued}
+
+
+# ---------------------------------------------------------------------------
 # GET /blobs/{sha256}/{kind} — stream image bytes from catalog
 #
 # comfyhelper is UI-only and holds no object store, so it proxies thumbnail /

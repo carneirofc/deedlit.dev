@@ -424,6 +424,90 @@ def test_task_by_id_proxies_and_passes_404(rec, client):
 
 
 # ---------------------------------------------------------------------------
+# (5c) /queues — RabbitMQ management proxy for the queue visualization (#29)
+#
+# httpx decodes the %2F vhost in .path to ///, so the recorder matches paths like
+# /api/queues///index (the wire request still sends %2F to RabbitMQ).
+# ---------------------------------------------------------------------------
+_QUEUE_NAMES = ["index", "index.retry", "index.dlq", "label", "label.retry", "label.dlq"]
+
+
+def test_queues_lists_task_queue_stats(rec, client):
+    for name in _QUEUE_NAMES:
+        rec.on(
+            "GET", f"/api/queues///{name}",
+            lambda r: {
+                "messages": 3, "messages_ready": 3, "messages_unacknowledged": 0,
+                "consumers": 1,
+                "message_stats": {
+                    "publish_details": {"rate": 1.5},
+                    "deliver_get_details": {"rate": 0.5},
+                },
+            },
+        )
+    body = client.get("/queues").json()
+    qs = body["queues"]
+    assert len(qs) == 6
+    idx = next(x for x in qs if x["name"] == "index")
+    assert idx["reachable"] is True
+    assert idx["messages"] == 3 and idx["consumers"] == 1
+    assert idx["publish_rate"] == 1.5 and idx["deliver_rate"] == 0.5
+
+
+def test_queues_degrades_unreachable_rows(rec, client):
+    rec.on("GET", "/api/queues///index", lambda r: {"messages": 5, "consumers": 2})
+    # The other queues have no mock -> 404 -> idle/unreachable rows.
+    qs = client.get("/queues").json()["queues"]
+    idx = next(x for x in qs if x["name"] == "index")
+    assert idx["reachable"] is True and idx["messages"] == 5
+    dlq = next(x for x in qs if x["name"] == "index.dlq")
+    assert dlq["reachable"] is False and dlq["messages"] == 0
+
+
+def test_peek_queue_messages(rec, client):
+    rec.on(
+        "POST", "/api/queues///index.dlq/get",
+        lambda r: [
+            {"payload": '{"sha256":"x"}', "properties": {"headers": {"x-attempt": 3, "x-error": "boom"}}}
+        ],
+    )
+    body = client.get("/queues/index.dlq/messages", params={"limit": 5}).json()
+    msg = body["messages"][0]
+    assert msg["payload"] == '{"sha256":"x"}'
+    assert msg["headers"]["x-error"] == "boom"
+
+
+def test_purge_queue_calls_mgmt_contents(rec, client):
+    rec.on("DELETE", "/api/queues///index.dlq/contents", lambda r: httpx.Response(204))
+    r = client.post("/queues/index.dlq/purge")
+    assert r.status_code == 200 and r.json()["status"] == "purged"
+    assert any(p == "/api/queues///index.dlq/contents" for (_b, _m, p) in rec.calls)
+
+
+def test_purge_unknown_queue_is_404(rec, client):
+    assert client.post("/queues/bogus/purge").status_code == 404
+
+
+def test_requeue_dlq_drains_and_republishes_to_main(rec, client):
+    msgs = [
+        {"payload": '{"sha256":"x"}', "payload_encoding": "string"},
+        {"payload": '{"sha256":"y"}', "payload_encoding": "string"},
+    ]
+    rec.on("POST", "/api/queues///label.dlq/get", lambda r: msgs)
+    rec.on("POST", "/api/exchanges///amq.default/publish", lambda r: {"routed": True})
+
+    r = client.post("/dlq/label/requeue")
+    assert r.status_code == 200
+    assert r.json() == {"status": "requeued", "queue": "label", "count": 2}
+    publishes = [p for (_b, _m, p) in rec.calls if p == "/api/exchanges///amq.default/publish"]
+    assert len(publishes) == 2
+
+
+def test_requeue_unknown_base_is_404(rec, client):
+    assert client.post("/dlq/bogus/requeue").status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # (6b) GET /fs/browse proxies the folder picker listing to ingest
 # ---------------------------------------------------------------------------
 def test_fs_browse_proxies_to_ingest_with_path(rec, client):
