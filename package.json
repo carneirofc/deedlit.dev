@@ -24,7 +24,6 @@
     "dev:api": "uv run --directory deedlit.api opentelemetry-instrument --service_name deedlit.api --traces_exporter otlp --metrics_exporter none --logs_exporter none --exporter_otlp_endpoint http://localhost:4318 --exporter_otlp_protocol http/protobuf uvicorn app:app --host 127.0.0.1 --port 8080 --reload",
     "dev:migrate": "uv run --directory deedlit.catalog python -m catalog.migrations",
     "predev": "npm run infra:up && npm run dev:migrate",
-    "dev": "concurrently -k -p \"[{name}]\" -n vision,catalog,search,graph,ingest,metadata,api,dev,comfyhelper -c blue,green,magenta,yellow,cyan,red,white,gray,gray \"npm:dev:vision\" \"npm:dev:catalog\" \"npm:dev:search\" \"npm:dev:graph\" \"npm:dev:ingest\" \"npm:dev:metadata\" \"npm:dev:api\" \"npm:dev:dev\" \"npm:dev:comfyhelper\"",
     "predev:services": "npm run infra:up && npm run dev:migrate",
     "dev:services": "concurrently -k -p \"[{name}]\" -n vision,catalog,search,graph,ingest,metadata,api -c blue,green,magenta,yellow,cyan,red,white \"npm:dev:vision\" \"npm:dev:catalog\" \"npm:dev:search\" \"npm:dev:graph\" \"npm:dev:ingest\" \"npm:dev:metadata\" \"npm:dev:api\"",
     "dev:web": "concurrently -k -p \"[{name}]\" -n dev,comfyhelper -c gray,cyan \"npm:dev:dev\" \"npm:dev:comfyhelper\"",
