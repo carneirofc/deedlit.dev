@@ -508,6 +508,45 @@ def test_requeue_unknown_base_is_404(rec, client):
 
 
 # ---------------------------------------------------------------------------
+# (5d) /images admin — DB power-user page (#30)
+# ---------------------------------------------------------------------------
+def test_images_list_proxies_to_catalog(rec, client):
+    rec.on("GET", "/images", lambda r: [{"sha256": SHA, "prompt": "p"}])
+    r = client.get("/images", params={"tag": "x", "limit": 10})
+    assert r.status_code == 200
+    assert r.json()[0]["sha256"] == SHA
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_images_list_degrades_to_empty_when_catalog_down(rec, client):
+    rec.on("GET", "/images", lambda r: httpx.Response(500))
+    assert client.get("/images").json() == []
+
+
+def test_patch_image_proxies_and_passes_404(rec, client):
+    rec.on("PATCH", f"/images/{SHA}", lambda r: {"sha256": SHA, "safety": "nsfw"})
+    r = client.patch(f"/images/{SHA}", json={"safety": "nsfw"})
+    assert r.status_code == 200 and r.json()["safety"] == "nsfw"
+
+    rec.on("PATCH", f"/images/{'c' * 64}", lambda r: httpx.Response(404, json={"detail": "x"}))
+    assert client.patch(f"/images/{'c' * 64}", json={"safety": "sfw"}).status_code == 404
+
+
+def test_reindex_dispatches_index_task_to_ingest(rec, client):
+    rec.on("POST", "/tasks/index", lambda r: {"status": "queued", "sha256": SHA, "type": "index"})
+    r = client.post(f"/images/{SHA}/reindex")
+    assert r.status_code == 202 and r.json()["type"] == "index"
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+def test_relabel_dispatches_label_task_to_ingest(rec, client):
+    rec.on("POST", "/tasks/label", lambda r: {"status": "queued", "sha256": SHA, "type": "label"})
+    r = client.post(f"/images/{SHA}/relabel")
+    assert r.status_code == 202 and r.json()["type"] == "label"
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+# ---------------------------------------------------------------------------
 # (6b) GET /fs/browse proxies the folder picker listing to ingest
 # ---------------------------------------------------------------------------
 def test_fs_browse_proxies_to_ingest_with_path(rec, client):

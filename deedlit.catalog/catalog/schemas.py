@@ -65,6 +65,9 @@ class ImagePatch(BaseModel):
     favorite: bool | None = None
     tags: list[str] | None = None
     safety: Safety | None = None
+    # Power-user / debug edits (#30): correct a bad extracted prompt in place.
+    prompt: str | None = None
+    negative: str | None = None
 
 
 class RatingBody(BaseModel):

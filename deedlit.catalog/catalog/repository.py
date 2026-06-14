@@ -248,6 +248,12 @@ def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
         if patch.safety is not None:
             sets.append("safety = :safety")
             params["safety"] = patch.safety
+        if patch.prompt is not None:
+            sets.append("prompt = :prompt")
+            params["prompt"] = patch.prompt
+        if patch.negative is not None:
+            sets.append("negative_prompt = :negative")
+            params["negative"] = patch.negative
         if sets:
             conn.execute(
                 text(

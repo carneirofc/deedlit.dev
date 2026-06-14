@@ -589,6 +589,64 @@ async def requeue_dlq(base: str, limit: int = 100) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# /images admin — DB power-user page (#30)
+#
+# Browse/filter the catalog truth (full records incl. raw params/workflow_json/
+# api_prompt_json), edit curated fields, and trigger per-image re-index/re-label.
+# DELETE /images/{sha256} (defined above) is the fan-out un-index. Projection
+# stores (search/graph) are never edited here — they're rebuilt from truth.
+# ---------------------------------------------------------------------------
+@app.get("/images")
+async def list_images(
+    tag: str | None = None,
+    favorite: bool | None = None,
+    safety: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Any:
+    from urllib.parse import urlencode
+
+    params: list[tuple[str, str]] = [("limit", str(int(limit))), ("offset", str(int(offset)))]
+    if tag:
+        params.append(("tag", tag))
+    if favorite is not None:
+        params.append(("favorite", "true" if favorite else "false"))
+    if safety:
+        params.append(("safety", safety))
+    try:
+        res = await clients.catalog("GET", f"/images?{urlencode(params)}")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
+
+
+@app.patch("/images/{sha256}")
+async def patch_image(sha256: str, payload: dict[str, Any]) -> Any:
+    """Edit curated fields of one image (tags/safety/rating/favorite/prompt)."""
+    return await _proxy_catalog("PATCH", f"/images/{sha256}", payload)
+
+
+@app.post("/images/{sha256}/reindex", status_code=202)
+async def reindex_image(sha256: str) -> JSONResponse:
+    """Re-project one image (publish an index task via ingest)."""
+    try:
+        res = await clients.ingest("POST", "/tasks/index", json={"sha256": sha256})
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"ingest unavailable: {exc.detail}")
+    return JSONResponse(status_code=202, content=res)
+
+
+@app.post("/images/{sha256}/relabel", status_code=202)
+async def relabel_image(sha256: str) -> JSONResponse:
+    """Re-label one image (publish a label task via ingest)."""
+    try:
+        res = await clients.ingest("POST", "/tasks/label", json={"sha256": sha256})
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"ingest unavailable: {exc.detail}")
+    return JSONResponse(status_code=202, content=res)
+
+
+# ---------------------------------------------------------------------------
 # GET /blobs/{sha256}/{kind} — stream image bytes from catalog
 #
 # comfyhelper is UI-only and holds no object store, so it proxies thumbnail /

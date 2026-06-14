@@ -43,6 +43,8 @@ from fs_browse import FsBrowseError, browse_directory
 from jobs import (
     REINDEX_ONE_IMAGE,
     JobStore,
+    _publish_index_best_effort,
+    _publish_label_best_effort,
     folder_scan_scheduler,
     folder_scan_tick_seconds,
     label_backfill_interval_seconds,
@@ -209,6 +211,38 @@ def start_reconcile(req: ReconcileRequest) -> JSONResponse:
     store.start_worker()
     job = store.create_reconcile_job(per_image_max=req.perImageMax)
     return JSONResponse(status_code=202, content=job.to_dict())
+
+
+class SingleTaskRequest(BaseModel):
+    """POST /tasks/{index,label} body — enqueue ONE async task for an image.
+
+    Backs the DB power page's per-image re-index / re-label actions (#30). The
+    sha256 must be 64 lowercase hex chars (the cross-service id).
+    """
+
+    sha256: str
+
+    @model_validator(mode="after")
+    def _check_sha(self) -> "SingleTaskRequest":
+        import re
+
+        if not re.fullmatch(r"[a-f0-9]{64}", self.sha256):
+            raise ValueError("sha256 must be 64 lowercase hex characters")
+        return self
+
+
+@app.post("/tasks/index", status_code=202)
+async def enqueue_index_task(req: SingleTaskRequest) -> dict:
+    """Publish a single index task for one image (re-project from catalog truth)."""
+    ok = await _publish_index_best_effort(req.sha256)
+    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "index"}
+
+
+@app.post("/tasks/label", status_code=202)
+async def enqueue_label_task(req: SingleTaskRequest) -> dict:
+    """Publish a single label task for one image (describe -> patch -> re-index)."""
+    ok = await _publish_label_best_effort(req.sha256)
+    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "label"}
 
 
 @app.get("/jobs/{job_id}")

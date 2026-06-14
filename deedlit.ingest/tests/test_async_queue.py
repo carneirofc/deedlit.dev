@@ -431,3 +431,39 @@ def test_publish_index_records_queued_on_ledger(stub_ledger, monkeypatch):
         c["type"] == "index" and c["status"] == "queued" and c["parent_op_id"] == "op7"
         for c in stub_ledger
     )
+
+
+# ---------------------------------------------------------------------------
+# (9) single-task endpoints (#30): POST /tasks/index, /tasks/label
+# ---------------------------------------------------------------------------
+def test_enqueue_index_endpoint_publishes(monkeypatch):
+    published: list[str] = []
+
+    async def fake(sha256, parent_op_id=None):
+        published.append(sha256)
+
+    monkeypatch.setattr(broker_module, "publish_index_task", fake)
+    with TestClient(app_module.app) as client:
+        r = client.post("/tasks/index", json={"sha256": "a" * 64})
+        assert r.status_code == 202
+        assert r.json()["type"] == "index"
+    assert published == ["a" * 64]
+
+
+def test_enqueue_label_endpoint_publishes(monkeypatch):
+    published: list[str] = []
+
+    async def fake(sha256, parent_op_id=None):
+        published.append(sha256)
+
+    monkeypatch.setattr(broker_module, "publish_label_task", fake)
+    with TestClient(app_module.app) as client:
+        r = client.post("/tasks/label", json={"sha256": "b" * 64})
+        assert r.status_code == 202
+        assert r.json()["type"] == "label"
+    assert published == ["b" * 64]
+
+
+def test_enqueue_task_rejects_bad_sha():
+    with TestClient(app_module.app) as client:
+        assert client.post("/tasks/index", json={"sha256": "nothex"}).status_code == 422

@@ -503,6 +503,67 @@ export async function listTasks(
 }
 
 // ---------------------------------------------------------------------------
+// Catalog admin (#30) — the DB power-user page works against the RAW catalog
+// records (full prompt/params/workflow_json/api_prompt_json), not the search
+// CompactResult shape. List/patch proxy the gateway /images routes; re-index /
+// re-label dispatch single tasks via ingest; delete-everywhere reuses
+// deleteImage (the fan-out un-index above).
+// ---------------------------------------------------------------------------
+
+/** Browse raw catalog records (gateway GET /images). */
+export async function listCatalogImages(
+  params: {
+    tag?: string;
+    favorite?: boolean;
+    safety?: string;
+    limit?: number;
+    offset?: number;
+  } = {},
+  signal?: AbortSignal,
+): Promise<CatalogImage[]> {
+  const res = await request<unknown>("/images", { query: params, signal });
+  return Array.isArray(res) ? (res as CatalogImage[]) : [];
+}
+
+/** Curated, editable catalog fields (gateway PATCH /images/{sha}). */
+export interface ImagePatchBody {
+  rating?: number | null;
+  favorite?: boolean;
+  tags?: string[];
+  safety?: "sfw" | "nsfw" | "explicit" | null;
+  prompt?: string | null;
+  negative?: string | null;
+}
+
+export async function patchImage(
+  sha256: string,
+  body: ImagePatchBody,
+  signal?: AbortSignal,
+): Promise<CatalogImage> {
+  return request<CatalogImage>(`/images/${encodeURIComponent(sha256)}`, {
+    method: "PATCH",
+    body,
+    signal,
+  });
+}
+
+/** Re-project one image (gateway POST /images/{sha}/reindex -> index task). */
+export async function reindexImage(sha256: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/images/${encodeURIComponent(sha256)}/reindex`, {
+    method: "POST",
+    signal,
+  });
+}
+
+/** Re-label one image (gateway POST /images/{sha}/relabel -> label task). */
+export async function relabelImage(sha256: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/images/${encodeURIComponent(sha256)}/relabel`, {
+    method: "POST",
+    signal,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Notes — the catalog "note" record (Editor.js block document + positive /
 // negative prompt fields + ordered image refs by sha256), proxied through the
 // gateway /notes routes. `blocks` is the raw Editor.js OutputData document; the
