@@ -11,8 +11,9 @@ export const dynamic = "force-dynamic";
  * NOTE: the gateway's search contract takes { query, limit, filter } only — it
  * has no offset/pagination and no graphScope resolution. We therefore page on
  * the client by slicing the gateway result; graphScope is accepted but ignored
- * here (the gateway exposes no graph-scope resolution endpoint). When `query`
- * is empty the gateway still runs (filter-only browse).
+ * here (the gateway exposes no graph-scope resolution endpoint). The gateway
+ * encodes the text `query` into vectors via deedlit.vision before searching, so
+ * an empty `query` returns no results (filter-only browse is not yet supported).
  */
 export async function POST(request: Request) {
   return handleRoute(async () => {

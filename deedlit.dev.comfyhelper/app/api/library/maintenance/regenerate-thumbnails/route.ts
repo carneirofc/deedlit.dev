@@ -9,5 +9,7 @@ export const dynamic = "force-dynamic";
  * gateway POST /jobs (routed to deedlit.ingest). Execution is owned by ingest.
  */
 export async function POST() {
-  return handleRoute(async () => jsonOk(await dispatchJob({ type: "regenerate-thumbnails" })));
+  // deedlit.ingest names the thumbnail rebuild `rebuild-thumbnails`; the old
+  // `regenerate-thumbnails` 422s.
+  return handleRoute(async () => jsonOk(await dispatchJob({ type: "rebuild-thumbnails" })));
 }

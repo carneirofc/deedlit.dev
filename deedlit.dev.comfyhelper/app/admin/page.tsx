@@ -3,17 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { PathInput } from "@/components/PathInput";
+import { ServiceStatusBoard } from "@/components/ServiceStatusBoard";
+import { useActivity } from "@/lib/store/activity";
 
 // ---------------------------------------------------------------------------
 // Types mirroring the library API responses.
 // ---------------------------------------------------------------------------
-
-type ServiceState = boolean | "disabled";
-
-interface HealthResponse {
-  healthy: boolean;
-  services: Record<string, ServiceState>;
-}
 
 interface JobSummary {
   id: string;
@@ -110,18 +105,6 @@ interface ActionRun {
   result: string | null;
 }
 
-function statusColor(state: ServiceState): string {
-  if (state === "disabled") return "bg-ui-bg text-ui-ink-muted";
-  return state
-    ? "bg-emerald-500/15 text-emerald-500"
-    : "bg-rose-500/15 text-rose-500";
-}
-
-function statusLabel(state: ServiceState): string {
-  if (state === "disabled") return "disabled";
-  return state ? "ok" : "down";
-}
-
 function jobStatusColor(status: string): string {
   switch (status) {
     case "running":
@@ -138,8 +121,7 @@ function jobStatusColor(status: string): string {
 }
 
 export default function AdminPage() {
-  // Health
-  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const { fetchJson, trackJob } = useActivity();
 
   // Ingest
   const [folderPath, setFolderPath] = useState("");
@@ -158,13 +140,6 @@ export default function AdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const refreshHealth = useCallback(() => {
-    fetch("/api/library/health")
-      .then((r) => r.json())
-      .then((j: HealthResponse) => setHealth(j))
-      .catch(() => setHealth(null));
-  }, []);
-
   const refreshJobs = useCallback(() => {
     fetch("/api/library/jobs")
       .then((r) => r.json())
@@ -174,17 +149,12 @@ export default function AdminPage() {
       .catch(() => {});
   }, []);
 
-  // Initial load + polling.
+  // Initial load + polling. (The status board self-polls its own health.)
   useEffect(() => {
-    refreshHealth();
     refreshJobs();
-    const healthId = setInterval(refreshHealth, 5000);
     const jobsId = setInterval(refreshJobs, 3000);
-    return () => {
-      clearInterval(healthId);
-      clearInterval(jobsId);
-    };
-  }, [refreshHealth, refreshJobs]);
+    return () => clearInterval(jobsId);
+  }, [refreshJobs]);
 
   // Load detail for the expanded job (and keep it fresh while jobs poll).
   useEffect(() => {
@@ -214,13 +184,18 @@ export default function AdminPage() {
     setError(null);
     setNotice(null);
     try {
-      const r = await fetch("/api/library/ingest/folder", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ folderPath: path, ...options }),
-      });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error ?? "Ingest failed");
+      const j = await fetchJson<{ job_id?: string | null }>(
+        `Ingest ${path.split(/[\\/]/).pop() || path}`,
+        "/api/library/ingest/folder",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ folderPath: path, ...options }),
+        },
+      );
+      // Hand the dispatched job to the global poller so its progress shows in
+      // the activity dock from any page, then keep the page's own jobs list fresh.
+      trackJob(`Ingest ${path.split(/[\\/]/).pop() || path}`, j.job_id);
       setNotice(`Ingestion started — job ${j.job_id}`);
       refreshJobs();
     } catch (e) {
@@ -234,14 +209,18 @@ export default function AdminPage() {
     setRuns((prev) => ({ ...prev, [action.key]: { status: "running", result: null } }));
     setError(null);
     try {
-      const r = await fetch(action.endpoint, { method: "POST" });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error ?? `${action.label} failed`);
+      const j = await fetchJson<{ id?: string | null; job_id?: string | null }>(
+        action.label,
+        action.endpoint,
+        { method: "POST" },
+      );
+      // Maintenance actions dispatch a job too — surface its live progress in the dock.
+      trackJob(action.label, j.id ?? j.job_id);
+      refreshJobs();
       setRuns((prev) => ({
         ...prev,
         [action.key]: { status: "done", result: JSON.stringify(j) },
       }));
-      refreshHealth();
     } catch (e) {
       setRuns((prev) => ({
         ...prev,
@@ -255,9 +234,9 @@ export default function AdminPage() {
 
   const cancelJob = async (jobId: string) => {
     try {
-      const r = await fetch(`/api/library/jobs/${jobId}/cancel`, { method: "POST" });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j.error ?? "Cancel failed");
+      await fetchJson(`Cancel job ${jobId.slice(0, 8)}`, `/api/library/jobs/${jobId}/cancel`, {
+        method: "POST",
+      });
       refreshJobs();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cancel failed");
@@ -269,34 +248,16 @@ export default function AdminPage() {
 
   return (
     <div className="mx-auto flex max-w-[1400px] flex-col gap-6" data-testid="admin-page">
-      {/* Header + health */}
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
-          <p className="text-ui-sm text-ui-ink-muted">
-            Trigger ingestion &amp; maintenance, monitor service health and jobs.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2" data-testid="health-badges">
-          <span
-            className={`rounded-full px-2 py-1 text-ui-2xs font-medium ${
-              health?.healthy ? "bg-emerald-500/15 text-emerald-500" : "bg-rose-500/15 text-rose-500"
-            }`}
-          >
-            {health ? (health.healthy ? "all systems ok" : "degraded") : "checking…"}
-          </span>
-          {health &&
-            Object.entries(health.services).map(([name, state]) => (
-              <span
-                key={name}
-                className={`rounded-full px-2 py-1 text-ui-2xs ${statusColor(state)}`}
-                data-testid={`health-${name}`}
-              >
-                {name} {statusLabel(state)}
-              </span>
-            ))}
-        </div>
+      {/* Header */}
+      <header>
+        <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
+        <p className="text-ui-sm text-ui-ink-muted">
+          Trigger ingestion &amp; maintenance, monitor service health and jobs.
+        </p>
       </header>
+
+      {/* System status — every backend component + its dependencies */}
+      <ServiceStatusBoard />
 
       {error && (
         <p className="text-ui-sm text-rose-500" data-testid="admin-error">

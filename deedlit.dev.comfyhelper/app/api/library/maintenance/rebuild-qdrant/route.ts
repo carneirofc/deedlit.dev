@@ -9,5 +9,7 @@ export const dynamic = "force-dynamic";
  * POST /jobs (routed to deedlit.ingest). Execution is owned by ingest.
  */
 export async function POST() {
-  return handleRoute(async () => jsonOk(await dispatchJob({ type: "rebuild-qdrant" })));
+  // deedlit.ingest names the vector-store rebuild `rebuild-search` (the Qdrant
+  // projection is owned by deedlit.search); the old `rebuild-qdrant` 422s.
+  return handleRoute(async () => jsonOk(await dispatchJob({ type: "rebuild-search" })));
 }
