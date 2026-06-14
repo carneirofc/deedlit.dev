@@ -138,6 +138,30 @@ def test_edges_key_distinguishes_by_hash_when_present():
     assert b not in [n["sha256"] for n in nb["neighbors"]]
 
 
+# --- (6) DELETE /images/{sha256} removes the node + its edges ----------------
+
+
+def test_delete_image_removes_node_and_neighbor_edges():
+    a, b = sha("delA"), sha("delB")
+    ckpt = {"kind": "checkpoint", "name": "todelete.safetensors", "hash": None}
+    client.post("/edges", json={"sha256": a, "references": [ckpt]})
+    client.post("/edges", json={"sha256": b, "references": [ckpt]})
+    # a and b share the checkpoint, so they are shared-asset neighbors.
+    nb = client.get(f"/neighbors/{a}", params={"relation": "shared_asset"}).json()
+    assert b in [n["sha256"] for n in nb["neighbors"]]
+
+    r = client.delete(f"/images/{b}")
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+
+    # b's node + USES edge are gone, so it no longer surfaces as a's neighbor.
+    nb2 = client.get(f"/neighbors/{a}", params={"relation": "shared_asset"}).json()
+    assert b not in [n["sha256"] for n in nb2["neighbors"]]
+
+    # Deleting a missing node is not an error and reports 0.
+    assert client.delete(f"/images/{b}").json()["deleted"] == 0
+
+
 # --- rebuild-from-catalog (mocked HTTP) -------------------------------------
 
 

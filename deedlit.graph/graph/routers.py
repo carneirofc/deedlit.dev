@@ -20,6 +20,18 @@ def post_edges(edge: EdgeUpsert) -> dict:
     return repository.upsert_edges(edge)
 
 
+@router.delete("/images/{sha256}")
+def delete_image(sha256: str) -> dict:
+    """Delete an image node + its edges from the graph projection. Idempotent.
+
+    Returns ``{deleted: <count>}`` (0 when the node was not present). A missing
+    node is not an error — the graph is a rebuildable projection, so the gateway
+    treats this as best-effort cleanup once the catalog record is gone.
+    """
+    deleted = repository.delete_image(sha256)
+    return {"status": "ok", "deleted": deleted}
+
+
 @router.get("/neighbors/{sha256}", response_model=NeighborResponse)
 def get_neighbors(
     sha256: str,

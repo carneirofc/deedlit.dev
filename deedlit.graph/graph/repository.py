@@ -114,6 +114,24 @@ def upsert_edges(edge: EdgeUpsert) -> dict:
         }
 
 
+def delete_image(sha256: str) -> int:
+    """Remove an image node and all its edges (DETACH DELETE). Idempotent.
+
+    Returns the number of Image nodes deleted (0 when it was not in the graph).
+    Asset / Tag nodes are intentionally left in place: they may still be USED /
+    TAGGED by other images. Any that are now orphaned are harmless and can be
+    pruned by a rebuild-from-catalog or a future sweep.
+    """
+    q = """
+    MATCH (img:Image {sha256: $sha256})
+    DETACH DELETE img
+    RETURN count(*) AS deleted
+    """
+    with _driver().session(database=get_database()) as session:
+        rec = session.run(q, sha256=sha256).single()
+        return int(rec["deleted"]) if rec else 0
+
+
 def neighbors(sha256: str, relation: str = "any", limit: int = 24) -> list[dict]:
     """Related images by shared asset and/or tag co-occurrence (traversal)."""
     results: dict[str, dict] = {}
