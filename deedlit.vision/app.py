@@ -154,6 +154,20 @@ INDEX_HTML = STATIC_DIR / "index.html"
 # ---------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------
+# Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
+# dashboard), so their access logs drown out everything else. Drop them from
+# uvicorn's access log while leaving real traffic intact.
+class _HealthAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        # uvicorn.access record args: (client, method, full_path, http_ver, status)
+        if isinstance(args, tuple) and len(args) >= 3:
+            return "/health" not in str(args[2])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
+
 app = FastAPI(
     title="ComfyUI CLIP Embedding API",
     description=(

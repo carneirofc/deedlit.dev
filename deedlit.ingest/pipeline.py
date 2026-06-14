@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,8 @@ import imagehash
 from PIL import Image
 
 from id_scheme import point_id_for_sha256
+
+log = logging.getLogger("deedlit.ingest.pipeline")
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via env)
@@ -437,10 +440,12 @@ def process_file(data: bytes, filename: str) -> IngestRecord:
     thumbnail = make_webp_thumbnail(data)
 
     extract = extract_metadata(data, filename, mime)
+    log.debug("%s sha=%s tool=%s dims=%sx%s", filename, sha256[:12], extract.get("sourceTool"), width, height)
     dense = embed_image(data, filename, mime)
     # Sparse vector is over the prompt text (lexical/term weights for hybrid).
     prompt_text = extract.get("prompt") or " ".join(extract.get("tags") or [])
     sparse = embed_sparse(prompt_text) if prompt_text.strip() else {"indices": [], "values": []}
+    log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
 
     return assemble_record(
         sha256=sha256,
@@ -537,3 +542,4 @@ def fan_out_writes(rec: IngestRecord) -> None:
     _post_with_retry(f"{SEARCH_URL}/points", rec.point)
     # 3. graph: reference/tag/lineage edges.
     _post_with_retry(f"{GRAPH_URL}/edges", rec.edges)
+    log.debug("fan-out OK %s -> catalog+search+graph", sha[:12])

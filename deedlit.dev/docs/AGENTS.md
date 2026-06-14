@@ -24,7 +24,7 @@ This guide is designed for AI agents to understand how to setup, test, and work 
 
 ```powershell
 # Clone/navigate to project
-cd c:\Users\claud\__Code__\deedlit.dev
+cd path\to\deedlit.dev
 
 # Install dependencies
 npm install

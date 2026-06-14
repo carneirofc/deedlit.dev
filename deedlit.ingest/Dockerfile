@@ -8,9 +8,15 @@ RUN pip install --no-cache-dir \
     "httpx>=0.27.0" \
     "pillow>=10.0.0" \
     "imagehash>=4.3.1" \
-    "python-multipart>=0.0.9"
+    "python-multipart>=0.0.9" \
+    "opentelemetry-distro>=0.48b0" \
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0" \
+    "opentelemetry-instrumentation-fastapi>=0.48b0" \
+    "opentelemetry-instrumentation-httpx>=0.48b0"
 COPY id_scheme.py pipeline.py jobs.py app.py ./
 
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --retries=10     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# opentelemetry-instrument wraps uvicorn for zero-code tracing; OTEL_* env
+# (endpoint/service name/protocol) is supplied by docker-compose.
+CMD ["opentelemetry-instrument", "python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

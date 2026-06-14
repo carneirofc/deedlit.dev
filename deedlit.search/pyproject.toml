@@ -7,6 +7,13 @@ dependencies = [
     "fastapi>=0.116.0",
     "uvicorn[standard]>=0.35.0",
     "qdrant-client>=1.12.0",
+    # OpenTelemetry: zero-code tracing via `opentelemetry-instrument`. Exports
+    # OTLP/http to Tempo (see OTEL_* env / dev:search script). httpx instrumentation
+    # covers qdrant-client's REST transport.
+    "opentelemetry-distro>=0.48b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
 ]
 
 [tool.uv]

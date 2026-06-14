@@ -1,0 +1,46 @@
+// Grafana Alloy — ships Docker container stdout/stderr into Loki.
+//
+// We scrape container logs (rather than wiring an OTLP logs exporter into every
+// service) so EVERYTHING a container prints is captured with zero app changes:
+// uvicorn access logs, tracebacks, and the deedlit.ingest pipeline/job debug
+// lines. Discovery + log tailing both go through the Docker API on the mounted
+// socket, so it works the same on Linux and Docker Desktop.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Promote useful Docker metadata to Loki labels: `service` is the compose
+// service name (catalog/search/ingest/...), `container` the container name.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  // Only this stack's containers (compose project name is `deedlit`).
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "deedlit"
+    action        = "keep"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = { job = "docker" }
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

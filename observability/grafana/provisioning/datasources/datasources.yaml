@@ -1,0 +1,41 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      # Map the span's service.name to a Grafana service so trace exploration
+      # groups by the owning FastAPI service.
+      serviceMap:
+        datasourceUid: tempo
+      # Trace -> logs: from a span, jump to that service's logs in Loki over the
+      # span's time window (matched on the `service` label Alloy attaches from
+      # the compose service name).
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1h
+        spanEndTimeShift: 1h
+        filterByTraceID: false
+        filterBySpanID: false
+        tags:
+          - key: service.name
+            value: service
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Logs -> trace: if a log line carries a trace id (e.g. OTLP structured
+      # metadata or `trace_id=<hex>` in the message), turn it into a Tempo link.
+      derivedFields:
+        - name: TraceID
+          matcherType: regex
+          matcherRegex: 'trace_id[=:"\s]+(\w+)'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
