@@ -15,11 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
 
-# Install CUDA-capable PyTorch before the rest so other packages don't pull CPU wheels.
+# Install CUDA-capable PyTorch before the rest so other packages don't pull CPU
+# wheels. cu128 (CUDA 12.8) wheels are REQUIRED for RTX 50-series / Blackwell
+# (sm_120) GPUs: cu121 ships no sm_120 kernels and dies at inference with
+# "no kernel image is available for execution on the device". Pinned to the same
+# versions the local cu128 venv runs; mirrors the cu128 index in pyproject.toml.
 RUN python3 -m pip install --no-cache-dir \
-    "torch==2.2.0+cu121" \
-    "torchvision==0.17.0+cu121" \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+    "torch==2.11.0+cu128" \
+    "torchvision==0.26.0+cu128" \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /app
 
@@ -27,6 +31,7 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN python3 -m pip install --no-cache-dir \
     "fastapi>=0.116.0" \
+    "fastembed>=0.4.0" \
     "httpx>=0.27.0" \
     "open-clip-torch>=2.24.0" \
     "pillow>=10.0.0" \
@@ -40,7 +45,7 @@ RUN python3 -m pip install --no-cache-dir \
     "opentelemetry-instrumentation-fastapi>=0.48b0" \
     "opentelemetry-instrumentation-httpx>=0.48b0"
 
-COPY app.py .
+COPY app.py activity.py ./
 
 # /comfyui is mounted from the host — see docker-compose COMFYUI_ROOT_HOST.
 ENV COMFYUI_ROOT=/comfyui

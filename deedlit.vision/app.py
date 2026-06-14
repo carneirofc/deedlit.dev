@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import asyncio
 import io
 import logging
 import os
+import time
 import warnings
 from pathlib import Path
 from typing import Annotated, Literal
@@ -29,6 +35,8 @@ from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
+
+from activity import install_activity
 
 
 # ---------------------------------------------------------------------
@@ -57,6 +65,20 @@ EMBEDDING_DISTANCE = "Cosine"
 
 DEVICE = os.getenv("CLIP_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 USE_FP16 = os.getenv("CLIP_FP16", "true").lower() == "true"
+
+# Fail fast (at import, before uvicorn binds) if CUDA was explicitly requested
+# but isn't actually usable — so a GPU deployment can never silently degrade to
+# CPU. Without this, a torch build lacking kernels for the installed GPU (e.g.
+# cu121 wheels on a Blackwell sm_120 card) still reports cuda.is_available()
+# True, loads onto "cuda", and only blows up at the first matmul. Set
+# CLIP_DEVICE=cpu to run on CPU intentionally.
+if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+    raise RuntimeError(
+        f"CLIP_DEVICE={DEVICE!r} requested CUDA but torch.cuda.is_available() is "
+        f"False (torch {torch.__version__}, built for CUDA {torch.version.cuda}). "
+        "Check the NVIDIA container runtime and that torch matches this GPU's "
+        "compute capability. Set CLIP_DEVICE=cpu to run on CPU intentionally."
+    )
 
 # SPLADE sparse text embedding (lexical/term-weight vectors for hybrid search).
 # Loaded lazily on the first /embed/sparse call, mirroring the CLIP towers.
@@ -133,6 +155,11 @@ CONFIG = MODEL_CONFIGS[DEFAULT_PRESET]
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333").rstrip("/")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "images")
 QDRANT_TIMEOUT = float(os.getenv("QDRANT_TIMEOUT", "5.0"))
+# deedlit.search owns the shared collection and configures NAMED vectors
+# (dense + sparse), so a search must address the vector by name — a bare
+# {"vector": [...]} query fails with "Not existing vector name". This is the
+# dense vector to query from the test UI; it matches deedlit.search's name.
+QDRANT_DENSE_VECTOR_NAME = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
 
 # Backing-stack services from deedlit.dev.comfyhelper's docker-compose. Used only
 # by the test UI's "Services" panel for reachability + console deep-links; none
@@ -168,6 +195,18 @@ class _HealthAccessFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
+# Surface this service's own work logs (model loads + per-request embed timing)
+# at INFO so the GPU's behaviour is visible — without this, a custom logger
+# propagates to the WARNING-level root and stays hidden behind uvicorn's loggers.
+# Set VISION_LOG_LEVEL=DEBUG for more detail.
+log = logging.getLogger("deedlit.vision")
+if not log.handlers:
+    _vh = logging.StreamHandler()
+    _vh.setFormatter(logging.Formatter("%(levelname)s:     [%(name)s] %(message)s"))
+    log.addHandler(_vh)
+    log.propagate = False
+log.setLevel(os.getenv("VISION_LOG_LEVEL", "INFO").upper())
+
 app = FastAPI(
     title="ComfyUI CLIP Embedding API",
     description=(
@@ -188,6 +227,7 @@ app = FastAPI(
         {"name": "services", "description": "Reachability of the backing data-stack services (used by the test UI)."},
     ],
 )
+install_activity(app)
 
 
 class TextEmbeddingRequest(BaseModel):
@@ -442,6 +482,7 @@ def _embed_text_vec(text: str, preset: str = DEFAULT_PRESET) -> torch.Tensor:
 def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.Tensor:
     _load_vision_model(preset)
 
+    started = time.perf_counter()
     image_tensor = _vision_preprocess[preset](image).unsqueeze(0).to(DEVICE)
 
     if USE_FP16 and DEVICE.startswith("cuda"):
@@ -451,6 +492,13 @@ def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.
         vec = _vision_models[preset](pixel_values=image_tensor).image_embeds
         vec = _normalize(vec)
 
+    # Per-request GPU timing: if this is fast but ingest is slow, the bottleneck
+    # is elsewhere (labelagent/metadata/network), not the CLIP forward pass.
+    log.info(
+        "embed image (%s) %.0f ms on %s%s",
+        preset, (time.perf_counter() - started) * 1000, DEVICE,
+        " fp16" if (USE_FP16 and DEVICE.startswith("cuda")) else "",
+    )
     return vec[0]
 
 
@@ -486,6 +534,11 @@ def _load_vision_model(preset: str) -> None:
     if not local_path.exists():
         raise RuntimeError(f"Local clip_vision safetensors not found for {preset!r}: {local_path}")
 
+    # Lazy first-use load (safetensors -> GPU) is a one-time multi-second cost
+    # during which the GPU looks idle; log it so a slow first file is explained.
+    log.info("loading CLIP vision tower %s onto %s …", preset, DEVICE)
+    _load_started = time.perf_counter()
+
     m = CLIPVisionModelWithProjection(config["vision_config"])
 
     state_dict = load_file(str(local_path))
@@ -510,6 +563,7 @@ def _load_vision_model(preset: str) -> None:
             transforms.Normalize(mean=CLIP_IMAGE_MEAN, std=CLIP_IMAGE_STD),
         ]
     )
+    log.info("loaded CLIP vision tower %s in %.0f ms", preset, (time.perf_counter() - _load_started) * 1000)
 
 
 def _load_text_model(preset: str) -> None:
@@ -968,21 +1022,28 @@ async def misspelled_similarity_text_to_image(
 # ---------------------------------------------------------------------
 # Optional Qdrant search (test UI only)
 # ---------------------------------------------------------------------
-def _extract_vector_params(vectors: object) -> tuple[int | None, str | None]:
-    """Pull (size, distance) from a Qdrant collection's vectors config.
+def _extract_vector_params(vectors: object) -> tuple[int | None, str | None, str | None]:
+    """Pull (size, distance, name) from a Qdrant collection's vectors config.
 
-    Handles both the unnamed default vector (``{"size": .., "distance": ..}``)
-    and named-vector maps (``{"name": {"size": ..}}``), taking the first named
-    config in the latter case.
+    Handles both the unnamed default vector (``{"size": .., "distance": ..}`` →
+    name ``None``) and named-vector maps (``{"dense": {"size": ..}}`` → that
+    name). For a named map we prefer the configured dense vector and otherwise
+    fall back to the first named config. ``name`` is ``None`` only for an unnamed
+    (legacy single-vector) collection.
     """
     if not isinstance(vectors, dict):
-        return None, None
+        return None, None, None
     if "size" in vectors:
-        return vectors.get("size"), vectors.get("distance")
-    for cfg in vectors.values():
-        if isinstance(cfg, dict) and "size" in cfg:
-            return cfg.get("size"), cfg.get("distance")
-    return None, None
+        return vectors.get("size"), vectors.get("distance"), None
+    name = (
+        QDRANT_DENSE_VECTOR_NAME
+        if QDRANT_DENSE_VECTOR_NAME in vectors
+        else next(iter(vectors), None)
+    )
+    cfg = vectors.get(name) if name is not None else None
+    if isinstance(cfg, dict) and "size" in cfg:
+        return cfg.get("size"), cfg.get("distance"), name
+    return None, None, name
 
 
 async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResponse:
@@ -1020,7 +1081,7 @@ async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResp
     status.collection_exists = True
     status.points_count = result.get("points_count")
     vectors = (((result.get("config") or {}).get("params") or {}).get("vectors"))
-    size, distance = _extract_vector_params(vectors)
+    size, distance, _name = _extract_vector_params(vectors)
     status.vector_size = size
     status.distance = distance
     status.dim_matches = size == model_dim
@@ -1030,6 +1091,28 @@ async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResp
             f"{model_dim}-dim. Rebuild the collection with deedlit.vision embeddings to enable search."
         )
     return status
+
+
+async def _resolve_search_vector_name() -> str | None:
+    """Which named vector to query, or ``None`` for an unnamed collection.
+
+    deedlit.search owns the shared collection with NAMED vectors (dense+sparse),
+    so the test-UI search must address the dense vector by name. Only a legacy
+    single-vector (unnamed) collection yields ``None``. On any read failure we
+    assume the named dense vector — that's the current architecture, and a wrong
+    guess surfaces as the real Qdrant error rather than a silent empty result.
+    """
+    url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}"
+    try:
+        async with httpx.AsyncClient(timeout=QDRANT_TIMEOUT) as client:
+            resp = await client.get(url)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return QDRANT_DENSE_VECTOR_NAME
+    result = resp.json().get("result", {}) or {}
+    vectors = (((result.get("config") or {}).get("params") or {}).get("vectors"))
+    _size, _distance, name = _extract_vector_params(vectors)
+    return name
 
 
 async def _qdrant_search(vector: list[float], limit: int, preset: str = DEFAULT_PRESET) -> list[QdrantSearchResult]:
@@ -1042,7 +1125,11 @@ async def _qdrant_search(vector: list[float], limit: int, preset: str = DEFAULT_
         raise HTTPException(status_code=409, detail=status.detail or "Qdrant collection vector size mismatch.")
 
     url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search"
-    payload = {"vector": vector, "limit": limit, "with_payload": True}
+    # Named-vector collections require the query vector to be addressed by name;
+    # an unnamed (legacy) collection takes the bare list.
+    name = await _resolve_search_vector_name()
+    query_vector: object = {"name": name, "vector": vector} if name else vector
+    payload = {"vector": query_vector, "limit": limit, "with_payload": True}
     try:
         async with httpx.AsyncClient(timeout=QDRANT_TIMEOUT) as client:
             resp = await client.post(url, json=payload)
