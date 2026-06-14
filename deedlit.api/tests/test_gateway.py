@@ -156,21 +156,83 @@ def test_detail_404_when_catalog_missing(rec, client):
 # ---------------------------------------------------------------------------
 # (4) POST /search proxies to deedlit.search
 # ---------------------------------------------------------------------------
-def test_search_proxies_to_search(rec, client):
+def test_search_encodes_text_then_queries(rec, client):
     seen = {}
 
-    def handler(request: httpx.Request):
+    def query_handler(request: httpx.Request):
         seen["body"] = json.loads(request.content)
         return {"hits": [{"sha256": "d" * 64, "score": 0.5}], "fusion": "rrf"}
 
-    rec.on("POST", "/query", handler)
+    # search is a pure vector store: the gateway must encode the text via vision
+    # (dense + sparse) before it can query search.
+    rec.on("POST", "/embed/text", lambda r: {"embedding": [0.1, 0.2, 0.3]})
+    rec.on("POST", "/embed/sparse", lambda r: {"indices": [1, 2], "values": [0.5, 0.7]})
+    rec.on("POST", "/query", query_handler)
 
     r = client.post("/search", json={"query": "a knight", "limit": 10})
     assert r.status_code == 200
     assert r.json()["hits"][0]["sha256"] == "d" * 64
-    # Proxied to the search service only.
-    assert _bases(rec) == {clients.SEARCH_URL}
+    # Text was encoded via vision, then the resulting vectors queried search.
+    assert _bases(rec) == {clients.VISION_URL, clients.SEARCH_URL}
     assert seen["body"]["limit"] == 10
+    assert seen["body"]["dense"] == [0.1, 0.2, 0.3]
+    assert seen["body"]["sparse"] == {"indices": [1, 2], "values": [0.5, 0.7]}
+    # No raw `query` string reaches the vector store.
+    assert "query" not in seen["body"]
+
+
+def test_search_empty_query_browses_catalog_without_calling_search(rec, client):
+    # An empty query has no vector to search by, so the gateway must NOT dispatch
+    # a vectorless query (search would 422). Instead it browses the catalog — the
+    # source of truth — so the default no-query gallery shows the library.
+    rows = [
+        {"sha256": "a" * 64, "prompt": "a knight", "tags": ["knight"]},
+        {"sha256": "b" * 64, "prompt": None, "tags": []},
+    ]
+    seen = {}
+
+    def images_handler(request: httpx.Request):
+        seen["url"] = str(request.url)
+        return rows
+
+    rec.on("GET", "/images", images_handler)
+
+    r = client.post("/search", json={"query": "   ", "limit": 10})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fusion"] == "browse"
+    assert [h["sha256"] for h in body["hits"]] == ["a" * 64, "b" * 64]
+    # The whole catalog record rides along as the hit payload (no second fetch).
+    assert body["hits"][0]["payload"]["prompt"] == "a knight"
+    # Only catalog was touched — vision/search stay out of the browse path.
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert "limit=10" in seen["url"]
+
+
+def test_blob_proxy_streams_catalog_bytes(rec, client):
+    # comfyhelper is UI-only and holds no object store, so the gateway proxies
+    # raw image bytes from the catalog (the blob owner).
+    png = b"\x89PNG\r\n\x1a\nFAKEWEBP"
+    rec.on(
+        "GET",
+        f"/blobs/{SHA}/thumbnail",
+        lambda r: httpx.Response(200, content=png, headers={"content-type": "image/webp"}),
+    )
+    r = client.get(f"/blobs/{SHA}/thumbnail")
+    assert r.status_code == 200
+    assert r.content == png
+    assert r.headers["content-type"] == "image/webp"
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_blob_proxy_404_passes_through(rec, client):
+    rec.on(
+        "GET",
+        f"/blobs/{SHA}/thumbnail",
+        lambda r: httpx.Response(404, json={"detail": "blob not found"}),
+    )
+    r = client.get(f"/blobs/{SHA}/thumbnail")
+    assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +293,55 @@ def test_jobs_get_degrades_to_empty_when_ingest_down(rec, client):
 
 
 # ---------------------------------------------------------------------------
+# (6b) GET /fs/browse proxies the folder picker listing to ingest
+# ---------------------------------------------------------------------------
+def test_fs_browse_proxies_to_ingest_with_path(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.params.get("path")
+        return {"path": "/data/pics", "parent": "/data", "separator": "/", "entries": [], "roots": []}
+
+    rec.on("GET", "/fs/browse", handler)
+
+    r = client.get("/fs/browse", params={"path": "/data/pics"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "/data/pics"
+    assert _bases(rec) == {clients.INGEST_URL}
+    assert seen["path"] == "/data/pics"
+
+
+def test_fs_browse_roots_view_omits_path(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["path"] = request.url.params.get("path")
+        return {"path": None, "parent": None, "separator": "/", "entries": [], "roots": [{"label": "/", "path": "/"}]}
+
+    rec.on("GET", "/fs/browse", handler)
+
+    r = client.get("/fs/browse")
+    assert r.status_code == 200
+    assert r.json()["path"] is None
+    # No path param forwarded for the roots view.
+    assert seen["path"] is None
+
+
+def test_fs_browse_passes_through_400(rec, client):
+    rec.on("GET", "/fs/browse", lambda r: httpx.Response(400, json={"detail": "Folder not found: /nope"}))
+    r = client.get("/fs/browse", params={"path": "/nope"})
+    # User-correctable filesystem error stays a 400 the picker shows inline.
+    assert r.status_code == 400
+    assert "not found" in r.json()["detail"].lower()
+
+
+def test_fs_browse_502_when_ingest_down(rec, client):
+    rec.on("GET", "/fs/browse", lambda r: httpx.Response(500))
+    r = client.get("/fs/browse", params={"path": "/data"})
+    assert r.status_code == 502
+
+
+# ---------------------------------------------------------------------------
 # (7) POST /mcp — tools/list and tools/call dispatch
 # ---------------------------------------------------------------------------
 def test_mcp_initialize(rec, client):
@@ -254,6 +365,10 @@ def test_mcp_tools_list(rec, client):
 
 
 def test_mcp_tools_call_search_dispatches_to_search(rec, client):
+    # search_images encodes the text via vision, then queries search (same hop
+    # as the REST /search route).
+    rec.on("POST", "/embed/text", lambda r: {"embedding": [0.1, 0.2, 0.3]})
+    rec.on("POST", "/embed/sparse", lambda r: {"indices": [1], "values": [0.5]})
     rec.on("POST", "/query", lambda r: {"hits": [{"sha256": "e" * 64, "score": 0.3}], "fusion": "rrf"})
     r = client.post("/mcp", json={
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -262,7 +377,7 @@ def test_mcp_tools_call_search_dispatches_to_search(rec, client):
     assert r.status_code == 200
     body = r.json()
     assert body["result"]["isError"] is False
-    assert _bases(rec) == {clients.SEARCH_URL}
+    assert _bases(rec) == {clients.VISION_URL, clients.SEARCH_URL}
     assert body["result"]["structuredContent"]["results"][0]["sha256"] == "e" * 64
 
 
@@ -350,7 +465,7 @@ def test_health_dashboard_all_ok(rec, client):
     body = r.json()
     assert body["status"] == "ok"
     names = {s["name"] for s in body["services"]}
-    assert names == {"catalog", "search", "graph", "ingest"}
+    assert names == {"catalog", "search", "graph", "ingest", "vision", "metadata"}
     assert all(s["status"] == "ok" for s in body["services"])
 
 

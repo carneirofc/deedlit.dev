@@ -8,10 +8,13 @@ Endpoints:
   GET  /health           -> HealthDashboard (probes every downstream in parallel)
   GET  /detail/{sha256}  -> Detail{image,similar,neighbors} (parallel fan-out,
                             degrades gracefully on a single downstream failure)
-  POST /search           -> proxy to deedlit.search /query
+  POST /search           -> encode text via vision, then query deedlit.search
   GET  /stats            -> aggregated library stats (from catalog)
   POST /jobs             -> dispatch an ingest/maintenance job (proxy to ingest)
   GET  /jobs             -> list jobs (proxy to ingest) for the dashboard
+  GET  /fs/browse        -> directory listing for the admin folder picker (proxy
+                            to ingest, which owns the host filesystem)
+  /notes, /collections   -> thin proxies to catalog (notes editor + collections)
   POST /mcp              -> MCP JSON-RPC 2.0 surface (see mcp.py)
 
 The downstream HTTP boundary lives in clients.py (monkeypatched in tests); the
@@ -20,15 +23,31 @@ MCP tool surface lives in mcp.py.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 import clients
 import mcp
 from clients import DownstreamError
+
+
+# Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
+# dashboard), so their access logs drown out everything else. Drop them from
+# uvicorn's access log while leaving real traffic intact.
+class _HealthAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        # uvicorn.access record args: (client, method, full_path, http_ver, status)
+        if isinstance(args, tuple) and len(args) >= 3:
+            return "/health" not in str(args[2])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.api", version="0.1.0")
 
@@ -38,16 +57,25 @@ app = FastAPI(title="deedlit.api", version="0.1.0")
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    async def probe(name: str, base: str) -> dict[str, str]:
+    async def probe(name: str, base: str) -> dict[str, Any]:
         try:
             body = await clients.request(name, "GET", base, "/health")
-            status = (body or {}).get("status", "ok") if isinstance(body, dict) else "ok"
-            return {"name": name, "status": "ok" if status == "ok" else "degraded"}
         except DownstreamError:
             return {"name": name, "status": "down"}
+        detail = body if isinstance(body, dict) else None
+        raw = (detail or {}).get("status", "ok")
+        result: dict[str, Any] = {"name": name, "status": "ok" if raw == "ok" else "degraded"}
+        # Forward the downstream's own readiness flags (db_ready, blob_ready,
+        # neo4j_ready, collection_ready, vision_ready, …) so the status
+        # dashboard can show each service's dependencies, not just a roll-up.
+        if detail:
+            extra = {k: v for k, v in detail.items() if k != "status"}
+            if extra:
+                result["detail"] = extra
+        return result
 
     services = await asyncio.gather(
-        *(probe(name, base) for name, base in clients.SERVICES.items())
+        *(probe(name, base) for name, base in clients.HEALTH_SERVICES.items())
     )
     overall = "ok" if all(s["status"] == "ok" for s in services) else "degraded"
     return {"status": overall, "services": list(services)}
@@ -106,9 +134,10 @@ class SearchRequest(BaseModel):
 
 @app.post("/search")
 async def search(req: SearchRequest) -> Any:
-    body = {"query": req.query, "limit": req.limit, "filter": req.filter}
+    # search is a pure vector store; encode the text via vision first (an empty
+    # query yields an empty result rather than a vectorless query that 422s).
     try:
-        return await clients.search("POST", "/query", json=body)
+        return await clients.search_by_text(req.query, req.limit, req.filter)
     except DownstreamError as exc:
         raise HTTPException(status_code=502, detail=f"search unavailable: {exc.detail}")
 
@@ -160,6 +189,125 @@ async def list_jobs() -> Any:
     except DownstreamError:
         return []
     return res if isinstance(res, list) else []
+
+
+@app.get("/fs/browse")
+async def fs_browse(path: str | None = None) -> Any:
+    """List a directory on the ingest host for the admin folder picker.
+
+    Proxies to deedlit.ingest, which owns the host filesystem. A downstream 400
+    (missing/denied/not-a-dir) is user-correctable, so it passes through as a
+    400 the picker shows inline; any other failure surfaces as a 502.
+    """
+    params = {"path": path} if path is not None else None
+    try:
+        return await clients.ingest("GET", "/fs/browse", params=params)
+    except DownstreamError as exc:
+        if exc.status == 400:
+            raise HTTPException(status_code=400, detail=exc.detail) from exc
+        raise HTTPException(
+            status_code=502, detail=f"ingest unavailable: {exc.detail}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Notes + collections — thin proxies to catalog (the owner of both)
+#
+# The gateway holds no data: each route forwards method+path+body to catalog
+# and returns its JSON unchanged. A catalog 404 surfaces as a gateway 404; any
+# other downstream failure (5xx / unreachable) surfaces as a 502 so the UI can
+# tell "not found" from "backend down".
+# ---------------------------------------------------------------------------
+async def _proxy_catalog(method: str, path: str, json_body: Any | None = None) -> Any:
+    try:
+        return await clients.catalog(method, path, json=json_body)
+    except DownstreamError as exc:
+        if exc.status == 404:
+            raise HTTPException(status_code=404, detail=exc.detail) from exc
+        raise HTTPException(status_code=502, detail=f"catalog unavailable: {exc.detail}") from exc
+
+
+# --- notes -----------------------------------------------------------------
+@app.post("/notes")
+async def create_note(payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("POST", "/notes", payload)
+
+
+@app.get("/notes/by-image/{sha256}")
+async def notes_by_image(sha256: str) -> Any:
+    return await _proxy_catalog("GET", f"/notes/by-image/{sha256}")
+
+
+@app.get("/notes/{note_id}")
+async def read_note(note_id: str) -> Any:
+    return await _proxy_catalog("GET", f"/notes/{note_id}")
+
+
+@app.put("/notes/{note_id}")
+async def update_note(note_id: str, payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("PUT", f"/notes/{note_id}", payload)
+
+
+@app.get("/notes/{note_id}/export")
+async def export_note(note_id: str) -> Any:
+    return await _proxy_catalog("GET", f"/notes/{note_id}/export")
+
+
+# --- collections -----------------------------------------------------------
+@app.post("/collections")
+async def create_collection(payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("POST", "/collections", payload)
+
+
+@app.get("/collections")
+async def list_collections() -> Any:
+    return await _proxy_catalog("GET", "/collections")
+
+
+@app.get("/collections/by-image/{sha256}")
+async def collections_by_image(sha256: str) -> Any:
+    return await _proxy_catalog("GET", f"/collections/by-image/{sha256}")
+
+
+@app.get("/collections/{collection_id}")
+async def read_collection(collection_id: str) -> Any:
+    return await _proxy_catalog("GET", f"/collections/{collection_id}")
+
+
+@app.put("/collections/{collection_id}")
+async def rename_collection(collection_id: str, payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("PUT", f"/collections/{collection_id}", payload)
+
+
+@app.delete("/collections/{collection_id}")
+async def delete_collection(collection_id: str) -> Any:
+    return await _proxy_catalog("DELETE", f"/collections/{collection_id}")
+
+
+@app.put("/collections/{collection_id}/images")
+async def set_collection_images(collection_id: str, payload: dict[str, Any]) -> Any:
+    return await _proxy_catalog("PUT", f"/collections/{collection_id}/images", payload)
+
+
+# ---------------------------------------------------------------------------
+# GET /blobs/{sha256}/{kind} — stream image bytes from catalog
+#
+# comfyhelper is UI-only and holds no object store, so it proxies thumbnail /
+# original bytes through the gateway. The gateway in turn streams them from the
+# catalog (the blob owner). Without this route the UI has no byte source and
+# every image renders broken.
+# ---------------------------------------------------------------------------
+@app.get("/blobs/{sha256}/{kind}")
+async def get_blob(sha256: str, kind: str) -> Response:
+    try:
+        data, content_type = await clients.request_bytes(
+            "catalog", "GET", clients.CATALOG_URL, f"/blobs/{sha256}/{kind}"
+        )
+    except DownstreamError as exc:
+        if exc.status == 404:
+            raise HTTPException(status_code=404, detail="blob not found") from exc
+        raise HTTPException(status_code=502, detail=f"catalog unavailable: {exc.detail}") from exc
+    return Response(content=data, media_type=content_type)
 
 
 # ---------------------------------------------------------------------------

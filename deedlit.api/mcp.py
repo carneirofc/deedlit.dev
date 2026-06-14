@@ -57,12 +57,11 @@ def _pick_filters(d: dict[str, Any] | None) -> dict[str, Any]:
 # Tool handlers — each dispatches to a downstream service via clients.py
 # ---------------------------------------------------------------------------
 async def _search_images(args: dict[str, Any]) -> Any:
-    body: dict[str, Any] = {
-        "query": args.get("query", ""),
-        "limit": args.get("limit", 30),
-        "filter": _pick_filters(_top_level_filters(args)) or None,
-    }
-    res = await clients.search("POST", "/query", json=body)
+    res = await clients.search_by_text(
+        args.get("query", ""),
+        args.get("limit", 30),
+        _pick_filters(_top_level_filters(args)) or None,
+    )
     return {"results": (res or {}).get("hits", [])}
 
 
@@ -73,12 +72,11 @@ def _top_level_filters(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _semantic_image_search(args: dict[str, Any]) -> Any:
-    body = {
-        "query": args["query"],
-        "limit": args.get("limit", 30),
-        "filter": _pick_filters(args.get("filters")) or None,
-    }
-    res = await clients.search("POST", "/query", json=body)
+    res = await clients.search_by_text(
+        args["query"],
+        args.get("limit", 30),
+        _pick_filters(args.get("filters")) or None,
+    )
     return {"results": (res or {}).get("hits", [])}
 
 
