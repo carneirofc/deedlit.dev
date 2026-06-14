@@ -143,7 +143,7 @@ export default function QueuesPage() {
   };
 
   return (
-    <div className="mx-auto flex max-w-[1200px] flex-col gap-6" data-testid="queues-page">
+    <div className="mx-auto flex w-full min-w-0 max-w-[1200px] flex-col gap-6" data-testid="queues-page">
       <header className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Queues</h1>
@@ -228,7 +228,7 @@ export default function QueuesPage() {
             return (
               <div
                 key={name}
-                className="flex flex-col gap-2 rounded-lg border border-ui-border/50 bg-ui-bg p-3"
+                className="flex min-w-0 flex-col gap-2 rounded-lg border border-ui-border/50 bg-ui-bg p-3"
                 data-testid={`dlq-${base}`}
               >
                 <div className="flex items-center justify-between">
@@ -258,7 +258,7 @@ export default function QueuesPage() {
                   <ul className="flex max-h-56 flex-col gap-1 overflow-y-auto text-ui-2xs">
                     {msgs.length === 0 && <li className="text-ui-ink-muted">empty</li>}
                     {msgs.map((m, i) => (
-                      <li key={i} className="rounded border border-ui-border/40 bg-ui-bg-soft/40 p-1.5">
+                      <li key={i} className="min-w-0 rounded border border-ui-border/40 bg-ui-bg-soft/40 p-1.5">
                         <div className="truncate text-ui-ink">{m.payload}</div>
                         {m.headers && (m.headers["x-error"] as string) && (
                           <div className="mt-0.5 text-rose-500">

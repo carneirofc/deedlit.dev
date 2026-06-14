@@ -344,10 +344,38 @@ export default function ImageDetailPage() {
             </div>
           </div>
 
-          {settings.showPrompt && detail.prompt && (
+          {settings.showDescription && detail.descriptions.length > 0 && (
             <div className={panel}>
-              <h2 className="mb-1 text-ui-sm font-semibold text-ui-ink-title">Prompt</h2>
-              <p className="whitespace-pre-wrap text-ui-xs text-ui-ink">{detail.prompt}</p>
+              <h2 className="mb-1 text-ui-sm font-semibold text-ui-ink-title">AI description</h2>
+              <div className="flex flex-col gap-2">
+                {detail.descriptions.map((d) => (
+                  <div key={d.id}>
+                    <p className="whitespace-pre-wrap text-ui-xs text-ui-ink">{d.description}</p>
+                    {d.provider && (
+                      <p className="mt-1 text-ui-2xs text-ui-ink-muted">via {d.provider}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {settings.showPrompt && (detail.prompt || detail.negativePrompt) && (
+            <div className={panel}>
+              {detail.prompt && (
+                <>
+                  <h2 className="mb-1 text-ui-sm font-semibold text-ui-ink-title">Prompt</h2>
+                  <p className="whitespace-pre-wrap text-ui-xs text-ui-ink">{detail.prompt}</p>
+                </>
+              )}
+              {detail.negativePrompt && (
+                <>
+                  <h2 className={`mb-1 text-ui-sm font-semibold text-ui-ink-title ${detail.prompt ? "mt-3" : ""}`}>
+                    Negative prompt
+                  </h2>
+                  <p className="whitespace-pre-wrap text-ui-xs text-ui-ink-muted">{detail.negativePrompt}</p>
+                </>
+              )}
             </div>
           )}
 

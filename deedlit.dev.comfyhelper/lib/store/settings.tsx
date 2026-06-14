@@ -45,6 +45,8 @@ export interface LibrarySettings {
   /** Load the full-resolution original instead of the thumbnail in the viewer. */
   viewerFullResolution: boolean;
   showPrompt: boolean;
+  /** Show the AI-generated description panel on the detail page. */
+  showDescription: boolean;
   showGenerationParams: boolean;
   showRelationshipGraph: boolean;
   /** Relationship-graph hop depth (1–3). */
@@ -89,6 +91,7 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   viewerImageFit: "contain",
   viewerFullResolution: false,
   showPrompt: true,
+  showDescription: true,
   showGenerationParams: true,
   showRelationshipGraph: true,
   graphDepth: 1,
@@ -141,6 +144,7 @@ function mergeSettings(raw: unknown): LibrarySettings {
     viewerImageFit: oneOf("viewerImageFit", ["contain", "cover"] as const),
     viewerFullResolution: bool("viewerFullResolution"),
     showPrompt: bool("showPrompt"),
+    showDescription: bool("showDescription"),
     showGenerationParams: bool("showGenerationParams"),
     showRelationshipGraph: bool("showRelationshipGraph"),
     graphDepth: num("graphDepth", 1, 3),

@@ -178,6 +178,8 @@ export interface CatalogImage {
   references?: Array<{ kind: string; name: string; hash?: string | null }>;
   rating?: number | null;
   favorite?: boolean;
+  /** AI-generated description (deedlit.labelagent), persisted by the catalog. */
+  description?: string | null;
   created_at?: string;
   // tolerate extra payload fields the gateway forwards
   [key: string]: unknown;
@@ -808,6 +810,22 @@ function mapLoras(image: CatalogImage): LoraRef[] {
     .map((r) => ({ name: r.name, weight: null }));
 }
 
+/** Provider recorded by the catalog for the AI description (see catalog
+ * repository ``_DESCRIPTION_PROVIDER``). The gateway forwards only the text, so
+ * we attribute it to its single known producer here. */
+const DESCRIPTION_PROVIDER = "deedlit.labelagent";
+
+/**
+ * Map the catalog's persisted AI description into the detail-page list shape.
+ * The catalog keeps one current description per provider and the gateway
+ * forwards it as a single ``description`` string, so this yields 0 or 1 entry.
+ */
+function mapDescriptions(image: CatalogImage): UiImageDetail["descriptions"] {
+  const description = str(image.description);
+  if (!description) return [];
+  return [{ id: `${image.sha256}:${DESCRIPTION_PROVIDER}`, description, provider: DESCRIPTION_PROVIDER }];
+}
+
 /**
  * The shape the detail page (`app/library/[imageId]/page.tsx`) consumes. This
  * is intentionally a subset of the legacy ImageDetail — only the fields the UI
@@ -853,7 +871,7 @@ export function imageToUiDetail(image: CatalogImage): UiImageDetail {
     tags: mapTags(image),
     loras: mapLoras(image),
     generationParams: mapGenerationParams(image),
-    descriptions: [],
+    descriptions: mapDescriptions(image),
   };
 }
 

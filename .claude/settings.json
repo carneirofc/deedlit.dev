@@ -11,7 +11,9 @@
       "Bash(grep -n \"^  /\\\\|^paths:\\\\|^components:\" contracts/catalog.openapi.yaml)",
       "Bash(./.venv/Scripts/python.exe -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('app.py','clients.py','mcp.py'\\)]; print\\('compile OK'\\)\")",
       "Bash(./.venv/Scripts/python.exe -m pytest -q)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(gh repo *)",
+      "Bash(gh label *)"
     ]
   }
 }

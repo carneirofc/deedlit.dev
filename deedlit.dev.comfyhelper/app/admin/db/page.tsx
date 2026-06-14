@@ -171,7 +171,7 @@ export default function DbPage() {
   };
 
   return (
-    <div className="mx-auto flex max-w-[1400px] flex-col gap-6" data-testid="db-page">
+    <div className="mx-auto flex w-full min-w-0 max-w-[1400px] flex-col gap-6" data-testid="db-page">
       <header>
         <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Database (power tools)</h1>
         <p className="text-ui-sm text-ui-ink-muted">
@@ -220,18 +220,18 @@ export default function DbPage() {
         </div>
       </section>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_1.2fr]">
+      <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
         {/* List */}
-        <section className={cls.card} data-testid="db-list">
+        <section className={`${cls.card} min-w-0`} data-testid="db-list">
           <h2 className="mb-2 text-ui-sm font-semibold text-ui-ink-title">
             Images <span className="text-ui-2xs text-ui-ink-muted">({images.length})</span>
           </h2>
-          <div className="flex max-h-[70vh] flex-col gap-1 overflow-y-auto">
+          <div className="flex max-h-[70vh] min-w-0 flex-col gap-1 overflow-y-auto">
             {images.map((img) => (
               <button
                 key={img.sha256}
                 onClick={() => select(img)}
-                className={`rounded-lg border px-3 py-2 text-left text-ui-xs transition ${
+                className={`w-full min-w-0 rounded-lg border px-3 py-2 text-left text-ui-xs transition ${
                   selected?.sha256 === img.sha256
                     ? "border-accent-cyan bg-accent-cyan/10"
                     : "border-ui-border/50 bg-ui-bg hover:bg-ui-bg-soft"
@@ -259,14 +259,14 @@ export default function DbPage() {
         </section>
 
         {/* Detail / editor */}
-        <section className={cls.card} data-testid="db-detail">
+        <section className={`${cls.card} min-w-0`} data-testid="db-detail">
           {!selected || !edit ? (
             <p className="text-ui-sm text-ui-ink-muted">Select an image to inspect and edit.</p>
           ) : (
             <div className="flex flex-col gap-3">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate font-mono text-ui-2xs text-ui-ink-muted">{selected.sha256}</span>
-                <div className="flex shrink-0 gap-1">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="min-w-0 flex-1 truncate font-mono text-ui-2xs text-ui-ink-muted">{selected.sha256}</span>
+                <div className="flex shrink-0 flex-wrap gap-1">
                   <button className={cls.btn} onClick={() => act("reindex")} data-testid="db-reindex">
                     Re-index
                   </button>

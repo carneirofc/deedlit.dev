@@ -154,6 +154,7 @@ test("getDetail() GETs /detail/{sha} and image maps to the UI detail shape", asy
       sourceTool: "comfyui",
       rating: 4,
       favorite: true,
+      description: "A studio portrait of a woman in soft light.",
       tags: ["portrait", "studio"],
       params: { seed: 7, steps: 30, cfg: 6.5, sampler: "euler", clipskip: 2, width: 1024, height: 1536 },
       references: [
@@ -192,6 +193,14 @@ test("getDetail() GETs /detail/{sha} and image maps to the UI detail shape", asy
       ]);
       // loras pulled from references
       expect(ui.loras).toEqual([{ name: "detail.safetensors", weight: null }]);
+      // AI description -> single labelagent-attributed entry
+      expect(ui.descriptions).toEqual([
+        {
+          id: `${sha}:deedlit.labelagent`,
+          description: "A studio portrait of a woman in soft light.",
+          provider: "deedlit.labelagent",
+        },
+      ]);
     } finally {
       restoreFetch();
     }
