@@ -16,7 +16,7 @@
  *   GET  /health           -> { status, services: [{ name, status }] }
  *   POST /mcp              -> JSON-RPC (clusters/compare/related-tags/lineage)
  *
- * Base URL: DEEDLIT_API_URL (server-side, default http://localhost:8080). When
+ * Base URL: DEEDLIT_API_URL (server-side, default http://localhost:8088). When
  * a value is needed in the browser, NEXT_PUBLIC_DEEDLIT_API_URL is consulted
  * first. In practice the React surfaces call the in-app /api/library/* routes,
  * which run server-side and proxy through this client, so the browser never
@@ -38,7 +38,7 @@ import type {
 export function getGatewayBaseUrl(): string {
   const server = process.env.DEEDLIT_API_URL?.trim();
   const pub = process.env.NEXT_PUBLIC_DEEDLIT_API_URL?.trim();
-  return (server || pub || "http://localhost:8080").replace(/\/+$/, "");
+  return (server || pub || "http://localhost:8088").replace(/\/+$/, "");
 }
 
 /**
@@ -213,12 +213,56 @@ export interface HealthResponse {
   services?: ServiceHealth[];
 }
 
+/**
+ * One service's live work snapshot, as aggregated by the gateway GET /activity.
+ * `per_min` is the trailing-60s completion rate; `busy` is `inflight > 0`;
+ * `reachable` is false when the gateway couldn't reach that service's /activity.
+ */
+export interface ServiceActivity {
+  name: string;
+  inflight: number;
+  per_min: number;
+  busy: boolean;
+  last_op: string | null;
+  reachable: boolean;
+}
+
+export interface ActivityResponse {
+  services: ServiceActivity[];
+}
+
 // ---------------------------------------------------------------------------
 // Endpoint wrappers
 // ---------------------------------------------------------------------------
 
 export async function getDetail(sha256: string, signal?: AbortSignal): Promise<DetailResponse> {
   return request<DetailResponse>(`/detail/${encodeURIComponent(sha256)}`, { signal });
+}
+
+/** Per-store outcome of un-indexing an image (DELETE /images/{sha256}). */
+export interface DeleteImageResult {
+  status: string;
+  sha256: string;
+  /** Catalog record removed (always true on success — catalog is the truth). */
+  catalog: boolean;
+  /** Search vector removed (best-effort projection cleanup). */
+  search: boolean;
+  /** Graph node/edges removed (best-effort projection cleanup). */
+  graph: boolean;
+}
+
+/**
+ * Delete an image's INDEXATION — catalog record + search vector + graph node —
+ * NOT the original file on disk. Proxies the gateway DELETE /images/{sha256},
+ * which removes the catalog record first (source of truth) then cleans the
+ * derived projections. A {@link GatewayError} with status 404 means the image
+ * is not in the library.
+ */
+export async function deleteImage(sha256: string, signal?: AbortSignal): Promise<DeleteImageResult> {
+  return request<DeleteImageResult>(`/images/${encodeURIComponent(sha256)}`, {
+    method: "DELETE",
+    signal,
+  });
 }
 
 export interface GatewaySearchRequest {
@@ -250,6 +294,16 @@ export async function dispatchJob(
 
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return request<HealthResponse>("/health", { signal });
+}
+
+/**
+ * Live per-service activity (in-flight / throughput / current op), aggregated by
+ * the gateway GET /activity. Tolerates a missing/odd `services` field by
+ * returning an empty list so the status board degrades to its health-only view.
+ */
+export async function getActivity(signal?: AbortSignal): Promise<ActivityResponse> {
+  const res = await request<ActivityResponse>("/activity", { signal });
+  return { services: Array.isArray(res?.services) ? res.services : [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +545,10 @@ export function hitToCompactResult(hit: SearchHit): CompactResult {
     model: str(p.model) ?? str(p.checkpoint),
     checkpoint: str(p.checkpoint),
     rating: typeof p.rating === "number" ? p.rating : null,
+    // Content-safety class (catalog browse forwards the row's `safety`; the
+    // vector path carries it in the Qdrant payload). null when unclassified.
+    safety:
+      p.safety === "sfw" || p.safety === "nsfw" || p.safety === "explicit" ? p.safety : null,
   };
 }
 

@@ -29,6 +29,13 @@ export interface Activity {
   message?: string;
   /** Links the activity to a backend job so the poller can drive it. */
   jobId?: string;
+  /**
+   * Current ingest pipeline stage of a job-linked activity, e.g. "vision:dense"
+   * — the microservice doing work right now. Driven from the job snapshot.
+   */
+  stage?: string | null;
+  /** Per-stage reached-count for the job-linked staircase (stage → files). */
+  stageCounts?: Record<string, number>;
   startedAt: number;
   endedAt?: number;
 }
@@ -41,6 +48,10 @@ export interface JobSnapshot {
   processedFiles: number;
   failedFiles: number;
   errorMessage: string | null;
+  /** Current pipeline stage (null when not yet running / not an ingest job). */
+  stage: string | null;
+  /** Per-stage reached-count (e.g. { metadata: 45, vision:dense: 43, ... }). */
+  stageCounts: Record<string, number>;
 }
 
 /** Job statuses past which an activity is settled and no longer driven. */
@@ -78,18 +89,25 @@ export function applyJobToActivity(
       message: ok
         ? undefined
         : job.errorMessage ?? (job.status === "cancelled" ? "cancelled" : "failed"),
+      // Clear the live stage once settled — there is no service still working.
+      stage: null,
+      stageCounts: job.stageCounts,
       endedAt: now,
     };
   }
 
-  // Still in flight: surface latest counts and promote pending → running.
+  // Still in flight: surface latest counts + the active stage and promote
+  // pending → running. The stage tells the dock which microservice is busy now.
+  // Treat a missing stage (undefined) and an explicit null as equal so an
+  // unchanged poll still returns the SAME reference (lets React bail).
   const same =
     activity.status === "running" &&
     activity.progress?.processed === progress.processed &&
     activity.progress?.total === progress.total &&
-    activity.progress?.failed === progress.failed;
+    activity.progress?.failed === progress.failed &&
+    (activity.stage ?? null) === (job.stage ?? null);
   if (same) return activity;
-  return { ...activity, status: "running", progress };
+  return { ...activity, status: "running", progress, stage: job.stage, stageCounts: job.stageCounts };
 }
 
 /**
@@ -116,10 +134,23 @@ export function hasActiveJob(activities: Activity[]): boolean {
   return activities.some((a) => Boolean(a.jobId) && !isTerminal(a.status));
 }
 
+/** Coerce an opaque value into a `{ stage: count }` map, dropping bad entries. */
+function stageCountMap(v: unknown): Record<string, number> {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof n === "number" && Number.isFinite(n)) out[k] = n;
+  }
+  return out;
+}
+
 /** Normalize one opaque `/api/library/jobs` row into a {@link JobSnapshot}. */
 export function normalizeJob(raw: unknown): JobSnapshot {
   const o = (raw ?? {}) as Record<string, unknown>;
   const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  // Tolerate both the camelCase shape the /api/library/jobs route emits and the
+  // raw snake_case the ingest service returns.
+  const stage = o.stage ?? o.current_stage;
   return {
     id: typeof o.id === "string" ? o.id : "",
     status: typeof o.status === "string" ? o.status : "unknown",
@@ -127,6 +158,8 @@ export function normalizeJob(raw: unknown): JobSnapshot {
     processedFiles: num(o.processedFiles),
     failedFiles: num(o.failedFiles),
     errorMessage: typeof o.errorMessage === "string" ? o.errorMessage : null,
+    stage: typeof stage === "string" ? stage : null,
+    stageCounts: stageCountMap(o.stageCounts ?? o.stage_counts),
   };
 }
 

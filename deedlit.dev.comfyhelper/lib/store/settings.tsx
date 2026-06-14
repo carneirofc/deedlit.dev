@@ -67,6 +67,14 @@ export interface LibrarySettings {
   defaultFavoritesOnly: boolean;
   /** Default minimum score for semantic / similar / by-image searches. */
   defaultMinScore: number;
+
+  // --- Slideshow (fullscreen viewer) ---
+  /** Seconds each image is shown before the slideshow auto-advances. */
+  slideshowInterval: number;
+  /** Loop back to the first image after the last one. */
+  slideshowLoop: boolean;
+  /** Advance to a random image instead of the next in order. */
+  slideshowShuffle: boolean;
 }
 
 export const DEFAULT_SETTINGS: LibrarySettings = {
@@ -95,6 +103,10 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   defaultMinRating: 0,
   defaultFavoritesOnly: false,
   defaultMinScore: 0,
+
+  slideshowInterval: 5,
+  slideshowLoop: true,
+  slideshowShuffle: false,
 };
 
 const clamp = (value: number, min: number, max: number): number =>
@@ -143,6 +155,10 @@ function mergeSettings(raw: unknown): LibrarySettings {
     defaultMinRating: num("defaultMinRating", 0, 5),
     defaultFavoritesOnly: bool("defaultFavoritesOnly"),
     defaultMinScore: num("defaultMinScore", 0, 1),
+
+    slideshowInterval: num("slideshowInterval", 1, 60),
+    slideshowLoop: bool("slideshowLoop"),
+    slideshowShuffle: bool("slideshowShuffle"),
   };
 }
 

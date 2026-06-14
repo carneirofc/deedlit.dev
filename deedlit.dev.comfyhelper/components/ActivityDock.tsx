@@ -75,6 +75,15 @@ function ActivityRow({ a, onDismiss }: { a: Activity; onDismiss: (id: string) =>
         <span className="min-w-0 flex-1 truncate text-ui-xs text-ui-ink" title={a.label}>
           {a.label}
         </span>
+        {active && a.stage && (
+          <span
+            className="shrink-0 rounded-full bg-sky-500/10 px-1.5 py-0.5 text-ui-2xs font-medium text-sky-500"
+            title="active pipeline stage — the microservice working now"
+            data-testid="activity-stage"
+          >
+            {a.stage}
+          </span>
+        )}
         <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-ui-2xs font-medium ${statusChip(a.status)}`}>
           {statusLabel(a.status)}
         </span>

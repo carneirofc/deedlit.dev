@@ -28,6 +28,23 @@ interface HealthPayload {
   warnings: string[];
 }
 
+/**
+ * One service's live work, from /api/library/activity (the gateway aggregate).
+ * `per_min` is the trailing-60s completion rate; `busy` is `inflight > 0`.
+ */
+interface ServiceActivity {
+  name: string;
+  inflight: number;
+  per_min: number;
+  busy: boolean;
+  last_op: string | null;
+  reachable: boolean;
+}
+
+interface ActivityPayload {
+  services: ServiceActivity[];
+}
+
 // ---------------------------------------------------------------------------
 // Presentation helpers.
 // ---------------------------------------------------------------------------
@@ -41,6 +58,7 @@ const COMPONENT_BLURB: Record<string, string> = {
   ingest: "Ingest & maintenance worker",
   vision: "CLIP + SPLADE embedding service",
   metadata: "PNG metadata extraction",
+  labelagent: "AI image labeling / description",
 };
 
 function statusDot(status: ComponentStatus): string {
@@ -83,14 +101,26 @@ function relativeTime(iso: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * System-status board: one card per backend component (gateway, catalog,
- * search, graph, ingest, vision, metadata) with an online/degraded/offline
- * indicator and per-component dependency readiness (Postgres, RustFS, Qdrant,
- * Neo4j, models). Polls /api/library/health every `pollMs`.
+ * System status & activity board: one card per backend component (gateway,
+ * catalog, search, graph, ingest, vision, metadata) with an online/degraded/
+ * offline indicator + per-component dependency readiness AND a live "what is it
+ * doing right now" line (busy/idle, in-flight count, throughput, current op).
+ *
+ * Two polls on different cadences: health every `pollMs` (default 5s, drives
+ * status + dependencies) and activity every `activityPollMs` (default 2s, the
+ * fast "who's working now" signal). Activity degrades silently — when it is
+ * unavailable the board still shows health.
  */
-export function ServiceStatusBoard({ pollMs = 5000 }: { pollMs?: number }) {
+export function ServiceStatusBoard({
+  pollMs = 5000,
+  activityPollMs = 2000,
+}: {
+  pollMs?: number;
+  activityPollMs?: number;
+}) {
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [activity, setActivity] = useState<Record<string, ServiceActivity>>({});
 
   const refresh = useCallback(() => {
     fetch("/api/library/health")
@@ -106,9 +136,31 @@ export function ServiceStatusBoard({ pollMs = 5000 }: { pollMs?: number }) {
     return () => clearInterval(id);
   }, [refresh, pollMs]);
 
+  // Fast, independent poll for the live per-service work line. Keyed by service
+  // name so a card can look up its own activity; failures keep the last snapshot.
+  useEffect(() => {
+    let cancelled = false;
+    const pollActivity = () => {
+      fetch("/api/library/activity", { cache: "no-store" })
+        .then((r) => r.json())
+        .then((j: ActivityPayload) => {
+          if (cancelled || !Array.isArray(j?.services)) return;
+          setActivity(Object.fromEntries(j.services.map((s) => [s.name, s])));
+        })
+        .catch(() => {});
+    };
+    pollActivity();
+    const id = setInterval(pollActivity, activityPollMs);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [activityPollMs]);
+
   const overall: ComponentStatus = health ? health.status : "down";
   const components = health?.components ?? [];
   const offline = components.filter((c) => c.status !== "ok").length;
+  const totalInflight = Object.values(activity).reduce((n, a) => n + (a.inflight || 0), 0);
 
   return (
     <section
@@ -117,7 +169,7 @@ export function ServiceStatusBoard({ pollMs = 5000 }: { pollMs?: number }) {
     >
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <h2 className="text-ui-sm font-semibold text-ui-ink-title">System status</h2>
+          <h2 className="text-ui-sm font-semibold text-ui-ink-title">System status &amp; activity</h2>
           <span
             className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-ui-2xs font-medium ${
               loaded ? statusChip(overall) : "bg-ui-bg text-ui-ink-muted"
@@ -131,6 +183,15 @@ export function ServiceStatusBoard({ pollMs = 5000 }: { pollMs?: number }) {
                 ? "all systems online"
                 : `${offline} component${offline === 1 ? " needs" : "s need"} attention`}
           </span>
+          {totalInflight > 0 && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full bg-sky-500/15 px-2 py-0.5 text-ui-2xs font-medium text-sky-500"
+              data-testid="status-inflight"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-500" />
+              {totalInflight} in-flight
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2 text-ui-2xs text-ui-ink-muted">
           {health?.checkedAt && <span>updated {relativeTime(health.checkedAt)}</span>}
@@ -189,6 +250,38 @@ export function ServiceStatusBoard({ pollMs = 5000 }: { pollMs?: number }) {
                       {d.name}
                     </span>
                   ))}
+                </div>
+              )}
+
+              {/* Live work line: what this service is doing right now. */}
+              {activity[c.name] && (
+                <div
+                  className="flex items-center gap-2 border-t border-ui-border/40 pt-2 text-ui-2xs"
+                  data-testid={`activity-${c.name}`}
+                >
+                  <span
+                    className={`inline-flex shrink-0 items-center gap-1 font-medium ${
+                      activity[c.name].busy ? "text-sky-500" : "text-ui-ink-muted"
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        activity[c.name].busy ? "animate-pulse bg-sky-500" : "bg-ui-ink-muted/50"
+                      }`}
+                    />
+                    {activity[c.name].busy ? "busy" : "idle"}
+                  </span>
+                  <span className="shrink-0 text-ui-ink-muted">
+                    {activity[c.name].inflight} in-flight · {activity[c.name].per_min}/min
+                  </span>
+                  {activity[c.name].busy && activity[c.name].last_op && (
+                    <span
+                      className="min-w-0 flex-1 truncate text-right text-ui-ink-muted"
+                      title={activity[c.name].last_op ?? undefined}
+                    >
+                      {activity[c.name].last_op}
+                    </span>
+                  )}
                 </div>
               )}
             </div>

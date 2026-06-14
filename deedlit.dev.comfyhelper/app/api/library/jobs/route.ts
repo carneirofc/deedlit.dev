@@ -12,6 +12,16 @@ function strOrNull(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
 
+/** Coerce an opaque value into a `{ stage: count }` map (drops non-numeric). */
+function stageCounts(v: unknown): Record<string, number> {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [k, n] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof n === "number" && Number.isFinite(n)) out[k] = n;
+  }
+  return out;
+}
+
 /**
  * List ingest/maintenance jobs for the dashboard. Proxies the gateway GET /jobs
  * (-> deedlit.ingest) and normalizes each opaque job into the fields the UI
@@ -31,6 +41,9 @@ export async function GET() {
       startedAt: strOrNull(j.startedAt ?? j.started_at),
       finishedAt: strOrNull(j.finishedAt ?? j.finished_at),
       createdAt: strOrNull(j.createdAt ?? j.created_at) ?? "",
+      // Live pipeline stage + per-stage staircase (which service is active now).
+      stage: strOrNull(j.currentStage ?? j.current_stage ?? j.stage),
+      stageCounts: stageCounts(j.stageCounts ?? j.stage_counts),
     }));
     return jsonOk({ jobs });
   });

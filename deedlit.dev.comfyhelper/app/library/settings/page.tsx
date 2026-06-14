@@ -194,13 +194,13 @@ export default function SettingsPage() {
           control={<NumberSlider {...slide("pageSize")} min={10} max={200} step={10} />}
         />
         <Row
-          label="Default search tab"
+          label="Open search on"
+          hint="Text/tag search runs a hybrid keyword + semantic match; “By image” opens the reverse-image dropzone."
           control={
             <Segmented
               {...seg<LibrarySettings["defaultMode"]>("defaultMode")}
               options={[
-                { value: "browse", label: "Browse" },
-                { value: "semantic", label: "Semantic" },
+                { value: "browse", label: "Search" },
                 { value: "image", label: "By image" },
               ]}
             />
@@ -310,6 +310,36 @@ export default function SettingsPage() {
         <Row
           label="Related tags count"
           control={<NumberSlider {...slide("relatedTagsCount")} min={0} max={40} step={2} />}
+        />
+      </Section>
+
+      {/* Slideshow */}
+      <Section
+        title="Slideshow"
+        hint="The fullscreen viewer opened by clicking an image or the Slideshow button."
+      >
+        <Row
+          label="Auto-advance interval"
+          hint="Seconds each image is shown while the slideshow is playing."
+          control={
+            <NumberSlider
+              {...slide("slideshowInterval")}
+              min={1}
+              max={60}
+              step={1}
+              format={(v) => `${v}s`}
+            />
+          }
+        />
+        <Row
+          label="Loop"
+          hint="Return to the first image after the last."
+          control={<Toggle {...bool("slideshowLoop")} />}
+        />
+        <Row
+          label="Shuffle"
+          hint="Jump to a random image instead of the next in order."
+          control={<Toggle {...bool("slideshowShuffle")} />}
         />
       </Section>
 

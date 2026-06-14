@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
 import { useActivity } from "@/lib/store/activity";
@@ -82,6 +82,7 @@ const chip = "rounded-full bg-ui-bg px-2 py-0.5 text-ui-2xs text-ui-ink-muted";
 export default function ImageDetailPage() {
   const params = useParams<{ imageId: string }>();
   const imageId = params.imageId;
+  const router = useRouter();
   const { settings, hydrated } = useSettings();
   const { track } = useActivity();
 
@@ -99,6 +100,10 @@ export default function ImageDetailPage() {
   // autoLoadSuggestions is on, otherwise after the user clicks the button.
   const [suggestRequested, setSuggestRequested] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
+
+  // Two-step "remove from library" confirmation.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Detail load — independent of settings so the page renders immediately.
   const load = useCallback(async () => {
@@ -225,6 +230,30 @@ export default function ImageDetailPage() {
     }
   }, [detail, imageId, track]);
 
+  // Remove the image's indexation (catalog record + search vector + graph
+  // node) via the gateway. The source file on disk is NOT touched. On success
+  // we leave the now-deleted detail page and return to the library.
+  const removeFromLibrary = useCallback(async () => {
+    setDeleting(true);
+    try {
+      await track("Remove from library", async () => {
+        const res = await fetch(`/api/library/images/${imageId}`, { method: "DELETE" });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j.error ?? "Failed to remove image");
+        }
+        return res.json();
+      });
+      router.push("/library");
+      router.refresh();
+    } catch {
+      // Surfaced by the activity dock/toast; re-enable the controls so the user
+      // can retry or cancel.
+      setDeleting(false);
+      setConfirmingDelete(false);
+    }
+  }, [imageId, track, router]);
+
   const loadDebug = useCallback(async () => {
     setDebugOpen((open) => !open);
     if (debug || debugLoading) return; // fetch once
@@ -273,12 +302,46 @@ export default function ImageDetailPage() {
                 {detail.favorite ? "★" : "☆"}
               </button>
             </div>
-            <dl className="mt-2 grid grid-cols-2 gap-1 text-ui-xs text-ui-ink-muted">
-              <dt>Model</dt><dd className="text-ui-ink">{detail.model ?? "—"}</dd>
-              <dt>Family</dt><dd className="text-ui-ink">{detail.modelFamily ?? "—"}</dd>
-              <dt>Source</dt><dd className="text-ui-ink">{detail.sourceTool ?? "—"}</dd>
-              <dt>Size</dt><dd className="text-ui-ink">{detail.width}×{detail.height}</dd>
+            <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-ui-xs text-ui-ink-muted">
+              <dt>Model</dt><dd className="break-words text-ui-ink">{detail.model ?? "—"}</dd>
+              <dt>Family</dt><dd className="break-words text-ui-ink">{detail.modelFamily ?? "—"}</dd>
+              <dt>Source</dt><dd className="break-words text-ui-ink">{detail.sourceTool ?? "—"}</dd>
+              <dt>Size</dt><dd className="break-words text-ui-ink">{detail.width}×{detail.height}</dd>
             </dl>
+
+            <div className="mt-3 border-t border-ui-border/40 pt-3">
+              {!confirmingDelete ? (
+                <button
+                  onClick={() => setConfirmingDelete(true)}
+                  className="text-ui-xs text-rose-400 transition hover:text-rose-300"
+                >
+                  Remove from library
+                </button>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <p className="text-ui-2xs text-ui-ink-muted">
+                    Remove this image&rsquo;s catalog record, search vector and graph
+                    links? The original file on disk is not deleted.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={removeFromLibrary}
+                      disabled={deleting}
+                      className="rounded-lg bg-rose-500/90 px-2.5 py-1 text-ui-xs font-medium text-white transition hover:bg-rose-500 disabled:opacity-60"
+                    >
+                      {deleting ? "Removing…" : "Remove"}
+                    </button>
+                    <button
+                      onClick={() => setConfirmingDelete(false)}
+                      disabled={deleting}
+                      className="rounded-lg border border-ui-border/70 px-2.5 py-1 text-ui-xs transition hover:bg-ui-bg-soft disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           {settings.showPrompt && detail.prompt && (
@@ -340,13 +403,13 @@ export default function ImageDetailPage() {
           {settings.showGenerationParams && detail.generationParams && (
             <div className={panel}>
               <h2 className="mb-2 text-ui-sm font-semibold text-ui-ink-title">Generation</h2>
-              <dl className="grid grid-cols-2 gap-1 text-ui-xs text-ui-ink-muted">
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-ui-xs text-ui-ink-muted">
                 {Object.entries(detail.generationParams)
                   .filter(([, v]) => v != null)
                   .map(([k, v]) => (
                     <div key={k} className="contents">
-                      <dt>{k}</dt>
-                      <dd className="text-ui-ink">{String(v)}</dd>
+                      <dt className="break-words">{k}</dt>
+                      <dd className="break-words text-ui-ink">{String(v)}</dd>
                     </div>
                   ))}
               </dl>

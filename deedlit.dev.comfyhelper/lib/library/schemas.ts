@@ -91,6 +91,10 @@ export const ImageDetailSchema = z.object({
 export type ImageDetail = z.infer<typeof ImageDetailSchema>;
 
 // Compact result row used in search / similarity responses.
+// AI content-safety class (deedlit.labelagent). Drives the library safety filter.
+export const SafetySchema = z.enum(["sfw", "nsfw", "explicit"]);
+export type Safety = z.infer<typeof SafetySchema>;
+
 export const CompactResultSchema = z.object({
   imageId: z.string(),
   score: z.number().nullable().optional(),
@@ -100,6 +104,7 @@ export const CompactResultSchema = z.object({
   model: z.string().nullable().optional(),
   checkpoint: z.string().nullable().optional(),
   rating: z.number().nullable().optional(),
+  safety: SafetySchema.nullable().optional(),
 });
 export type CompactResult = z.infer<typeof CompactResultSchema>;
 
@@ -116,6 +121,8 @@ export const SearchFiltersSchema = z.object({
   ratingGte: z.number().int().min(0).max(5).optional(),
   favorite: z.boolean().optional(),
   sourceTool: z.string().optional(),
+  // Content-safety classes to include. Omit/empty = no filter (show all).
+  safety: z.array(SafetySchema).optional(),
 });
 export type SearchFilters = z.infer<typeof SearchFiltersSchema>;
 

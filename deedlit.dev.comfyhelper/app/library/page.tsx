@@ -1,9 +1,9 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";
+import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
 import type { GraphScope } from "@/lib/library/schemas";
 import {
@@ -12,6 +12,14 @@ import {
   useSettings,
   type ViewMode,
 } from "@/lib/store/settings";
+
+type SafetyClass = "sfw" | "nsfw" | "explicit";
+const SAFETY_CLASSES: SafetyClass[] = ["sfw", "nsfw", "explicit"];
+const SAFETY_LABEL: Record<SafetyClass, string> = {
+  sfw: "SFW",
+  nsfw: "NSFW",
+  explicit: "Explicit",
+};
 
 interface CompactResult {
   imageId: string;
@@ -22,6 +30,7 @@ interface CompactResult {
   model?: string | null;
   checkpoint?: string | null;
   rating?: number | null;
+  safety?: SafetyClass | null;
 }
 
 interface JobSummary {
@@ -65,7 +74,7 @@ export default function LibraryPage() {
   const { settings, hydrated, setKey } = useSettings();
 
   // Browse / filter state — seeded from saved settings (defaults until hydrated).
-  const [mode, setMode] = useState<BrowseMode>(settings.defaultMode);
+  const [mode, setMode] = useState<BrowseMode>("browse");
   const [query, setQuery] = useState("");
   const [tags, setTags] = useState("");
   const [excludeTags, setExcludeTags] = useState("");
@@ -75,12 +84,16 @@ export default function LibraryPage() {
   const [sourceTool, setSourceTool] = useState("");
   const [favorites, setFavorites] = useState(settings.defaultFavoritesOnly);
   const [minRating, setMinRating] = useState(settings.defaultMinRating);
+  // Content-safety multi-select: which classes to SHOW. All on = no filter.
+  const [safety, setSafety] = useState<SafetyClass[]>(SAFETY_CLASSES);
   const [limit, setLimit] = useState(settings.pageSize);
   const [minScore, setMinScore] = useState(settings.defaultMinScore);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [similarRef, setSimilarRef] = useState<SimilarRef | null>(null);
   const [graphScope, setGraphScope] = useState<GraphScope | null>(null);
 
+  // Reverse-image search panel toggle (the inline dropzone).
+  const [showImageSearch, setShowImageSearch] = useState(false);
   // External (pasted / uploaded) image to search against — never persisted.
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
@@ -94,6 +107,10 @@ export default function LibraryPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Fullscreen viewer / slideshow
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const [lightboxAutoPlay, setLightboxAutoPlay] = useState(false);
+
   // System
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
@@ -104,18 +121,21 @@ export default function LibraryPage() {
   // even when called from callbacks that close over an older render.
   const filtersRef = useRef({
     mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
-    favorites, minRating, limit, minScore, similarRef, imageFile, graphScope,
+    favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
   });
   useEffect(() => {
     filtersRef.current = {
       mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
-      favorites, minRating, limit, minScore, similarRef, imageFile, graphScope,
+      favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
     };
   });
 
   const doFetch = useCallback(
     async (append: boolean, overrides?: Partial<typeof filtersRef.current>) => {
       const s = { ...filtersRef.current, ...overrides };
+
+      // A fresh search invalidates the open viewer (its indices no longer map).
+      if (!append) setLightboxIndex(null);
 
       // Image mode with no image yet: nothing to search.
       if (s.mode === "image" && !s.imageFile) {
@@ -138,6 +158,12 @@ export default function LibraryPage() {
         sourceTool: s.sourceTool.trim() || undefined,
         favorite: s.favorites || undefined,
         ratingGte: s.minRating > 0 ? s.minRating : undefined,
+        // Only send a safety filter when a strict subset is selected; all (or
+        // none) selected means "no filter" so unclassified images stay visible.
+        safety:
+          s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length
+            ? s.safety
+            : undefined,
       };
 
       try {
@@ -166,16 +192,9 @@ export default function LibraryPage() {
               ? `Visual similarity · ${j.provider}`
               : "Visual similarity · local color/layout features (CLIP not configured)",
           );
-        } else if (s.mode === "semantic") {
-          const r = await fetch("/api/library/search/semantic", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ query: s.query || "image", filters, limit: pageSize, minScore: s.minScore }),
-          });
-          const j = await r.json();
-          if (!r.ok) throw new Error(j.error ?? "Semantic search failed");
-          fresh = j.results ?? [];
         } else {
+          // Unified text / filter search. The gateway encodes the text query into
+          // dense+sparse vectors, so this is the hybrid "browse + semantic" path.
           const r = await fetch("/api/library/search", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -210,8 +229,25 @@ export default function LibraryPage() {
     [],
   );
 
-  const search = useCallback(() => doFetch(false), [doFetch]);
+  // Run a plain text / filter search, dropping any active image / similar query.
+  const search = useCallback(() => {
+    setSimilarRef(null);
+    setImageFile(null);
+    setImageNote(null);
+    setImagePreview((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setMode("browse");
+    doFetch(false, { mode: "browse", similarRef: null, imageFile: null });
+  }, [doFetch]);
+
   const loadMore = useCallback(() => doFetch(true), [doFetch]);
+
+  const openLightbox = useCallback((index: number, autoplay = false) => {
+    setLightboxAutoPlay(autoplay);
+    setLightboxIndex(index);
+  }, []);
 
   const findSimilar = useCallback(
     (id: string, thumbUrl: string, summary: string) => {
@@ -233,16 +269,18 @@ export default function LibraryPage() {
   const applyExternalImage = useCallback(
     (file: File) => {
       setImageFile(file);
+      setSimilarRef(null);
       setImagePreview((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return URL.createObjectURL(file);
       });
       setMode("image");
-      doFetch(false, { mode: "image", imageFile: file });
+      doFetch(false, { mode: "image", imageFile: file, similarRef: null });
     },
     [doFetch],
   );
 
+  // Drop the image query and return to text/filter browsing.
   const clearImage = useCallback(() => {
     setImageFile(null);
     setImageNote(null);
@@ -250,13 +288,13 @@ export default function LibraryPage() {
       if (prev) URL.revokeObjectURL(prev);
       return null;
     });
-    setResults([]);
-    setHasMore(false);
-  }, []);
+    setMode("browse");
+    doFetch(false, { mode: "browse", imageFile: null });
+  }, [doFetch]);
 
-  // Global clipboard paste while in image mode — paste a screenshot anywhere.
+  // Global clipboard paste while the image panel is open — paste a screenshot.
   useEffect(() => {
-    if (mode !== "image") return;
+    if (!showImageSearch && mode !== "image") return;
     const onPaste = (e: ClipboardEvent) => {
       const item = Array.from(e.clipboardData?.items ?? []).find((i) => i.type.startsWith("image/"));
       const file = item?.getAsFile();
@@ -267,7 +305,7 @@ export default function LibraryPage() {
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [mode, applyExternalImage]);
+  }, [showImageSearch, mode, applyExternalImage]);
 
   // Health + job polling (independent of saved settings).
   useEffect(() => {
@@ -298,13 +336,12 @@ export default function LibraryPage() {
     const qpTags = sp.get("tags") ?? "";
     const qpQuery = sp.get("q") ?? "";
     const qpMode = sp.get("mode");
-    const initialMode: BrowseMode =
-      qpMode === "browse" || qpMode === "semantic" || qpMode === "image"
-        ? qpMode
-        : settings.defaultMode;
+    const wantImage = qpMode === "image" || (!qpMode && settings.defaultMode === "image");
+    const initialMode: BrowseMode = wantImage ? "image" : "browse";
 
     if (qpTags) setTags(qpTags);
     if (qpQuery) setQuery(qpQuery);
+    if (wantImage) setShowImageSearch(true);
     setMode(initialMode);
     setFavorites(settings.defaultFavoritesOnly);
     setMinRating(settings.defaultMinRating);
@@ -353,11 +390,7 @@ export default function LibraryPage() {
     }
   };
 
-  const tabs: Array<{ id: BrowseMode; label: string }> = [
-    { id: "browse", label: "Browse / Filter" },
-    { id: "semantic", label: "Semantic" },
-    { id: "image", label: "By image" },
-  ];
+  const imagePanelOpen = showImageSearch || mode === "image";
 
   return (
     <div className="mx-auto flex max-w-[2000px] flex-col gap-6">
@@ -372,6 +405,17 @@ export default function LibraryPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => openLightbox(0, true)}
+            disabled={results.length === 0}
+            className="flex items-center gap-1.5 rounded-lg border border-ui-border/60 bg-ui-bg px-2.5 py-1.5 text-ui-2xs font-medium text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan disabled:opacity-40"
+            title="Play all results as a slideshow"
+          >
+            <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+            Slideshow
+          </button>
           <div className="flex gap-0.5 rounded-lg border border-ui-border/60 bg-ui-bg p-0.5" role="group" aria-label="Result layout">
             {([
               ["grid", "Grid"],
@@ -404,220 +448,252 @@ export default function LibraryPage() {
         </div>
       </header>
 
-      {/* Search & filter panel */}
+      {/* Unified search & filter panel */}
       <section className={cls.card}>
-        {/* Mode tabs */}
-        <div className="mb-3 flex flex-wrap gap-2">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              className={`${cls.btn} ${mode === t.id ? cls.btnActive : ""}`}
-              onClick={() => setMode(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
-          {similarRef && (
-            <button
-              className={`${cls.btn} ${mode === "similar" ? cls.btnActive : ""}`}
-              onClick={() => setMode("similar")}
-            >
-              <span className="flex items-center gap-1.5">
-                Similar to
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={similarRef.thumbUrl} alt="" className="h-4 w-4 rounded object-cover" />
-              </span>
-            </button>
-          )}
-        </div>
-
-        {/* Controls */}
-        {mode === "similar" && similarRef ? (
-          <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-3">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={similarRef.thumbUrl}
-                alt=""
-                className="h-16 w-16 shrink-0 rounded-lg border border-ui-border/60 object-cover"
-              />
-              <div className="min-w-0 flex-1">
-                <p className="text-ui-sm font-medium text-ui-ink-title">Finding similar images</p>
-                <p className="truncate text-ui-xs text-ui-ink-muted">{similarRef.summary}</p>
-              </div>
-              <button className={cls.btn} onClick={clearSimilar}>Clear</button>
-            </div>
-            <GraphFilterPanel
-              value={graphScope}
-              relatedImageId={similarRef.id}
-              onChange={(scope) => { setGraphScope(scope); doFetch(false, { graphScope: scope }); }}
-            />
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {/* Reverse-image dropzone */}
-            {mode === "image" && (
-              <ImageDropzone
-                preview={imagePreview}
-                note={imageNote}
-                onFile={applyExternalImage}
-                onClear={clearImage}
-              />
-            )}
-
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-              {mode !== "image" && (
-                <input
-                  className="w-full rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-2 text-ui-sm outline-none focus:border-accent-cyan"
-                  placeholder={mode === "semantic" ? "natural language query…" : "prompt / filename…"}
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && search()}
-                />
-              )}
-              <input
-                className={cls.input}
-                placeholder="tags, comma-separated"
-                value={tags}
-                onChange={(e) => setTags(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && search()}
-              />
-              <input
-                className={cls.input}
-                placeholder="model family (sdxl…)"
-                value={modelFamily}
-                onChange={(e) => setModelFamily(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && search()}
-              />
-              <div className="flex items-center gap-3">
-                <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
-                  <input
-                    type="checkbox"
-                    checked={favorites}
-                    onChange={(e) => setFavorites(e.target.checked)}
-                    className="rounded"
-                  />
-                  Favorites
-                </label>
-                <select
-                  className="rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-2 text-ui-xs outline-none"
-                  value={minRating}
-                  onChange={(e) => setMinRating(Number(e.target.value))}
-                >
-                  <option value={0}>Any rating</option>
-                  <option value={1}>★+</option>
-                  <option value={2}>★★+</option>
-                  <option value={3}>★★★+</option>
-                  <option value={4}>★★★★+</option>
-                  <option value={5}>★★★★★</option>
-                </select>
-              </div>
-            </div>
-
-            {(mode === "browse" || mode === "image") && (
-              <GraphFilterPanel
-                value={graphScope}
-                onChange={(scope) => { setGraphScope(scope); doFetch(false, { graphScope: scope }); }}
-              />
-            )}
-
-            {/* Advanced filters */}
-            <button
-              className="flex items-center gap-1.5 self-start text-ui-xs font-medium text-ui-ink-muted transition hover:text-ui-ink"
-              onClick={() => setShowAdvanced((v) => !v)}
-            >
+        <div className="flex flex-col gap-3">
+          {/* Search bar */}
+          <div className="flex flex-wrap items-stretch gap-2">
+            <div className="relative min-w-[14rem] flex-1">
               <svg
                 aria-hidden="true"
                 viewBox="0 0 24 24"
-                className={`h-3.5 w-3.5 transition-transform ${showAdvanced ? "rotate-90" : ""}`}
+                className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ui-ink-muted"
                 fill="none"
                 stroke="currentColor"
                 strokeWidth="2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
               >
-                <path d="m9 18 6-6-6-6" />
+                <circle cx="11" cy="11" r="7" />
+                <path d="m21 21-4.3-4.3" />
               </svg>
-              Advanced filters
+              <input
+                className="w-full rounded-lg border border-ui-border/70 bg-ui-bg py-2 pl-9 pr-3 text-ui-sm outline-none focus:border-accent-cyan"
+                placeholder="Search prompts, tags, filenames — or describe what you want…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && search()}
+              />
+            </div>
+            <button
+              className={`${cls.btn} flex items-center gap-1.5 ${imagePanelOpen ? cls.btnActive : ""}`}
+              onClick={() => {
+                if (imagePanelOpen) {
+                  setShowImageSearch(false);
+                  if (mode === "image") clearImage();
+                } else {
+                  setShowImageSearch(true);
+                }
+              }}
+              aria-pressed={imagePanelOpen}
+              title="Search by image"
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14.5 4h-5L8 6H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-4l-1.5-2z" />
+                <circle cx="12" cy="13" r="3.5" />
+              </svg>
+              <span className="hidden sm:inline">By image</span>
             </button>
-
-            {showAdvanced && (
-              <div className="grid gap-3 rounded-lg border border-ui-border/40 bg-ui-bg/40 p-3 sm:grid-cols-2 lg:grid-cols-3">
-                <label className={cls.label}>
-                  Exclude tags
-                  <input
-                    className={cls.input}
-                    placeholder="comma-separated"
-                    value={excludeTags}
-                    onChange={(e) => setExcludeTags(e.target.value)}
-                  />
-                </label>
-                <label className={cls.label}>
-                  Checkpoint
-                  <input
-                    className={cls.input}
-                    placeholder="checkpoint name…"
-                    value={checkpoint}
-                    onChange={(e) => setCheckpoint(e.target.value)}
-                  />
-                </label>
-                <label className={cls.label}>
-                  LoRAs
-                  <input
-                    className={cls.input}
-                    placeholder="comma-separated"
-                    value={loras}
-                    onChange={(e) => setLoras(e.target.value)}
-                  />
-                </label>
-                <label className={cls.label}>
-                  Source tool
-                  <input
-                    className={cls.input}
-                    placeholder="comfyui, a1111…"
-                    value={sourceTool}
-                    onChange={(e) => setSourceTool(e.target.value)}
-                  />
-                </label>
-                <label className={cls.label}>
-                  Results: {limit}
-                  <input
-                    type="range"
-                    min={10}
-                    max={200}
-                    step={10}
-                    value={limit}
-                    onChange={(e) => setLimit(Number(e.target.value))}
-                    className="accent-accent-cyan"
-                  />
-                </label>
-                <label className={cls.label}>
-                  Min similarity: {minScore.toFixed(2)}
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    value={minScore}
-                    onChange={(e) => setMinScore(Number(e.target.value))}
-                    className="accent-accent-cyan"
-                  />
-                  <span className="text-ui-2xs normal-case tracking-normal text-ui-ink-muted/70">
-                    applies to semantic / similar / by-image
-                  </span>
-                </label>
-              </div>
-            )}
-          </div>
-        )}
-
-        {mode !== "image" && (
-          <div className="mt-3">
             <button className={cls.btn} onClick={search} disabled={loading}>
               {loading ? "Loading…" : "Search"}
             </button>
           </div>
-        )}
+
+          {/* Inline reverse-image dropzone */}
+          {imagePanelOpen && (
+            <ImageDropzone
+              preview={imagePreview}
+              note={imageNote}
+              onFile={applyExternalImage}
+              onClear={clearImage}
+            />
+          )}
+
+          {/* Active "similar to" query banner */}
+          {similarRef && (
+            <div className="flex items-center gap-3 rounded-lg border border-accent-cyan/40 bg-accent-cyan/5 p-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={similarRef.thumbUrl}
+                alt=""
+                className="h-12 w-12 shrink-0 rounded-lg border border-ui-border/60 object-cover"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-ui-xs font-medium text-accent-cyan">Showing images similar to</p>
+                <p className="truncate text-ui-xs text-ui-ink-muted">{similarRef.summary}</p>
+              </div>
+              <button
+                className="rounded-lg border border-ui-border/60 px-2 py-1 text-ui-xs text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan"
+                onClick={clearSimilar}
+              >
+                Clear
+              </button>
+            </div>
+          )}
+
+          {/* Filters */}
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <input
+              className={cls.input}
+              placeholder="tags, comma-separated"
+              value={tags}
+              onChange={(e) => setTags(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && search()}
+            />
+            <input
+              className={cls.input}
+              placeholder="model family (sdxl…)"
+              value={modelFamily}
+              onChange={(e) => setModelFamily(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && search()}
+            />
+            <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
+              <input
+                type="checkbox"
+                checked={favorites}
+                onChange={(e) => setFavorites(e.target.checked)}
+                className="rounded"
+              />
+              Favorites only
+            </label>
+            <select
+              className="rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-2 text-ui-xs outline-none focus:border-accent-cyan"
+              value={minRating}
+              onChange={(e) => setMinRating(Number(e.target.value))}
+            >
+              <option value={0}>Any rating</option>
+              <option value={1}>★+</option>
+              <option value={2}>★★+</option>
+              <option value={3}>★★★+</option>
+              <option value={4}>★★★★+</option>
+              <option value={5}>★★★★★</option>
+            </select>
+          </div>
+
+          {/* Content-safety filter — multi-select chips. All on = no filter
+              (everything, incl. unclassified); a subset shows only those classes. */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted">
+              Safety
+            </span>
+            {SAFETY_CLASSES.map((c) => {
+              const on = safety.includes(c);
+              return (
+                <button
+                  key={c}
+                  type="button"
+                  aria-pressed={on}
+                  onClick={() => {
+                    const next = on ? safety.filter((x) => x !== c) : [...safety, c];
+                    setSafety(next);
+                    doFetch(false, { safety: next });
+                  }}
+                  className={`rounded-full border px-2.5 py-1 text-ui-2xs font-medium transition ${
+                    on
+                      ? "border-accent-cyan bg-accent-cyan/15 text-accent-cyan"
+                      : "border-ui-border/60 text-ui-ink-muted hover:text-ui-ink"
+                  }`}
+                >
+                  {SAFETY_LABEL[c]}
+                </button>
+              );
+            })}
+          </div>
+
+          <GraphFilterPanel
+            value={graphScope}
+            relatedImageId={similarRef?.id}
+            onChange={(scope) => { setGraphScope(scope); doFetch(false, { graphScope: scope }); }}
+          />
+
+          {/* Advanced filters */}
+          <button
+            className="flex items-center gap-1.5 self-start text-ui-xs font-medium text-ui-ink-muted transition hover:text-ui-ink"
+            onClick={() => setShowAdvanced((v) => !v)}
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className={`h-3.5 w-3.5 transition-transform ${showAdvanced ? "rotate-90" : ""}`}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+            Advanced filters
+          </button>
+
+          {showAdvanced && (
+            <div className="grid gap-3 rounded-lg border border-ui-border/40 bg-ui-bg/40 p-3 sm:grid-cols-2 lg:grid-cols-3">
+              <label className={cls.label}>
+                Exclude tags
+                <input
+                  className={cls.input}
+                  placeholder="comma-separated"
+                  value={excludeTags}
+                  onChange={(e) => setExcludeTags(e.target.value)}
+                />
+              </label>
+              <label className={cls.label}>
+                Checkpoint
+                <input
+                  className={cls.input}
+                  placeholder="checkpoint name…"
+                  value={checkpoint}
+                  onChange={(e) => setCheckpoint(e.target.value)}
+                />
+              </label>
+              <label className={cls.label}>
+                LoRAs
+                <input
+                  className={cls.input}
+                  placeholder="comma-separated"
+                  value={loras}
+                  onChange={(e) => setLoras(e.target.value)}
+                />
+              </label>
+              <label className={cls.label}>
+                Source tool
+                <input
+                  className={cls.input}
+                  placeholder="comfyui, a1111…"
+                  value={sourceTool}
+                  onChange={(e) => setSourceTool(e.target.value)}
+                />
+              </label>
+              <label className={cls.label}>
+                Results: {limit}
+                <input
+                  type="range"
+                  min={10}
+                  max={200}
+                  step={10}
+                  value={limit}
+                  onChange={(e) => setLimit(Number(e.target.value))}
+                  className="accent-accent-cyan"
+                />
+              </label>
+              <label className={cls.label}>
+                Min similarity: {minScore.toFixed(2)}
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={minScore}
+                  onChange={(e) => setMinScore(Number(e.target.value))}
+                  className="accent-accent-cyan"
+                />
+                <span className="text-ui-2xs normal-case tracking-normal text-ui-ink-muted/70">
+                  applies to similar / by-image
+                </span>
+              </label>
+            </div>
+          )}
+        </div>
       </section>
 
       {error && <p className="text-ui-sm text-rose-500">{error}</p>}
@@ -625,7 +701,7 @@ export default function LibraryPage() {
       {/* Image grid */}
       {results.length === 0 && !loading && (
         <p className="text-ui-sm text-ui-ink-muted">
-          {mode === "image"
+          {imagePanelOpen
             ? "Paste, drop, or choose an image above to search by visual similarity."
             : "No images found. Ingest a folder below to get started."}
         </p>
@@ -639,6 +715,7 @@ export default function LibraryPage() {
           showScores={settings.showScores}
           showCardMeta={settings.showCardMeta}
           onSimilar={findSimilar}
+          onOpen={openLightbox}
         />
       )}
 
@@ -718,11 +795,38 @@ export default function LibraryPage() {
           </div>
         )}
       </section>
+
+      {/* Fullscreen viewer / slideshow */}
+      {lightboxIndex !== null && results[lightboxIndex] && (
+        <Lightbox
+          items={results}
+          initialIndex={lightboxIndex}
+          fullResolution={settings.viewerFullResolution}
+          slideshow={{
+            interval: settings.slideshowInterval,
+            loop: settings.slideshowLoop,
+            shuffle: settings.slideshowShuffle,
+          }}
+          autoPlay={lightboxAutoPlay}
+          hasMore={hasMore}
+          loadingMore={loading}
+          onLoadMore={loadMore}
+          onClose={() => setLightboxIndex(null)}
+          onSimilar={(it) => {
+            setLightboxIndex(null);
+            findSimilar(it.imageId, it.thumbnailUrl, it.summary);
+          }}
+          onToggleFullResolution={() =>
+            setKey("viewerFullResolution", !settings.viewerFullResolution)
+          }
+        />
+      )}
     </div>
   );
 }
 
 type SimilarHandler = (id: string, thumbUrl: string, summary: string) => void;
+type OpenHandler = (index: number) => void;
 
 /** Renders the result set in the layout chosen in settings (grid / masonry / list). */
 function ResultsView({
@@ -732,6 +836,7 @@ function ResultsView({
   showScores,
   showCardMeta,
   onSimilar,
+  onOpen,
 }: {
   results: CompactResult[];
   viewMode: ViewMode;
@@ -739,17 +844,20 @@ function ResultsView({
   showScores: boolean;
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
+  onOpen: OpenHandler;
 }) {
   if (viewMode === "list") {
     return (
       <div className="flex flex-col gap-2">
-        {results.map((r) => (
+        {results.map((r, i) => (
           <ResultRow
             key={r.imageId}
             r={r}
+            index={i}
             showScores={showScores}
             showCardMeta={showCardMeta}
             onSimilar={onSimilar}
+            onOpen={onOpen}
           />
         ))}
       </div>
@@ -759,14 +867,16 @@ function ResultsView({
   const masonry = viewMode === "masonry";
   return (
     <div className={masonry ? `${masonryColumnsClass(density)} gap-3` : `grid ${gridColumnsClass(density)} gap-3`}>
-      {results.map((r) => (
+      {results.map((r, i) => (
         <ResultCard
           key={r.imageId}
           r={r}
+          index={i}
           masonry={masonry}
           showScores={showScores}
           showCardMeta={showCardMeta}
           onSimilar={onSimilar}
+          onOpen={onOpen}
         />
       ))}
     </div>
@@ -782,6 +892,17 @@ function CardMeta({ r, showScores }: { r: CompactResult; showScores: boolean }) 
         </span>
       )}
       {r.rating && r.rating > 0 && <StarRating value={r.rating} />}
+      {(r.safety === "nsfw" || r.safety === "explicit") && (
+        <span
+          className={`rounded px-1.5 py-0.5 text-ui-2xs font-medium ${
+            r.safety === "explicit"
+              ? "bg-rose-500/15 text-rose-500"
+              : "bg-amber-500/15 text-amber-500"
+          }`}
+        >
+          {SAFETY_LABEL[r.safety]}
+        </span>
+      )}
       {r.model && (
         <span className="rounded bg-ui-bg px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">{r.model}</span>
       )}
@@ -789,18 +910,30 @@ function CardMeta({ r, showScores }: { r: CompactResult; showScores: boolean }) 
   );
 }
 
+/**
+ * Left-click opens the fullscreen viewer; modified clicks (Ctrl/Cmd/middle)
+ * fall through to the native link so the detail page can still open in a new tab.
+ */
+function shouldOpenViewer(e: React.MouseEvent): boolean {
+  return !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0);
+}
+
 function ResultCard({
   r,
+  index,
   masonry,
   showScores,
   showCardMeta,
   onSimilar,
+  onOpen,
 }: {
   r: CompactResult;
+  index: number;
   masonry: boolean;
   showScores: boolean;
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
+  onOpen: OpenHandler;
 }) {
   return (
     <div
@@ -808,7 +941,15 @@ function ResultCard({
         masonry ? "mb-3 break-inside-avoid" : ""
       }`}
     >
-      <Link href={`/library/${r.imageId}`} prefetch={false} className="block">
+      <a
+        href={`/library/${r.imageId}`}
+        onClick={(e) => {
+          if (!shouldOpenViewer(e)) return;
+          e.preventDefault();
+          onOpen(index);
+        }}
+        className="block cursor-zoom-in"
+      >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={r.thumbnailUrl}
@@ -816,7 +957,7 @@ function ResultCard({
           loading="lazy"
           className={masonry ? "w-full object-cover" : "aspect-square w-full object-cover"}
         />
-      </Link>
+      </a>
 
       {/* Hover action: find similar */}
       <div className="pointer-events-none absolute right-1.5 top-1.5 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
@@ -841,18 +982,27 @@ function ResultCard({
 
 function ResultRow({
   r,
+  index,
   showScores,
   showCardMeta,
   onSimilar,
+  onOpen,
 }: {
   r: CompactResult;
+  index: number;
   showScores: boolean;
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
+  onOpen: OpenHandler;
 }) {
+  const open = (e: React.MouseEvent) => {
+    if (!shouldOpenViewer(e)) return;
+    e.preventDefault();
+    onOpen(index);
+  };
   return (
     <div className="group flex items-center gap-3 rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-2 transition hover:border-accent-cyan">
-      <Link href={`/library/${r.imageId}`} prefetch={false} className="shrink-0">
+      <a href={`/library/${r.imageId}`} onClick={open} className="shrink-0 cursor-zoom-in">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={r.thumbnailUrl}
@@ -860,11 +1010,11 @@ function ResultRow({
           loading="lazy"
           className="h-16 w-16 rounded-lg object-cover sm:h-20 sm:w-20"
         />
-      </Link>
+      </a>
       <div className="min-w-0 flex-1">
-        <Link href={`/library/${r.imageId}`} prefetch={false} className="block">
+        <a href={`/library/${r.imageId}`} onClick={open} className="block cursor-zoom-in">
           <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
-        </Link>
+        </a>
         {showCardMeta && <CardMeta r={r} showScores={showScores} />}
       </div>
       <button

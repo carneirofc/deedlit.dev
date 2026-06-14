@@ -21,7 +21,27 @@ interface JobSummary {
   startedAt: string | null;
   finishedAt: string | null;
   createdAt: string;
+  /** Current pipeline stage — which microservice is active right now. */
+  stage: string | null;
+  /** Per-stage reached-count for the expandable staircase. */
+  stageCounts: Record<string, number>;
 }
+
+// Pipeline stages in execution order — drives the expanded per-job staircase so
+// rows render in a stable, meaningful sequence (mirrors deedlit.ingest).
+const PIPELINE_STAGES = [
+  "hash",
+  "metadata",
+  "label",
+  "vision:dense",
+  "vision:sparse",
+  "catalog",
+  "search",
+  "graph",
+] as const;
+
+// Grafana base URL for the trace deep-link (compose maps it to :3002).
+const GRAFANA_URL = process.env.NEXT_PUBLIC_GRAFANA_URL ?? "http://localhost:3002";
 
 interface JobDetail {
   job: JobSummary;
@@ -249,11 +269,24 @@ export default function AdminPage() {
   return (
     <div className="mx-auto flex max-w-[1400px] flex-col gap-6" data-testid="admin-page">
       {/* Header */}
-      <header>
-        <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
-        <p className="text-ui-sm text-ui-ink-muted">
-          Trigger ingestion &amp; maintenance, monitor service health and jobs.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
+          <p className="text-ui-sm text-ui-ink-muted">
+            Trigger ingestion &amp; maintenance, monitor service health and jobs.
+          </p>
+        </div>
+        {/* Deep-link to the distributed traces (one ingest = one cross-service
+            trace tree) for debugging beyond the live board. */}
+        <a
+          href={GRAFANA_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={cls.btn}
+          data-testid="grafana-link"
+        >
+          View traces in Grafana ↗
+        </a>
       </header>
 
       {/* System status — every backend component + its dependencies */}
@@ -390,6 +423,15 @@ export default function AdminPage() {
                       <span className="min-w-0 flex-1 truncate text-ui-xs text-ui-ink">
                         {j.folderPath ?? "—"}
                       </span>
+                      {ACTIVE_JOB_STATUSES.has(j.status) && j.stage && (
+                        <span
+                          className="shrink-0 rounded-full bg-sky-500/10 px-1.5 py-0.5 text-ui-2xs font-medium text-sky-500"
+                          title="active pipeline stage — the microservice working now"
+                          data-testid={`job-stage-${j.id}`}
+                        >
+                          {j.stage}
+                        </span>
+                      )}
                       <span className="shrink-0 text-ui-2xs text-ui-ink-muted">
                         {j.processedFiles}/{j.totalFiles} ({pct}%)
                         {j.failedFiles > 0 ? ` · ${j.failedFiles} err` : ""}
@@ -424,6 +466,34 @@ export default function AdminPage() {
                       </div>
                       {j.errorMessage && (
                         <p className="mt-1 text-rose-500">error: {j.errorMessage}</p>
+                      )}
+                      {/* Per-stage staircase: how far each microservice has
+                          carried this job's files (which service is the
+                          bottleneck / where failures stall). */}
+                      {Object.keys(j.stageCounts).length > 0 && (
+                        <div className="mt-2" data-testid={`job-stages-${j.id}`}>
+                          <p className="font-medium text-ui-ink">Pipeline stages</p>
+                          <div className="mt-1 flex flex-col gap-0.5">
+                            {PIPELINE_STAGES.filter((s) => s in j.stageCounts).map((s) => {
+                              const reached = j.stageCounts[s] ?? 0;
+                              const w = j.totalFiles > 0 ? Math.round((reached / j.totalFiles) * 100) : 0;
+                              return (
+                                <div key={s} className="flex items-center gap-2">
+                                  <span className="w-24 shrink-0 truncate text-ui-ink">{s}</span>
+                                  <div className="h-1 flex-1 overflow-hidden rounded-full bg-ui-bg-soft">
+                                    <div
+                                      className="h-full rounded-full bg-accent-cyan/70"
+                                      style={{ width: `${w}%` }}
+                                    />
+                                  </div>
+                                  <span className="w-14 shrink-0 text-right tabular-nums">
+                                    {reached}/{j.totalFiles}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
                       )}
                       {detail && detail.job.id === j.id && detail.failedFiles.length > 0 && (
                         <div className="mt-2">
