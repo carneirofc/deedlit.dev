@@ -12,12 +12,26 @@ servers:
 paths:
   /health:
     get: { summary: Liveness, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Health" } } } } } }
+  /fs/browse:
+    get:
+      summary: List a directory on the ingest host (admin folder picker)
+      description: >
+        Read-only listing of the ingest worker's host filesystem so the admin
+        directory picker can choose an ingest folder. Omit `path` for the
+        synthetic roots view (drives/home/cwd).
+      parameters: [ { name: path, in: query, required: false, schema: { type: string }, description: "Absolute directory to list; omit for roots view" } ]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/FsBrowseResult" } } } }
+        "400": { description: "Missing / denied / not a directory (user-correctable)" }
   /ingest:
     post:
       summary: Start an ingest job over a folder
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { folderPath: { type: string } }, required: [folderPath] } } } }
       responses: { "202": { description: Job started, content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } } } }
   /jobs:
+    get:
+      summary: List jobs (newest first) for the gateway/dashboard
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Job" } } } } } }
     post:
       summary: Start a maintenance job
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceRequest" } } } }
@@ -35,10 +49,27 @@ paths:
 components:
   schemas:
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] } }, required: [status] }
+    FsEntry:
+      type: object
+      properties: { name: { type: string }, path: { type: string }, isDirectory: { type: boolean } }
+      required: [name, path, isDirectory]
+    FsRoot:
+      type: object
+      properties: { label: { type: string }, path: { type: string } }
+      required: [label, path]
+    FsBrowseResult:
+      type: object
+      properties:
+        path: { type: [string, "null"], description: "Absolute path listed, or null for the roots view" }
+        parent: { type: [string, "null"], description: "Parent directory, or null at a filesystem root" }
+        separator: { type: string }
+        entries: { type: array, items: { $ref: "#/components/schemas/FsEntry" } }
+        roots: { type: array, items: { $ref: "#/components/schemas/FsRoot" } }
+      required: [path, parent, separator, entries, roots]
     MaintenanceRequest:
       type: object
       properties:
-        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails] }
+        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile] }
         sha256: { type: [string, "null"], pattern: "^[a-f0-9]{64}$", description: "for reindex-one-image" }
       required: [type]
     Job:
@@ -49,4 +80,12 @@ components:
         status: { type: string, enum: [queued, running, completed, failed, cancelled] }
         progress: { type: object, properties: { total: { type: integer }, done: { type: integer }, skipped: { type: integer }, failed: { type: integer } } }
         error: { type: [string, "null"] }
+        # Flattened aliases of `progress`/`error` for UI consumers (dashboard +
+        # activity dock) that normalize on snake_case file counts.
+        total_files: { type: integer }
+        processed_files: { type: integer }
+        skipped_files: { type: integer }
+        failed_files: { type: integer }
+        folder_path: { type: [string, "null"] }
+        error_message: { type: [string, "null"] }
       required: [id, type, status]

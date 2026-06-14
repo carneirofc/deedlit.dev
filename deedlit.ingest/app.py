@@ -11,6 +11,7 @@ claim/worker loop.
 
 Endpoints (see contracts/ingest.openapi.yaml):
   GET  /health
+  GET  /fs/browse?path=   -> directory listing for the admin folder picker
   POST /ingest            {folderPath} -> Job (202)
   POST /jobs              MaintenanceRequest{type, sha256?} -> Job (202)
   GET  /jobs/{id}         -> Job
@@ -23,13 +24,16 @@ ingest job.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
+from fs_browse import FsBrowseError, browse_directory
 from jobs import REINDEX_ONE_IMAGE, JobStore, reconcile_interval_seconds, reconcile_scheduler
 
 store = JobStore()
@@ -49,6 +53,34 @@ async def lifespan(app: FastAPI):
         if scheduler is not None:
             scheduler.cancel()
 
+
+# Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
+# dashboard), so their access logs drown out everything else. Drop them from
+# uvicorn's access log while leaving real traffic intact.
+class _HealthAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        # uvicorn.access record args: (client, method, full_path, http_ver, status)
+        if isinstance(args, tuple) and len(args) >= 3:
+            return "/health" not in str(args[2])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
+
+# Surface the ingest pipeline/job debug logs. uvicorn only configures its own
+# loggers and leaves the root at WARNING, so without this the per-file/per-step
+# `deedlit.ingest.*` logs (the whole point of the ingest trace) are swallowed.
+# Attach a handler to the package logger and honour INGEST_LOG_LEVEL (default
+# INFO; set DEBUG for per-step pipeline detail). propagate=False avoids
+# double-printing through any root handler.
+_ingest_logger = logging.getLogger("deedlit.ingest")
+if not _ingest_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     [%(name)s] %(message)s"))
+    _ingest_logger.addHandler(_handler)
+    _ingest_logger.propagate = False
+_ingest_logger.setLevel(os.getenv("INGEST_LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="deedlit.ingest", version="0.1.0", lifespan=lifespan)
 
@@ -100,6 +132,20 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/fs/browse")
+def fs_browse(path: str | None = Query(default=None)) -> dict:
+    """List a directory on the ingest host for the admin folder picker.
+
+    Read-only. Omitting ``path`` returns the synthetic roots view (drives/home/
+    cwd). Filesystem errors (missing/denied/not-a-dir) are user-correctable, so
+    they surface as 400s the picker shows inline rather than 500s.
+    """
+    try:
+        return browse_directory(path)
+    except FsBrowseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/ingest", status_code=202)
 def start_ingest(req: IngestRequest) -> JSONResponse:
     # Ensure the worker is running even outside the lifespan (e.g. TestClient
@@ -107,6 +153,17 @@ def start_ingest(req: IngestRequest) -> JSONResponse:
     store.start_worker()
     job = store.create_ingest_job(req.folderPath)
     return JSONResponse(status_code=202, content=job.to_dict())
+
+
+@app.get("/jobs")
+def list_jobs() -> list[dict]:
+    """List every job (newest first) for the gateway/dashboard.
+
+    The gateway proxies ``GET /jobs`` here; without this route it 405s and the
+    UI's job poller silently degrades to an empty list, so ingest progress and
+    completion never surface in the activity dock.
+    """
+    return [job.to_dict() for job in store.list()]
 
 
 @app.post("/jobs", status_code=202)
