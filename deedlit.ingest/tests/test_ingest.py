@@ -272,8 +272,10 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     assert "label" not in rec.point["payload"]
     assert "description" not in rec.point["payload"]
     assert "safety" not in rec.point["payload"]
-    # record always carries the safety key (None when unclassified; catalog COALESCEs).
+    # record always carries the safety + description keys (None when the labelagent
+    # is off; catalog COALESCEs/keeps so a reindex never wipes a stored value).
     assert rec.record["safety"] is None
+    assert rec.record["description"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +308,12 @@ def test_pipeline_folds_labelagent_into_tags_sparse_and_payload(mock_outbound, m
     assert rec.point["payload"]["label"] == "fantasy character portrait"
     assert (
         rec.point["payload"]["description"]
+        == "A red-armored knight standing in a misty forest."
+    )
+    # The (expensive) AI description is ALSO persisted on the catalog record so it
+    # is retrievable/viewable without re-running the model — not only in search.
+    assert (
+        rec.record["description"]
         == "A red-armored knight standing in a misty forest."
     )
     # Safety class lands on the catalog record AND the search payload (filterable).

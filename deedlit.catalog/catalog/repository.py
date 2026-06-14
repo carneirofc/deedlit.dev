@@ -107,6 +107,11 @@ def upsert_image(payload: ImageUpsert) -> Image:
             _set_params(conn, payload.sha256, payload.params)
         if payload.references:
             _set_references(conn, payload.sha256, payload.references)
+        # Only persist a description when one is supplied — a reindex with the
+        # labelagent off carries None and must NOT wipe the existing (expensive)
+        # one, mirroring the COALESCE behavior of the scalar columns above.
+        if payload.description:
+            _set_description(conn, payload.sha256, payload.description)
 
     img = get_image(payload.sha256)
     assert img is not None
@@ -142,6 +147,7 @@ def get_image(sha256: str) -> Image | None:
         tags = _get_tags(conn, image_id)
         params = _get_params(conn, image_id)
         references = _get_references(conn, sha256)
+        description = _get_description(conn, image_id)
 
         metadata = row["metadata_json"] or {}
         api_prompt_json = (
@@ -165,6 +171,7 @@ def get_image(sha256: str) -> Image | None:
             rating=row["rating"],
             favorite=row["favorite"],
             safety=row["safety"],
+            description=description,
             created_at=row["imported_at"],
         )
 
@@ -471,6 +478,61 @@ def _get_references(conn: Connection, sha256: str) -> list[AssetRef]:
         {"sha": sha256},
     ).mappings().all()
     return [AssetRef(kind=r["kind"], name=r["name"], hash=r["hash"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# descriptions (AI enrichment, kept in image_descriptions — separate from the
+# canonical images row)
+# ---------------------------------------------------------------------------
+
+# The producing system for AI descriptions; recorded as the provenance
+# ``provider`` so a future second source (or a manual description) is
+# distinguishable and replaceable independently.
+_DESCRIPTION_PROVIDER = "deedlit.labelagent"
+
+
+def _set_description(
+    conn: Connection, sha256: str, description: str, *, provider: str = _DESCRIPTION_PROVIDER
+) -> None:
+    """Store the latest AI description for an image (one row per provider).
+
+    The table has no natural unique key, so a re-ingest would otherwise pile up
+    duplicate rows on every run. We keep a single current description per
+    provider: drop the prior one, then insert. This makes a reindex REFRESH the
+    description (matching the scalar columns' COALESCE-on-supply semantics)
+    rather than accumulate history.
+    """
+    image_id = _image_uuid(conn, sha256)
+    if image_id is None:
+        return
+    conn.execute(
+        text(
+            "DELETE FROM image_descriptions "
+            "WHERE image_id = :iid AND provider = :provider"
+        ),
+        {"iid": image_id, "provider": provider},
+    )
+    conn.execute(
+        text(
+            """
+            INSERT INTO image_descriptions (image_id, description, provider)
+            VALUES (:iid, :description, :provider)
+            """
+        ),
+        {"iid": image_id, "description": description, "provider": provider},
+    )
+
+
+def _get_description(conn: Connection, image_id: str) -> str | None:
+    """Return the most recent description text for an image, or None."""
+    row = conn.execute(
+        text(
+            "SELECT description FROM image_descriptions "
+            "WHERE image_id = :iid ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"iid": image_id},
+    ).first()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------------------

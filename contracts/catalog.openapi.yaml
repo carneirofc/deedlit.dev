@@ -145,6 +145,13 @@ components:
           type: [string, "null"]
           enum: [sfw, nsfw, explicit, null]
           description: AI content-safety class (deedlit.labelagent); null = unclassified.
+        description:
+          type: [string, "null"]
+          description: >-
+            AI-generated image description (deedlit.labelagent). An expensive
+            vision-LLM result, persisted in image_descriptions so it is
+            retrievable/viewable without re-running the model. Re-derivable: a
+            reindex without one keeps the stored value. Null = none.
       required: [sha256]
     Image:
       allOf:

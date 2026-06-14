@@ -17,10 +17,7 @@ API_KEY = os.getenv("LABELAGENT_API_KEY", "sk-no-key")
 
 TEMPERATURE = float(os.getenv("LABELAGENT_TEMPERATURE", "0.2"))
 
-# Hard cap on total generated tokens — the guaranteed backstop on thinking spend.
-MAX_TOKENS = int(os.getenv("LABELAGENT_MAX_TOKENS", "1024"))
-
-# Thinking-token budget forwarded to llama-server for reasoning models. There is
-# no dedicated reasoning knob on OpenAILike/LlamaCpp, so this is passed through
-# the request body; MAX_TOKENS remains the hard cap regardless.
-THINKING_BUDGET = int(os.getenv("LABELAGENT_THINKING_BUDGET", "256"))
+# NOTE: generation length and the thinking/reasoning budget are intentionally NOT
+# set here. This is a thinking model, and a client-side hard token cap truncated
+# the structured JSON output (breaking every label). Let llama-server's own
+# defaults govern length/thinking; configure them on the server if needed.

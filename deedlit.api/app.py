@@ -50,7 +50,8 @@ class _HealthAccessFilter(logging.Filter):
         args = record.args
         # uvicorn.access record args: (client, method, full_path, http_ver, status)
         if isinstance(args, tuple) and len(args) >= 3:
-            return "/health" not in str(args[2])
+            path = str(args[2])
+            return "/health" not in path and "/activity" not in path
         return True
 
 

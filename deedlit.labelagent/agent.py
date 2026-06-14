@@ -44,16 +44,18 @@ class ImageLabel(BaseModel):
 
 def build_model() -> LlamaCpp:
     # LlamaCpp is an OpenAILike subclass — just point base_url at llama-server.
-    # OpenAILike exposes no dedicated reasoning knob, so thinking is bounded by
-    # (a) max_completion_tokens (the hard cap) and (b) a reasoning budget passed
-    # through to llama-server via extra_body, plus a "think briefly" instruction.
+    #
+    # We deliberately DON'T cap generation here (no max_completion_tokens) or
+    # force a reasoning budget. The model is a thinking model (Qwen3.5): a hard
+    # token cap made it spend the budget reasoning and then truncate the
+    # structured JSON output mid-string, so every label failed to parse. Length
+    # and thinking are left to llama-server's own configured defaults (control
+    # them on the server, e.g. --reasoning-budget / --n-predict, not here).
     return LlamaCpp(
         id=config.MODEL_ID,
         base_url=config.LLM_BASE_URL,
         api_key=config.API_KEY,
         temperature=config.TEMPERATURE,
-        max_completion_tokens=config.MAX_TOKENS,
-        request_params={"extra_body": {"reasoning_budget": config.THINKING_BUDGET}},
     )
 
 

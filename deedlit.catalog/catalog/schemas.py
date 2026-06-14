@@ -46,6 +46,12 @@ class ImageUpsert(BaseModel):
     workflow_json: dict[str, Any] | None = None
     api_prompt_json: dict[str, Any] | None = None
     safety: Safety | None = None
+    # AI-generated description (deedlit.labelagent). An expensive vision-LLM
+    # computation, so it is PERSISTED here (not just in the search payload) to be
+    # retrievable/viewable without re-running the model. Stored in the dedicated
+    # image_descriptions table; None = none supplied. Like ``safety`` it is
+    # re-derivable, so a reindex without one keeps the existing value.
+    description: str | None = None
 
 
 class Image(ImageUpsert):

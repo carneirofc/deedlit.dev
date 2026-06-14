@@ -485,6 +485,11 @@ def assemble_record(
         # AI content-safety class (deedlit.labelagent); None when the labelagent
         # is disabled — catalog COALESCEs None so a reindex never wipes it.
         "safety": safety,
+        # AI description (deedlit.labelagent). An expensive vision-LLM result, so
+        # it is persisted in the catalog (image_descriptions) — not just the
+        # search payload — to stay retrievable/viewable. None when the labelagent
+        # is disabled; catalog keeps the existing one so a reindex never wipes it.
+        "description": description,
     }
 
     # search UpsertPoint: {sha256, dense, sparse?, payload?}. Search keys the

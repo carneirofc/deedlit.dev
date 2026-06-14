@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm run dev:migrate 2>&1)",
+      "PowerShell(uv run --directory deedlit.catalog python -m catalog.migrations 2>&1)",
+      "PowerShell(uv run --directory deedlit.catalog python _verify_safety.py 2>&1)",
+      "PowerShell(Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -in 3000,4318,8000,8001,8002,8003,8004,8005,8006,8080 } | Select-Object LocalAddress,LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table -AutoSize)",
+      "Bash(curl -s --max-time 5 http://127.0.0.1:8888/v1/models)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); m=d['choices'][0]['message']; print\\('finish_reason:', d['choices'][0].get\\('finish_reason'\\)\\); print\\('reasoning_content len:', len\\(m.get\\('reasoning_content'\\) or ''\\)\\); print\\('content:', repr\\(m.get\\('content'\\)\\)[:400]\\)\")"
+    ]
+  }
+}

@@ -183,6 +183,28 @@ def test_safety_roundtrips_and_survives_reindex(client) -> None:
     assert client.get(f"/images/{sha}").json()["safety"] == "explicit"
 
 
+def test_description_roundtrips_survives_reindex_and_refreshes(client) -> None:
+    # The labelagent's (expensive) description is persisted and round-trips on read.
+    sha = _sha()
+    desc = "A red-armored knight standing in a misty forest."
+    r = client.post("/images", json={"sha256": sha, "description": desc})
+    assert r.status_code == 200, r.text
+    assert r.json()["description"] == desc
+
+    # A reindex with the labelagent off (no description) must NOT wipe the stored
+    # one — re-deriving it is expensive, so it is kept like the scalar columns.
+    r2 = client.post("/images", json={"sha256": sha, "prompt": "refreshed"})
+    assert r2.status_code == 200, r2.text
+    assert client.get(f"/images/{sha}").json()["description"] == desc
+
+    # A reindex that DOES supply a new description refreshes it (single current
+    # row per provider — no duplicate accumulation across re-ingests).
+    new_desc = "A knight in gleaming silver armor under a clear sky."
+    r3 = client.post("/images", json={"sha256": sha, "description": new_desc})
+    assert r3.status_code == 200, r3.text
+    assert client.get(f"/images/{sha}").json()["description"] == new_desc
+
+
 def test_patch_safety(client) -> None:
     sha = _sha()
     client.post("/images", json={"sha256": sha, "safety": "nsfw"})
