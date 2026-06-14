@@ -190,6 +190,78 @@ services:
       retries: 20
       start_period: 60s
 
+  # --- Observability (profile-gated) -------------------------------------
+  # Relocated here from deedlit.dev.comfyhelper/docker-compose.yml (deleted in
+  # 4fbf4cc when comfyhelper became UI-only). Configs live in ./observability/.
+  #   docker compose --profile observability up -d
+  # Grafana http://localhost:3002 (3001 is the landing dev app's port).
+
+  # Loki: log aggregation (filesystem-backed, 7-day retention).
+  loki:
+    image: grafana/loki:3.3.2
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+
+  # Tempo: distributed trace storage; OTLP receivers on 4317/4318.
+  tempo:
+    image: grafana/tempo:2.6.1
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command: -config.file=/etc/tempo/tempo-config.yaml
+    ports:
+      - "3200:3200" # Tempo API (queried by Grafana)
+    volumes:
+      - ./observability/tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
+      - tempo_data:/var/tempo
+
+  # Alloy: collector. Scrapes Docker logs -> Loki, receives OTLP -> Tempo.
+  # Needs the Docker socket to discover and tail container logs.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    ports:
+      - "12345:12345" # Alloy UI
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    depends_on:
+      - loki
+      - tempo
+
+  # Grafana: UI for Loki + Tempo (datasources pre-provisioned, anonymous admin).
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["observability", "full"]
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    ports:
+      - "3002:3000" # 3000=comfyhelper app, 3001=landing dev app, so Grafana on 3002
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - loki
+      - tempo
+
 volumes:
   postgres_data:
   neo4j_data:
@@ -197,3 +269,7 @@ volumes:
   qdrant_data:
   rustfs_data:
   rustfs_logs:
+  loki_data:
+  tempo_data:
+  alloy_data:
+  grafana_data:
