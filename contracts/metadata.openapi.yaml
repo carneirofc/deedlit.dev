@@ -34,8 +34,21 @@ paths:
           content: { application/json: { schema: { $ref: "#/components/schemas/ExtractResult" } } }
         "422":
           description: Unparseable / no recognized metadata
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board (in-flight requests, trailing-60s throughput, most recent op).
+      properties:
+        inflight: { type: integer }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+      required: [inflight, per_min, busy, last_op]
     Health:
       type: object
       properties: { status: { type: string, enum: [ok, degraded] } }

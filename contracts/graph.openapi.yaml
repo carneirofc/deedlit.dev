@@ -16,6 +16,15 @@ paths:
       summary: Upsert edges for one image's references/tags/lineage
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/EdgeUpsert" } } } }
       responses: { "200": { description: Upserted } }
+  /images/{sha256}:
+    delete:
+      summary: Delete an image node + its edges from the projection (idempotent)
+      description: >
+        DETACH DELETEs the Image node when un-indexing. Asset/Tag nodes are left
+        in place (still used by other images). A missing node is not an error;
+        the response reports how many Image nodes were deleted.
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      responses: { "200": { description: Deleted, content: { application/json: { schema: { type: object, properties: { status: { type: string }, deleted: { type: integer } } } } } } }
   /neighbors/{sha256}:
     get:
       parameters:
@@ -36,8 +45,21 @@ paths:
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { tag: { type: string }, weight: { type: number } }, required: [tag] } } } } } }
   /rebuild:
     post: { summary: Rebuild the graph from catalog, responses: { "202": { description: Rebuild started } } }
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board (in-flight requests, trailing-60s throughput, most recent op).
+      properties:
+        inflight: { type: integer }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+      required: [inflight, per_min, busy, last_op]
     Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, neo4j_ready: { type: boolean } }, required: [status] }
     AssetRef:

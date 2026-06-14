@@ -20,6 +20,15 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: "#/components/schemas/UpsertPoint" } } }
       responses: { "200": { description: Upserted } }
+  /points/{sha256}:
+    delete:
+      summary: Delete the point keyed by uuid5(sha256) (idempotent)
+      description: >
+        Removes an image's vector from the projection when it is un-indexed.
+        Deleting a missing point is not an error, so this always returns 200 for
+        a well-formed sha256.
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      responses: { "200": { description: Deleted } }
   /query:
     post:
       summary: Hybrid search (dense + sparse prefetch, RRF fusion)
@@ -48,8 +57,21 @@ paths:
     post:
       summary: Rebuild the collection from catalog
       responses: { "202": { description: Rebuild started } }
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board (in-flight requests, trailing-60s throughput, most recent op).
+      properties:
+        inflight: { type: integer }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+      required: [inflight, per_min, busy, last_op]
     Sha256:
       type: string
       pattern: "^[a-f0-9]{64}$"
@@ -70,7 +92,17 @@ components:
         sha256: { $ref: "#/components/schemas/Sha256" }
         dense: { type: array, items: { type: number }, description: "1024-dim CLIP vector" }
         sparse: { $ref: "#/components/schemas/SparseVector" }
-        payload: { type: object, additionalProperties: true }
+        payload:
+          type: object
+          additionalProperties: true
+          description: >-
+            Free-form payload stored alongside the point and echoed back on
+            hits. Ingest writes by convention: `sha256`, `point_id`, `tags`,
+            and `image_url` / `thumbnail_url` — absolute URLs (with a file
+            extension) to the comfyhelper image proxy, so a hit can be rendered
+            without a follow-up catalog lookup and the Qdrant dashboard shows
+            previews. When known, `filepath` carries the original on-disk source
+            path so a point is identifiable by its file in the dashboard.
       required: [sha256, dense]
     HybridQuery:
       type: object

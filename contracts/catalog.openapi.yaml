@@ -21,6 +21,7 @@ paths:
       parameters:
         - { name: tag, in: query, schema: { type: string } }
         - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }
@@ -31,6 +32,16 @@ paths:
       summary: Update mutable fields (rating/favorite/tags)
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ImagePatch" } } } }
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } } }
+    delete:
+      summary: Delete an image record (+ sha256-keyed blobs); not the source file
+      description: >
+        Hard-deletes the Postgres row (FK children cascade) plus the per-image
+        asset references, then drops the sha256-keyed RustFS blobs (thumbnail +
+        cached embedding). The original file on disk is never touched. Note /
+        collection membership refs are left intact so a re-ingest re-attaches.
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+        "404": { description: Not found }
   /images/{sha256}/rating:
     put:
       parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
@@ -78,8 +89,21 @@ paths:
       summary: Set/reorder collection membership (ordered sha256 list)
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { images: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [images] } } } }
       responses: { "200": { description: OK } }
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board (in-flight requests, trailing-60s throughput, most recent op).
+      properties:
+        inflight: { type: integer }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+      required: [inflight, per_min, busy, last_op]
     Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, db_ready: { type: boolean }, blob_ready: { type: boolean } }, required: [status] }
     AssetRef: { type: object, properties: { kind: { type: string, enum: [checkpoint, lora, embedding, vae, controlnet, upscaler] }, name: { type: string }, hash: { type: [string, "null"] } }, required: [kind, name] }
@@ -99,6 +123,13 @@ components:
       type: object
       properties:
         sha256: { $ref: "#/components/schemas/Sha256" }
+        filepath:
+          type: [string, "null"]
+          description: >-
+            Original on-disk path of the source file captured at ingest, so an
+            image is identifiable when inspecting the catalog (the id is the
+            opaque sha256). Stored INSERT-only — a later reindex (which has no
+            path) never overwrites it. Null when unknown.
         phash: { type: [string, "null"] }
         width: { type: [integer, "null"] }
         height: { type: [integer, "null"] }
@@ -110,6 +141,10 @@ components:
         references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
         workflow_json: { type: [object, "null"] }
         api_prompt_json: { type: [object, "null"] }
+        safety:
+          type: [string, "null"]
+          enum: [sfw, nsfw, explicit, null]
+          description: AI content-safety class (deedlit.labelagent); null = unclassified.
       required: [sha256]
     Image:
       allOf:
@@ -125,6 +160,7 @@ components:
         rating: { type: [integer, "null"] }
         favorite: { type: [boolean, "null"] }
         tags: { type: [array, "null"], items: { type: string } }
+        safety: { type: [string, "null"], enum: [sfw, nsfw, explicit, null] }
     NoteUpsert:
       type: object
       properties:

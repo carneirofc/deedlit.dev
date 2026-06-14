@@ -13,11 +13,35 @@ paths:
     get:
       summary: Gateway liveness + downstream service health
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/HealthDashboard" } } } } }
+  /activity:
+    get:
+      summary: Aggregated live per-service work for the system-activity board
+      description: >
+        Probes every downstream service's /activity in parallel and returns one
+        row per service (plus the gateway itself first). Mirrors /health: a
+        downstream miss degrades to an idle row (busy=false, reachable=false)
+        rather than failing the request.
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/ActivityDashboard" } } } } }
   /detail/{sha256}:
     get:
       parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
       summary: Aggregated detail (catalog + search neighbors + graph), parallel fan-out
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Detail" } } } } }
+  /images/{sha256}:
+    delete:
+      parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
+      summary: Un-index an image (catalog record + search vector + graph node)
+      description: >
+        Deletes the image's INDEXATION, NOT the source file on disk. Catalog
+        (source of truth) is deleted first — a 404 there is a 404 here, any other
+        catalog failure is a 502 before projections are touched. With the record
+        gone, the search point + graph node are cleaned best-effort in parallel;
+        per-store outcomes are reported in the body (a failed projection delete
+        leaves an orphan a reconcile/rebuild can prune).
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { $ref: "#/components/schemas/DeleteResult" } } } }
+        "404": { description: image not found }
+        "502": { description: catalog unavailable }
   /search:
     post:
       summary: Hybrid search — encodes the text query via deedlit.vision, then queries deedlit.search
@@ -80,6 +104,21 @@ components:
         status: { type: string, enum: [ok, degraded] }
         services: { type: array, items: { $ref: "#/components/schemas/ServiceHealth" } }
       required: [status]
+    ServiceActivity:
+      type: object
+      properties:
+        name: { type: string }
+        inflight: { type: integer, description: "Requests in flight on that service" }
+        per_min: { type: number, description: "Completions in the trailing 60s" }
+        busy: { type: boolean }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+        reachable: { type: boolean, description: "false when the gateway couldn't reach the service" }
+      required: [name, inflight, per_min, busy, reachable]
+    ActivityDashboard:
+      type: object
+      properties:
+        services: { type: array, items: { $ref: "#/components/schemas/ServiceActivity" } }
+      required: [services]
     Detail:
       type: object
       properties:
@@ -95,6 +134,15 @@ components:
         collections: { type: integer }
         notes: { type: integer }
       required: [images]
+    DeleteResult:
+      type: object
+      properties:
+        status: { type: string }
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        catalog: { type: boolean, description: "catalog record removed (truth)" }
+        search: { type: boolean, description: "search vector removed (best-effort)" }
+        graph: { type: boolean, description: "graph node removed (best-effort)" }
+      required: [status, sha256, catalog]
     JsonRpcRequest:
       type: object
       properties:
