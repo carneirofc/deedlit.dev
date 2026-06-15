@@ -130,7 +130,10 @@ export function getLibraryConfig(): LibraryConfig {
     clipVisionApiUrl,
     metadataApiUrl: envString("METADATA_API_URL", "http://localhost:8005").replace(/\/+$/, ""),
     embeddingDimensions: parseInt(envString("EMBEDDING_DIMENSIONS", String(defaultEmbeddingDimensions)), 10),
-    thumbnailSizes: { small: 256, medium: 512 },
+    // Floor for the SHORTER edge (px); thumbnails are downscaled to this and
+    // never upscaled. `medium` doubles as the viewer image, so it stays "1080p"
+    // class; `small` feeds dense grids/filmstrips.
+    thumbnailSizes: { small: 256, medium: 1080 },
     qdrantCollection: envString("QDRANT_COLLECTION", "images"),
     objectStore: {
       enabled: envBool("OBJECT_STORE_ENABLED", true),

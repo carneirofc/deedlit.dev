@@ -35,8 +35,11 @@ export async function generateThumbnail(
 ): Promise<string> {
   const { thumbnailSizes } = getLibraryConfig();
   const dimension = thumbnailSizes[size];
+  // `fit: "outside"` scales so the SHORTER edge hits `dimension` (the longer
+  // edge stays proportionally larger); `withoutEnlargement` keeps a smaller
+  // source at native size. Lossless WebP so the thumbnail is viewer-grade.
   const buffer = await sharp(sourcePath)
-    .resize(dimension, dimension, { fit: "inside", withoutEnlargement: true })
+    .resize(dimension, dimension, { fit: "outside", withoutEnlargement: true })
     .webp({ lossless: true })
     .toBuffer();
 

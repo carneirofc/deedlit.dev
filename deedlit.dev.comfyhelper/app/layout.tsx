@@ -60,7 +60,7 @@ export default function RootLayout({
           <ThemeToggleButton />
           <AppSidebar />
           <AppProviders>
-            <div className="mx-auto w-full max-w-[2200px] min-w-0">
+            <div className="mx-auto w-full min-w-0">
               {children}
             </div>
           </AppProviders>

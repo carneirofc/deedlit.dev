@@ -83,7 +83,7 @@ export default function ImageDetailPage() {
   const params = useParams<{ imageId: string }>();
   const imageId = params.imageId;
   const router = useRouter();
-  const { settings, hydrated } = useSettings();
+  const { settings, setKey, hydrated } = useSettings();
   const { track } = useActivity();
 
   const [detail, setDetail] = useState<Detail | null>(null);
@@ -283,18 +283,35 @@ export default function ImageDetailPage() {
       : "max-h-[80vh] w-full bg-ui-bg object-contain";
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-5">
+    <div className="flex w-full min-w-0 flex-col gap-5">
       <Link href="/library" prefetch={false} className="text-ui-sm text-accent-cyan">
         ← Back to library
       </Link>
 
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="overflow-hidden rounded-xl border border-ui-border/60">
+      <div className="flex flex-col gap-5 xl:flex-row xl:items-start">
+        <div className="relative w-full overflow-hidden rounded-xl border border-ui-border/60 xl:w-[55%] xl:max-w-[1400px]">
+          {/* Quality indicator + quick toggle: HD original vs cached thumbnail. */}
+          <button
+            type="button"
+            onClick={() => setKey("viewerFullResolution", !settings.viewerFullResolution)}
+            aria-pressed={settings.viewerFullResolution}
+            title="Toggle full-resolution original"
+            className={`absolute left-2 top-2 z-10 rounded-md border px-2 py-1 text-ui-2xs font-semibold backdrop-blur transition ${
+              settings.viewerFullResolution
+                ? "border-accent-cyan bg-ui-bg/80 text-accent-cyan"
+                : "border-ui-border/60 bg-ui-bg/80 text-ui-ink-muted hover:text-ui-ink"
+            }`}
+          >
+            {settings.viewerFullResolution ? "HD · original" : "Thumbnail"}
+          </button>
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={viewerSrc} alt={detail.filename} className={viewerClass} />
         </div>
 
-        <div className="flex flex-col gap-4">
+        {/* Panels: column-width (not fixed count) — browser fits as many
+            ≥24rem columns as the available space allows, so text never cramps
+            and extra desktop width just adds columns. */}
+        <div className="min-w-0 flex-1 columns-[24rem] gap-4 [&>div]:mb-4 [&>div]:break-inside-avoid">
           <div className={panel}>
             <div className="flex items-center justify-between">
               <h1 className="truncate text-ui-lg font-semibold text-ui-ink-title">{detail.filename}</h1>
@@ -468,7 +485,7 @@ export default function ImageDetailPage() {
               Load similar images
             </button>
           ) : similar.length > 0 ? (
-            <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6">
+            <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6 2xl:grid-cols-8 3xl:grid-cols-10 4xl:grid-cols-12 5xl:grid-cols-14">
               {similar.map((s) => (
                 <Link
                   key={s.imageId}

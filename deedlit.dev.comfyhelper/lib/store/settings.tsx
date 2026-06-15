@@ -234,15 +234,18 @@ export function useSettings(): SettingsValue {
 // ---------------------------------------------------------------------------
 
 const GRID_COLUMNS: Record<GridDensity, string> = {
-  compact: "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 2xl:grid-cols-8",
-  comfortable: "grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6",
-  spacious: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  compact:
+    "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 2xl:grid-cols-8 3xl:grid-cols-10 4xl:grid-cols-12 5xl:grid-cols-14",
+  comfortable:
+    "grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 3xl:grid-cols-8 4xl:grid-cols-10 5xl:grid-cols-12",
+  spacious:
+    "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6 4xl:grid-cols-8",
 };
 
 const MASONRY_COLUMNS: Record<GridDensity, string> = {
-  compact: "columns-3 sm:columns-4 lg:columns-6 xl:columns-7",
-  comfortable: "columns-2 sm:columns-3 lg:columns-4 xl:columns-5",
-  spacious: "columns-1 sm:columns-2 lg:columns-3",
+  compact: "columns-3 sm:columns-4 lg:columns-6 xl:columns-7 2xl:columns-8 3xl:columns-10 4xl:columns-12 5xl:columns-14",
+  comfortable: "columns-2 sm:columns-3 lg:columns-4 xl:columns-5 2xl:columns-6 3xl:columns-8 4xl:columns-10 5xl:columns-12",
+  spacious: "columns-1 sm:columns-2 lg:columns-3 xl:columns-4 2xl:columns-5 3xl:columns-6 4xl:columns-8",
 };
 
 export function gridColumnsClass(density: GridDensity): string {

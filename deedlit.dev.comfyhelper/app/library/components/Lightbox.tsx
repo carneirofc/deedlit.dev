@@ -242,7 +242,7 @@ export function Lightbox({
               onClick={onToggleFullResolution}
               className={`${ctrlBtn} w-auto px-2 text-ui-2xs font-semibold ${fullResolution ? "border-accent-cyan text-accent-cyan" : ""}`}
               aria-pressed={fullResolution}
-              title="Toggle full-resolution original"
+              title={fullResolution ? "Showing HD original — switch to thumbnail" : "Showing thumbnail — switch to HD original"}
             >
               HD
             </button>
@@ -314,6 +314,17 @@ export function Lightbox({
           onLoad={() => setImgLoaded(true)}
           className={`max-h-full max-w-full object-contain transition-opacity duration-200 ${imgLoaded ? "opacity-100" : "opacity-0"}`}
         />
+
+        {/* Quality indicator — what's actually on screen right now. */}
+        <span
+          className={`pointer-events-none absolute bottom-3 left-3 rounded-md border px-2 py-1 text-ui-2xs font-semibold backdrop-blur ${
+            fullResolution
+              ? "border-accent-cyan bg-ui-bg/80 text-accent-cyan"
+              : "border-ui-border/50 bg-ui-bg/70 text-ui-ink-muted"
+          }`}
+        >
+          {fullResolution ? "HD · original" : "Thumbnail"}
+        </span>
 
         {typeof current.score === "number" && current.score > 0 && (
           <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-ui-bg/80 px-2.5 py-1 font-mono text-ui-2xs text-accent-cyan backdrop-blur">
