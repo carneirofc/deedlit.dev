@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // DB power-user / debug page (#30, ADR 0001).
@@ -21,6 +21,10 @@ const cls = {
 };
 
 const SAFETY = ["", "sfw", "nsfw", "explicit"] as const;
+
+// Catalog page size for the infinite-scroll list. A short final page (< this)
+// means there is nothing more to fetch.
+const PAGE_SIZE = 60;
 
 interface CatalogImage {
   sha256: string;
@@ -75,28 +79,74 @@ export default function DbPage() {
   const [safety, setSafety] = useState("");
   const [favorite, setFavorite] = useState(false);
   const [images, setImages] = useState<CatalogImage[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<CatalogImage | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const load = useCallback(() => {
-    const sp = new URLSearchParams({ limit: "100" });
-    if (tag.trim()) sp.set("tag", tag.trim());
-    if (safety) sp.set("safety", safety);
-    if (favorite) sp.set("favorite", "true");
-    fetch(`/api/library/admin/images?${sp.toString()}`)
-      .then((r) => r.json())
-      .then((j) => {
-        if (Array.isArray(j.images)) setImages(j.images as CatalogImage[]);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : "Load failed"));
-  }, [tag, safety, favorite]);
-
+  // Page cursor + the scroll container / sentinel for infinite scroll. Filters
+  // live in a ref so loadMore() reads the current values without re-creating the
+  // callback (which would re-arm the observer on every keystroke).
+  const pageRef = useRef(0);
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const filtersRef = useRef({ tag, safety, favorite });
   useEffect(() => {
-    load();
-  }, [load]);
+    filtersRef.current = { tag, safety, favorite };
+  });
+
+  const fetchPage = useCallback(async (reset: boolean) => {
+    const f = filtersRef.current;
+    const offset = reset ? 0 : pageRef.current * PAGE_SIZE;
+    const sp = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
+    if (f.tag.trim()) sp.set("tag", f.tag.trim());
+    if (f.safety) sp.set("safety", f.safety);
+    if (f.favorite) sp.set("favorite", "true");
+    setLoadingMore(true);
+    try {
+      const j = await fetch(`/api/library/admin/images?${sp.toString()}`).then((r) => r.json());
+      const batch: CatalogImage[] = Array.isArray(j.images) ? (j.images as CatalogImage[]) : [];
+      setHasMore(batch.length === PAGE_SIZE);
+      if (reset) {
+        pageRef.current = 1;
+        setImages(batch);
+      } else {
+        pageRef.current += 1;
+        setImages((prev) => [...prev, ...batch]);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Load failed");
+    } finally {
+      setLoadingMore(false);
+    }
+  }, []);
+
+  const load = useCallback(() => fetchPage(true), [fetchPage]);
+  const loadMore = useCallback(() => fetchPage(false), [fetchPage]);
+
+  // Re-query from the top whenever a filter changes (mirrors the prior auto-load).
+  useEffect(() => {
+    fetchPage(true);
+  }, [tag, safety, favorite, fetchPage]);
+
+  // Infinite scroll: pull the next page as the sentinel nears the bottom of the
+  // scrollable list (root = the list container, not the viewport).
+  useEffect(() => {
+    if (!hasMore) return;
+    const el = sentinelRef.current;
+    if (!el) return;
+    const ob = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && !loadingMore) loadMore();
+      },
+      { root: listScrollRef.current, rootMargin: "400px" },
+    );
+    ob.observe(el);
+    return () => ob.disconnect();
+  }, [hasMore, loadingMore, loadMore]);
 
   const select = (img: CatalogImage) => {
     setSelected(img);
@@ -171,7 +221,7 @@ export default function DbPage() {
   };
 
   return (
-    <div className="mx-auto flex w-full min-w-0 max-w-[1400px] flex-col gap-6" data-testid="db-page">
+    <div className="flex w-full min-w-0 flex-col gap-6" data-testid="db-page">
       <header>
         <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Database (power tools)</h1>
         <p className="text-ui-sm text-ui-ink-muted">
@@ -224,37 +274,60 @@ export default function DbPage() {
         {/* List */}
         <section className={`${cls.card} min-w-0`} data-testid="db-list">
           <h2 className="mb-2 text-ui-sm font-semibold text-ui-ink-title">
-            Images <span className="text-ui-2xs text-ui-ink-muted">({images.length})</span>
+            Images{" "}
+            <span className="text-ui-2xs text-ui-ink-muted">
+              ({images.length}
+              {hasMore ? "+" : ""})
+            </span>
           </h2>
-          <div className="flex max-h-[70vh] min-w-0 flex-col gap-1 overflow-y-auto">
+          <div
+            ref={listScrollRef}
+            className="flex max-h-[70vh] min-w-0 flex-col gap-1 overflow-y-auto"
+          >
             {images.map((img) => (
               <button
                 key={img.sha256}
                 onClick={() => select(img)}
-                className={`w-full min-w-0 rounded-lg border px-3 py-2 text-left text-ui-xs transition ${
+                className={`flex w-full min-w-0 items-center gap-2 rounded-lg border px-3 py-2 text-left text-ui-xs transition ${
                   selected?.sha256 === img.sha256
                     ? "border-accent-cyan bg-accent-cyan/10"
                     : "border-ui-border/50 bg-ui-bg hover:bg-ui-bg-soft"
                 }`}
                 data-testid={`db-row-${img.sha256}`}
               >
-                <div className="flex items-center gap-2">
-                  {img.safety && (
-                    <span className="shrink-0 rounded-full bg-ui-bg-soft px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">
-                      {img.safety}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`/api/library/images/${img.sha256}/thumbnail`}
+                  alt=""
+                  loading="lazy"
+                  className="h-10 w-10 shrink-0 rounded-md border border-ui-border/50 bg-ui-bg-soft object-cover"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    {img.safety && (
+                      <span className="shrink-0 rounded-full bg-ui-bg-soft px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">
+                        {img.safety}
+                      </span>
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-ui-ink">
+                      {img.prompt || img.sha256.slice(0, 16)}
                     </span>
-                  )}
-                  <span className="min-w-0 flex-1 truncate text-ui-ink">
-                    {img.prompt || img.sha256.slice(0, 16)}
-                  </span>
-                  {img.favorite && <span className="shrink-0 text-amber-500">★</span>}
-                </div>
-                <div className="mt-0.5 truncate font-mono text-ui-2xs text-ui-ink-muted">
-                  {img.sha256}
+                    {img.favorite && <span className="shrink-0 text-amber-500">★</span>}
+                  </div>
+                  <div className="mt-0.5 truncate font-mono text-ui-2xs text-ui-ink-muted">
+                    {img.sha256}
+                  </div>
                 </div>
               </button>
             ))}
-            {images.length === 0 && <p className="text-ui-sm text-ui-ink-muted">No images.</p>}
+            {images.length === 0 && !loadingMore && (
+              <p className="text-ui-sm text-ui-ink-muted">No images.</p>
+            )}
+            {/* Infinite-scroll trigger + loading indicator (inside the scroll box). */}
+            <div ref={sentinelRef} aria-hidden="true" className="h-px" />
+            {loadingMore && (
+              <p className="py-2 text-center text-ui-2xs text-ui-ink-muted">Loading…</p>
+            )}
           </div>
         </section>
 
@@ -264,6 +337,12 @@ export default function DbPage() {
             <p className="text-ui-sm text-ui-ink-muted">Select an image to inspect and edit.</p>
           ) : (
             <div className="flex flex-col gap-3">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={`/api/library/images/${selected.sha256}/thumbnail`}
+                alt={selected.prompt ?? ""}
+                className="max-h-72 w-full rounded-lg border border-ui-border/50 bg-ui-bg-soft object-contain"
+              />
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="min-w-0 flex-1 truncate font-mono text-ui-2xs text-ui-ink-muted">{selected.sha256}</span>
                 <div className="flex shrink-0 flex-wrap gap-1">
