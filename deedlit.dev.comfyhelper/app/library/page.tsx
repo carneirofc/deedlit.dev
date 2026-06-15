@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";
 import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
+import { deleteImages } from "@/lib/library/bulk-delete";
 import type { GraphScope } from "@/lib/library/schemas";
 import {
   gridColumnsClass,
@@ -111,6 +112,14 @@ export default function LibraryPage() {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [lightboxAutoPlay, setLightboxAutoPlay] = useState(false);
 
+  // Bulk selection / delete. In select mode a card click toggles selection
+  // instead of opening the viewer; "Delete selected" un-indexes each picked
+  // image (catalog + search + graph), leaving the originals on disk.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [confirmingBulk, setConfirmingBulk] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
   // System
   const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
@@ -134,8 +143,13 @@ export default function LibraryPage() {
     async (append: boolean, overrides?: Partial<typeof filtersRef.current>) => {
       const s = { ...filtersRef.current, ...overrides };
 
-      // A fresh search invalidates the open viewer (its indices no longer map).
-      if (!append) setLightboxIndex(null);
+      // A fresh search invalidates the open viewer (its indices no longer map)
+      // and any pending bulk selection (those ids may not be in the new set).
+      if (!append) {
+        setLightboxIndex(null);
+        setSelected(new Set());
+        setConfirmingBulk(false);
+      }
 
       // Image mode with no image yet: nothing to search.
       if (s.mode === "image" && !s.imageFile) {
@@ -248,6 +262,58 @@ export default function LibraryPage() {
     setLightboxAutoPlay(autoplay);
     setLightboxIndex(index);
   }, []);
+
+  const toggleSelect = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    setConfirmingBulk(false);
+  }, []);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false);
+    setSelected(new Set());
+    setConfirmingBulk(false);
+  }, []);
+
+  // Un-index every selected image, fanning the per-image delete out with bounded
+  // concurrency. Whatever actually went away is pruned from the grid even on a
+  // partial failure; the rest stay selected with the reason surfaced.
+  const deleteSelected = useCallback(async () => {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    setError(null);
+    try {
+      const { deleted, failed } = await deleteImages(ids);
+      if (deleted.length > 0) {
+        const gone = new Set(deleted);
+        setResults((prev) => prev.filter((r) => !gone.has(r.imageId)));
+        setSelected((prev) => {
+          const next = new Set(prev);
+          for (const id of gone) next.delete(id);
+          return next;
+        });
+      }
+      if (failed.length > 0) {
+        setError(
+          `Deleted ${deleted.length}/${ids.length}. ${failed.length} failed: ${failed[0].error}`,
+        );
+        setConfirmingBulk(false);
+      } else {
+        exitSelectMode();
+      }
+    } finally {
+      setBulkDeleting(false);
+    }
+  }, [selected, exitSelectMode]);
 
   const findSimilar = useCallback(
     (id: string, thumbUrl: string, summary: string) => {
@@ -393,7 +459,7 @@ export default function LibraryPage() {
   const imagePanelOpen = showImageSearch || mode === "image";
 
   return (
-    <div className="mx-auto flex max-w-[2000px] flex-col gap-6">
+    <div className="flex w-full min-w-0 flex-col gap-6">
       {/* Header */}
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -405,6 +471,23 @@ export default function LibraryPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+            disabled={results.length === 0}
+            aria-pressed={selectMode}
+            className={`flex items-center gap-1.5 rounded-lg border bg-ui-bg px-2.5 py-1.5 text-ui-2xs font-medium transition disabled:opacity-40 ${
+              selectMode
+                ? "border-accent-cyan text-accent-cyan"
+                : "border-ui-border/60 text-ui-ink-muted hover:border-accent-cyan hover:text-accent-cyan"
+            }`}
+            title="Select multiple images to delete"
+          >
+            <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M9 11l3 3 8-8" />
+              <path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" />
+            </svg>
+            {selectMode ? "Done" : "Select"}
+          </button>
           <button
             onClick={() => openLightbox(0, true)}
             disabled={results.length === 0}
@@ -707,6 +790,56 @@ export default function LibraryPage() {
         </p>
       )}
 
+      {/* Bulk-selection toolbar */}
+      {selectMode && results.length > 0 && (
+        <div className="sticky top-2 z-20 flex flex-wrap items-center gap-2 rounded-xl border border-accent-cyan/40 bg-ui-bg-soft/90 px-3 py-2 backdrop-blur-sm">
+          <span className="text-ui-sm font-medium text-ui-ink">
+            {selected.size} selected
+          </span>
+          <button
+            className={cls.btn}
+            onClick={() => setSelected(new Set(results.map((r) => r.imageId)))}
+            disabled={selected.size === results.length}
+          >
+            Select all
+          </button>
+          <button className={cls.btn} onClick={clearSelection} disabled={selected.size === 0}>
+            Clear
+          </button>
+          <div className="flex-1" />
+          {!confirmingBulk ? (
+            <button
+              onClick={() => setConfirmingBulk(true)}
+              disabled={selected.size === 0}
+              className="rounded-lg border border-rose-500/60 px-3 py-2 text-ui-sm font-medium text-rose-400 transition hover:bg-rose-500/10 disabled:opacity-50"
+            >
+              Delete selected
+            </button>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-ui-xs text-ui-ink-muted">
+                Remove {selected.size} image{selected.size === 1 ? "" : "s"} from the
+                library? Originals on disk are kept.
+              </span>
+              <button
+                onClick={deleteSelected}
+                disabled={bulkDeleting}
+                className="rounded-lg bg-rose-500/90 px-3 py-2 text-ui-sm font-medium text-white transition hover:bg-rose-500 disabled:opacity-60"
+              >
+                {bulkDeleting ? "Removing…" : "Remove"}
+              </button>
+              <button
+                onClick={() => setConfirmingBulk(false)}
+                disabled={bulkDeleting}
+                className={cls.btn}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
       {results.length > 0 && (
         <ResultsView
           results={results}
@@ -714,6 +847,9 @@ export default function LibraryPage() {
           density={settings.gridDensity}
           showScores={settings.showScores}
           showCardMeta={settings.showCardMeta}
+          selectMode={selectMode}
+          selected={selected}
+          onToggleSelect={toggleSelect}
           onSimilar={findSimilar}
           onOpen={openLightbox}
         />
@@ -827,6 +963,13 @@ export default function LibraryPage() {
 
 type SimilarHandler = (id: string, thumbUrl: string, summary: string) => void;
 type OpenHandler = (index: number) => void;
+type ToggleSelectHandler = (id: string) => void;
+
+interface SelectionProps {
+  selectMode: boolean;
+  selected: Set<string>;
+  onToggleSelect: ToggleSelectHandler;
+}
 
 /** Renders the result set in the layout chosen in settings (grid / masonry / list). */
 function ResultsView({
@@ -835,6 +978,9 @@ function ResultsView({
   density,
   showScores,
   showCardMeta,
+  selectMode,
+  selected,
+  onToggleSelect,
   onSimilar,
   onOpen,
 }: {
@@ -845,7 +991,7 @@ function ResultsView({
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
   onOpen: OpenHandler;
-}) {
+} & SelectionProps) {
   if (viewMode === "list") {
     return (
       <div className="flex flex-col gap-2">
@@ -856,6 +1002,9 @@ function ResultsView({
             index={i}
             showScores={showScores}
             showCardMeta={showCardMeta}
+            selectMode={selectMode}
+            isSelected={selected.has(r.imageId)}
+            onToggleSelect={onToggleSelect}
             onSimilar={onSimilar}
             onOpen={onOpen}
           />
@@ -875,11 +1024,32 @@ function ResultsView({
           masonry={masonry}
           showScores={showScores}
           showCardMeta={showCardMeta}
+          selectMode={selectMode}
+          isSelected={selected.has(r.imageId)}
+          onToggleSelect={onToggleSelect}
           onSimilar={onSimilar}
           onOpen={onOpen}
         />
       ))}
     </div>
+  );
+}
+
+/** Checkbox overlay shown on each card/row while in select mode. */
+function SelectCheck({ checked }: { checked: boolean }) {
+  return (
+    <span
+      className={`flex h-5 w-5 items-center justify-center rounded border transition ${
+        checked
+          ? "border-accent-cyan bg-accent-cyan text-ui-bg-deep"
+          : "border-ui-border/80 bg-ui-bg/80 text-transparent backdrop-blur-sm"
+      }`}
+      aria-hidden="true"
+    >
+      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M5 12l5 5 9-11" />
+      </svg>
+    </span>
   );
 }
 
@@ -924,6 +1094,9 @@ function ResultCard({
   masonry,
   showScores,
   showCardMeta,
+  selectMode,
+  isSelected,
+  onToggleSelect,
   onSimilar,
   onOpen,
 }: {
@@ -934,21 +1107,27 @@ function ResultCard({
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
   onOpen: OpenHandler;
-}) {
+  isSelected: boolean;
+} & Omit<SelectionProps, "selected">) {
   return (
     <div
-      className={`group relative overflow-hidden rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 transition hover:border-accent-cyan ${
-        masonry ? "mb-3 break-inside-avoid" : ""
-      }`}
+      className={`group relative overflow-hidden rounded-xl border bg-ui-bg-soft/40 transition ${
+        isSelected ? "border-accent-cyan ring-2 ring-accent-cyan" : "border-ui-border/60 hover:border-accent-cyan"
+      } ${masonry ? "mb-3 break-inside-avoid" : ""}`}
     >
       <a
         href={`/library/${r.imageId}`}
         onClick={(e) => {
+          if (selectMode) {
+            e.preventDefault();
+            onToggleSelect(r.imageId);
+            return;
+          }
           if (!shouldOpenViewer(e)) return;
           e.preventDefault();
           onOpen(index);
         }}
-        className="block cursor-zoom-in"
+        className={selectMode ? "block cursor-pointer" : "block cursor-zoom-in"}
       >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
@@ -959,16 +1138,30 @@ function ResultCard({
         />
       </a>
 
-      {/* Hover action: find similar */}
-      <div className="pointer-events-none absolute right-1.5 top-1.5 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
+      {/* Selection checkbox (select mode only) */}
+      {selectMode && (
         <button
-          onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-          className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
-          title="Find similar images"
+          onClick={() => onToggleSelect(r.imageId)}
+          className="absolute left-1.5 top-1.5"
+          aria-pressed={isSelected}
+          aria-label={isSelected ? "Deselect image" : "Select image"}
         >
-          Similar
+          <SelectCheck checked={isSelected} />
         </button>
-      </div>
+      )}
+
+      {/* Hover action: find similar (hidden while selecting) */}
+      {!selectMode && (
+        <div className="pointer-events-none absolute right-1.5 top-1.5 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
+          <button
+            onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
+            className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
+            title="Find similar images"
+          >
+            Similar
+          </button>
+        </div>
+      )}
 
       {showCardMeta && (
         <div className="p-2">
@@ -985,6 +1178,9 @@ function ResultRow({
   index,
   showScores,
   showCardMeta,
+  selectMode,
+  isSelected,
+  onToggleSelect,
   onSimilar,
   onOpen,
 }: {
@@ -994,15 +1190,36 @@ function ResultRow({
   showCardMeta: boolean;
   onSimilar: SimilarHandler;
   onOpen: OpenHandler;
-}) {
+  isSelected: boolean;
+} & Omit<SelectionProps, "selected">) {
   const open = (e: React.MouseEvent) => {
+    if (selectMode) {
+      e.preventDefault();
+      onToggleSelect(r.imageId);
+      return;
+    }
     if (!shouldOpenViewer(e)) return;
     e.preventDefault();
     onOpen(index);
   };
+  const linkClass = selectMode ? "cursor-pointer" : "cursor-zoom-in";
   return (
-    <div className="group flex items-center gap-3 rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-2 transition hover:border-accent-cyan">
-      <a href={`/library/${r.imageId}`} onClick={open} className="shrink-0 cursor-zoom-in">
+    <div
+      className={`group flex items-center gap-3 rounded-xl border bg-ui-bg-soft/40 p-2 transition ${
+        isSelected ? "border-accent-cyan ring-2 ring-accent-cyan" : "border-ui-border/60 hover:border-accent-cyan"
+      }`}
+    >
+      {selectMode && (
+        <button
+          onClick={() => onToggleSelect(r.imageId)}
+          className="shrink-0"
+          aria-pressed={isSelected}
+          aria-label={isSelected ? "Deselect image" : "Select image"}
+        >
+          <SelectCheck checked={isSelected} />
+        </button>
+      )}
+      <a href={`/library/${r.imageId}`} onClick={open} className={`shrink-0 ${linkClass}`}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={r.thumbnailUrl}
@@ -1012,18 +1229,20 @@ function ResultRow({
         />
       </a>
       <div className="min-w-0 flex-1">
-        <a href={`/library/${r.imageId}`} onClick={open} className="block cursor-zoom-in">
+        <a href={`/library/${r.imageId}`} onClick={open} className={`block ${linkClass}`}>
           <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
         </a>
         {showCardMeta && <CardMeta r={r} showScores={showScores} />}
       </div>
-      <button
-        onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-        className="shrink-0 rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
-        title="Find similar images"
-      >
-        Similar
-      </button>
+      {!selectMode && (
+        <button
+          onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
+          className="shrink-0 rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
+          title="Find similar images"
+        >
+          Similar
+        </button>
+      )}
     </div>
   );
 }
