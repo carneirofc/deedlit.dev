@@ -149,6 +149,14 @@ export default function LibraryPage() {
   // Fullscreen viewer / slideshow
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [lightboxAutoPlay, setLightboxAutoPlay] = useState(false);
+  // Live mirror so the freshness poll can tell the viewer is open without taking
+  // lightboxIndex as a dep (it changes on every slideshow step — that would
+  // restart the poll interval each frame). Never auto-prepend under an open
+  // viewer: it would shift the indices out from under the current slide.
+  const lightboxOpenRef = useRef(false);
+  useEffect(() => {
+    lightboxOpenRef.current = lightboxIndex !== null;
+  }, [lightboxIndex]);
 
   // Bulk selection / delete. In select mode a card click toggles selection
   // instead of opening the viewer; "Delete selected" un-indexes each picked
@@ -297,7 +305,13 @@ export default function LibraryPage() {
 
         if (append) {
           pageRef.current += 1;
-          setResults((prev) => [...prev, ...fresh]);
+          // Drop any id already on screen. Offset paging can re-emit a boundary
+          // row when the underlying set shifts between page fetches (an ingest
+          // lands mid-scroll); a repeated id would collide as a React key.
+          setResults((prev) => {
+            const seen = new Set(prev.map((r) => r.imageId));
+            return [...prev, ...fresh.filter((r) => !seen.has(r.imageId))];
+          });
         } else {
           pageRef.current = 1;
           setResults(fresh);
@@ -511,10 +525,15 @@ export default function LibraryPage() {
   }, [settings.infiniteScroll, hasMore, loading, loadMore]);
 
   // Freshness poll: while filter-only browsing, watch the newest catalog head for
-  // the current filter set. When a newer image than the one we baselined appears
-  // (ingest finished, a backfill landed), raise the "new images" banner instead
-  // of silently going stale. Only runs on the browse path — search results are a
+  // the current filter set. Only runs on the browse path — search results are a
   // point-in-time ranking, not a live feed.
+  //
+  // When the grid is sorted newest-first and the user is parked at the top with no
+  // viewer open, new arrivals are spliced straight into the grid (no click). Any
+  // other case — a different sort, scrolled down, viewer open — keeps the gentle
+  // "New images — refresh" banner instead, so the scroll position never jumps out
+  // from under the user. `relevance` maps to newest on the browse path, so it
+  // counts as newest-first here too.
   useEffect(() => {
     if (!isBrowsePath(mode, query)) {
       setHasNew(false);
@@ -522,6 +541,9 @@ export default function LibraryPage() {
     }
     const safetySubset =
       safety.length > 0 && safety.length < SAFETY_CLASSES.length ? safety : undefined;
+    // Only a newest-first grid can correctly receive arrivals at the head; for
+    // other sorts new rows belong elsewhere, so we just detect + banner.
+    const newestFirst = settings.sortMode === "newest" || settings.sortMode === "relevance";
     const body = {
       tags: tags.length ? tags : undefined,
       excludeTags: excludeTags.length ? excludeTags : undefined,
@@ -529,7 +551,9 @@ export default function LibraryPage() {
       ratingGte: minRating > 0 ? minRating : undefined,
       safety: safetySubset,
       sort: "newest" as const,
-      limit: 1,
+      // Pull a small window when we may splice (catch a short burst of arrivals);
+      // a single row is enough just to detect change for the banner path.
+      limit: newestFirst ? 12 : 1,
       offset: 0,
     };
     let alive = true;
@@ -542,21 +566,39 @@ export default function LibraryPage() {
         });
         if (!r.ok) return;
         const j = await r.json();
-        const topId: string | null = j.results?.[0]?.imageId ?? null;
+        const rows: CompactResult[] = j.results ?? [];
+        const topId = rows[0]?.imageId ?? null;
         if (!alive || !topId) return;
-        if (newestIdRef.current === null) newestIdRef.current = topId;
-        else if (topId !== newestIdRef.current) setHasNew(true);
+        if (newestIdRef.current === null) {
+          newestIdRef.current = topId; // baseline whatever's at the head now
+          return;
+        }
+        if (topId === newestIdRef.current) return; // nothing new
+
+        const canSplice =
+          newestFirst && !lightboxOpenRef.current && window.scrollY < 200;
+        if (canSplice) {
+          setResults((prev) => {
+            const seen = new Set(prev.map((p) => p.imageId));
+            const incoming = rows.filter((p) => !seen.has(p.imageId));
+            return incoming.length ? [...incoming, ...prev] : prev;
+          });
+          newestIdRef.current = topId;
+          setHasNew(false);
+        } else {
+          setHasNew(true); // surface the banner; refresh re-pages from the top
+        }
       } catch {
         // transient — try again next tick
       }
     };
     check();
-    const id = setInterval(check, 15000);
+    const id = setInterval(check, 4000);
     return () => {
       alive = false;
       clearInterval(id);
     };
-  }, [mode, query, tags, excludeTags, favorites, minRating, safety]);
+  }, [mode, query, tags, excludeTags, favorites, minRating, safety, settings.sortMode]);
 
   const startIngest = async () => {
     if (!folderPath.trim()) return;

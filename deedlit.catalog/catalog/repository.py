@@ -185,14 +185,20 @@ def get_image(sha256: str) -> Image | None:
 # interpolated from caller input, so the ORDER BY clause can be safely embedded
 # in the SQL string. `name_*` sorts by the OS-agnostic basename of file_path
 # (strip everything up to the last / or \) so "name" means filename, not folder.
+#
+# Every clause ENDS in `i.sha256_hash` — a unique key — so the order is TOTAL.
+# Without it, ties on the primary key (a bulk ingest stamps many rows with the
+# same `imported_at`; ratings/names collide freely) leave row order undefined,
+# and LIMIT/OFFSET paging over an undefined order repeats some rows on the next
+# page and skips others. That surfaced as duplicate React keys in the grid.
 _NAME_EXPR = r"lower(regexp_replace(i.file_path, '^.*[/\\]', ''))"
 _ORDER_BY: dict[str, str] = {
-    "newest": "i.imported_at DESC",
-    "oldest": "i.imported_at ASC",
-    "rating_desc": "i.rating DESC NULLS LAST, i.imported_at DESC",
-    "rating_asc": "i.rating ASC NULLS LAST, i.imported_at DESC",
-    "name_asc": f"{_NAME_EXPR} ASC, i.imported_at DESC",
-    "name_desc": f"{_NAME_EXPR} DESC, i.imported_at DESC",
+    "newest": "i.imported_at DESC, i.sha256_hash DESC",
+    "oldest": "i.imported_at ASC, i.sha256_hash ASC",
+    "rating_desc": "i.rating DESC NULLS LAST, i.imported_at DESC, i.sha256_hash DESC",
+    "rating_asc": "i.rating ASC NULLS LAST, i.imported_at DESC, i.sha256_hash DESC",
+    "name_asc": f"{_NAME_EXPR} ASC, i.imported_at DESC, i.sha256_hash DESC",
+    "name_desc": f"{_NAME_EXPR} DESC, i.imported_at DESC, i.sha256_hash DESC",
 }
 
 
