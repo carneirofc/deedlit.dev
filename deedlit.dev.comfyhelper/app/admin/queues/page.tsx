@@ -48,7 +48,18 @@ interface Task {
   updated_at?: string | null;
 }
 
-const DLQ_BASES = ["index", "label"] as const;
+// Per-stage DAG queues (ADR 0002): the opt-in `ingest` producer queue, the
+// embed/index/label stages, plus the legacy `index` queue kept for in-flight
+// migration drain. Each has a `<base>.dlq` with peek/requeue/purge controls.
+const DLQ_BASES = [
+  "ingest",
+  "embed.dense",
+  "embed.sparse",
+  "index.search",
+  "index.graph",
+  "label",
+  "index",
+] as const;
 
 function statusColor(status: string): string {
   switch (status) {
@@ -148,7 +159,8 @@ export default function QueuesPage() {
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Queues</h1>
           <p className="text-ui-sm text-ui-ink-muted">
-            Async index/label task queues — live depth, dead-letters, and per-image history.
+            Per-stage ingest DAG queues (embed.dense/embed.sparse → index.search,
+            index.graph, label) — live depth, dead-letters, and per-image history.
           </p>
         </div>
         <a

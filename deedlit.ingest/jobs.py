@@ -19,52 +19,121 @@ from pathlib import Path
 from typing import Any
 
 import broker
+import config
 import ledger
 import pipeline
 
 log = logging.getLogger("deedlit.ingest.jobs")
 
 
-async def _publish_index_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
-    """Publish an index task, swallowing broker errors (ADR 0001).
+async def _publish_stage_best_effort(
+    publisher: Callable[..., Any], queue: str, sha256: str, parent_op_id: str | None = None
+) -> bool:
+    """Publish one per-image stage task, swallowing broker errors (ADR 0001/0002).
 
     The catalog write is the durability boundary: a publish failure must NEVER
     fail the fast path. The image stays cataloged-but-unprojected and the
-    reconcile sweep re-enqueues it once the broker is back. Returns True on a
-    successful publish (lets callers/tests assert the happy path).
+    reconcile / label-backfill sweeps re-enqueue it once the broker is back.
+    Records ``queued`` on the ledger best-effort (off the critical path). Returns
+    True on a successful publish (lets callers/tests assert the happy path).
     """
     try:
-        await broker.publish_index_task(sha256, parent_op_id=parent_op_id)
+        await publisher(sha256, parent_op_id=parent_op_id)
     except Exception as exc:  # noqa: BLE001 — best-effort by design
         log.warning(
-            "index publish failed for %s (%s); reconcile will re-enqueue", sha256[:12], exc
+            "%s publish failed for %s (%s); a sweep will re-enqueue", queue, sha256[:12], exc
         )
         return False
-    # Record queued on the ledger best-effort (off the critical path).
     await asyncio.to_thread(
-        ledger.record_task, sha256, broker.INDEX_QUEUE, "queued", None, None, parent_op_id
+        ledger.record_task, sha256, queue, "queued", None, None, parent_op_id
     )
     return True
+
+
+async def _publish_index_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    """Best-effort publish of the legacy ADR 0001 ``index`` task (migration only)."""
+    return await _publish_stage_best_effort(
+        broker.publish_index_task, broker.INDEX_QUEUE, sha256, parent_op_id
+    )
+
+
+async def _publish_embed_dense_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    return await _publish_stage_best_effort(
+        broker.publish_embed_dense_task, broker.EMBED_DENSE_QUEUE, sha256, parent_op_id
+    )
+
+
+async def _publish_embed_sparse_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    return await _publish_stage_best_effort(
+        broker.publish_embed_sparse_task, broker.EMBED_SPARSE_QUEUE, sha256, parent_op_id
+    )
+
+
+async def _publish_index_search_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    return await _publish_stage_best_effort(
+        broker.publish_index_search_task, broker.INDEX_SEARCH_QUEUE, sha256, parent_op_id
+    )
+
+
+async def _publish_index_graph_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    return await _publish_stage_best_effort(
+        broker.publish_index_graph_task, broker.INDEX_GRAPH_QUEUE, sha256, parent_op_id
+    )
 
 
 async def _publish_label_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
-    """Publish a label task, swallowing broker errors (ADR 0001).
+    return await _publish_stage_best_effort(
+        broker.publish_label_task, broker.LABEL_QUEUE, sha256, parent_op_id
+    )
 
-    Best-effort like the index publish: a failure here just means the image is
-    unlabeled until the label-backfill sweep re-enqueues it. Returns True on a
-    successful publish.
+
+async def _publish_ingest_best_effort(
+    path: str, source_folder_id: str | None = None, parent_op_id: str | None = None
+) -> bool:
+    """Best-effort publish of an ``ingest`` task for one file path (ADR 0002).
+
+    No ledger row (ingest is keyed by path, not sha; the downstream per-image
+    stages carry the ledger). Returns False on a broker error so the caller can
+    fall back to the inline fast path and still land the catalog write.
     """
     try:
-        await broker.publish_label_task(sha256, parent_op_id=parent_op_id)
-    except Exception as exc:  # noqa: BLE001 — best-effort by design
-        log.warning(
-            "label publish failed for %s (%s); backfill will re-enqueue", sha256[:12], exc
+        await broker.publish_ingest_task(
+            path, source_folder_id=source_folder_id, parent_op_id=parent_op_id
         )
+    except Exception as exc:  # noqa: BLE001 — best-effort; caller falls back inline
+        log.warning("ingest publish failed for %s (%s); running inline fallback", path, exc)
         return False
-    await asyncio.to_thread(
-        ledger.record_task, sha256, broker.LABEL_QUEUE, "queued", None, None, parent_op_id
-    )
     return True
+
+
+async def _publish_reproject_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+    """Re-publish the projection stages (no re-label) for one image (ADR 0002).
+
+    Drives embed.dense + embed.sparse (which fan into index.search) + index.graph
+    from catalog truth — the bulk ``rebuild-search`` / ``rebuild-graph`` reproject
+    set. Returns True only when all three enqueue, so the bulk job's ``failed``
+    count reflects a broker hiccup. Does NOT re-label (that is label-backfill).
+    """
+    results = [
+        await _publish_embed_dense_best_effort(sha256, parent_op_id),
+        await _publish_embed_sparse_best_effort(sha256, parent_op_id),
+        await _publish_index_graph_best_effort(sha256, parent_op_id),
+    ]
+    return all(results)
+
+
+async def _publish_post_ingest_best_effort(sha256: str, parent_op_id: str | None = None) -> None:
+    """Enqueue the per-stage DAG after a fast-path catalog write (ADR 0002).
+
+    Fans out the four downstream stages — embed.dense + embed.sparse (which both
+    fan in to index.search), index.graph, and label. Each is best-effort: a broker
+    hiccup leaves the image cataloged-but-unprojected, and reconcile (embed/index)
+    + label-backfill re-enqueue once the broker returns.
+    """
+    await _publish_embed_dense_best_effort(sha256, parent_op_id)
+    await _publish_embed_sparse_best_effort(sha256, parent_op_id)
+    await _publish_index_graph_best_effort(sha256, parent_op_id)
+    await _publish_label_best_effort(sha256, parent_op_id)
 
 
 def _now_iso() -> str:
@@ -81,6 +150,31 @@ CANCELLED = "cancelled"
 # Root walked by the ``rescan-files`` maintenance job when no folderPath is
 # given. Mirrors the monolith's IMAGE_LIBRARY_ROOT.
 LIBRARY_ROOT = os.getenv("IMAGE_LIBRARY_ROOT", os.path.join("data", "library"))
+
+
+def ingest_concurrency() -> int:
+    """How many files a folder scan fast-paths at once (ADR 0002). >= 1.
+
+    Read live from :mod:`config` (env default + settings-panel override) on every
+    scan, so it can be tuned from the UI without a restart (and pinned to 1 in
+    tests that need deterministic serial ordering, via the env). Bounds the
+    producer's in-flight work so a big folder parallelizes catalog writes without
+    unbounded fan-out — an asyncio.Semaphore, not a thread lock.
+    """
+    return config.runtime()["ingest_concurrency"]
+
+
+def ingest_via_queue() -> bool:
+    """Opt-in: route the folder scan through the ``ingest`` queue (ADR 0002).
+
+    Off by default — the fast path runs inline (bounded concurrency), keeping the
+    catalog write as the durability boundary. When on, the scan publishes a cheap
+    ``ingest`` task per file and the ingest-worker pool catalogs them across
+    processes; a broker outage falls back to the inline fast path so the catalog
+    write still lands. Read live from :mod:`config` so it can be flipped from the
+    settings panel without a restart.
+    """
+    return config.runtime()["ingest_via_queue"]
 
 # Maintenance job types (mirrors MaintenanceRequest.type in the contract).
 REINDEX_ONE_IMAGE = "reindex-one-image"
@@ -369,14 +463,37 @@ class JobStore:
         )
 
     async def _run_folder(self, job: Job) -> None:
+        """Walk the folder and fast-path each file with BOUNDED CONCURRENCY (ADR
+        0002).
+
+        The fast path (catalog write + thumbnail) runs inline so the catalog write
+        stays the durability boundary, but up to ``INGEST_CONCURRENCY`` files are
+        processed at once — overlapping their metadata round-trip + catalog write
+        + thumbnail encode — so image availability scales past the old serial loop.
+        A semaphore bounds in-flight work; cancellation is honoured between
+        launches (already-launched files finish, then the job settles cancelled).
+        """
         files = _list_supported_files(job.folder_path or "")
         job.progress.total = len(files)
+        sem = asyncio.Semaphore(ingest_concurrency())
+        tasks: list[asyncio.Task] = []
+
+        async def _run_one(path: Path) -> None:
+            try:
+                await self._process_one(job, path)
+            finally:
+                sem.release()
+
         for path in files:
             if job.cancel_requested:
-                job.status = CANCELLED
-                return
-            await self._process_one(job, path)
-        job.status = COMPLETED
+                break
+            await sem.acquire()  # block until a concurrency slot frees up
+            if job.cancel_requested:
+                sem.release()
+                break
+            tasks.append(asyncio.create_task(_run_one(path)))
+        await asyncio.gather(*tasks)
+        job.status = CANCELLED if job.cancel_requested else COMPLETED
 
     async def _run_reindex_one(self, job: Job) -> None:
         """Re-run the per-file pipeline for a single already-cataloged image.
@@ -408,13 +525,14 @@ class JobStore:
         job.status = COMPLETED
 
     async def _run_rebuild(self, job: Job) -> None:
-        """Rebuild a projection (ADR 0001 — coarse op as task producer).
+        """Rebuild a projection (ADR 0002 — coarse op as task producer).
 
-        ``rebuild-search`` / ``rebuild-graph`` are now BULK PRODUCERS: they publish
-        an index task for every cataloged image (an index task re-projects BOTH the
-        search and graph stores from catalog truth, so the two types are
-        equivalent). ``rebuild-thumbnails`` stays a catalog-owned rebuild
-        (thumbnails are catalog blobs, not a queue projection).
+        ``rebuild-search`` / ``rebuild-graph`` are BULK PRODUCERS: they re-publish
+        the projection stages (embed.dense + embed.sparse -> index.search, plus
+        index.graph) for every cataloged image from catalog truth, so the two
+        types are equivalent (both reproject all stores). ``rebuild-thumbnails``
+        stays a catalog-owned rebuild (thumbnails are catalog blobs, not a queue
+        projection).
         """
         if job.type in (REBUILD_SEARCH, REBUILD_GRAPH):
             await self._run_bulk_index(job)
@@ -430,7 +548,7 @@ class JobStore:
         job.status = COMPLETED
 
     async def _run_bulk_index(self, job: Job) -> None:
-        """Publish an index task for every cataloged image (bulk reprojection).
+        """Re-publish the projection stages for every cataloged image (ADR 0002).
 
         Progress counts images enqueued; cancellation is honoured between
         publishes. Best-effort publish: a broker hiccup increments ``failed`` but
@@ -442,64 +560,100 @@ class JobStore:
             if job.cancel_requested:
                 job.status = CANCELLED
                 return
-            if await _publish_index_best_effort(sha, parent_op_id=job.id):
+            if await _publish_reproject_best_effort(sha, parent_op_id=job.id):
                 job.progress.done += 1
             else:
                 job.progress.failed += 1
         job.status = COMPLETED
 
     async def _run_reconcile(self, job: Job) -> None:
-        """Reconcile sweep: catalog coverage vs search + graph projections (#21,
-        ADR 0001 — coarse op as task producer).
+        """Reconcile sweep: catalog truth vs the per-stage DAG outputs (#21,
+        ADR 0002 — coarse op as task producer).
 
-        Probes which cataloged images are missing from the search and/or graph
-        projection, then PUBLISHES an index task for each drifted image (one task
-        re-projects both stores). This is ALSO the safety net for the best-effort
-        publish model: an image cataloged while the broker was down shows as drift
-        here and gets re-enqueued. Progress counts catalog images probed;
-        cancellation is checked between probes and between publishes.
+        For each cataloged image, probe the four stage outputs that hang off
+        catalog truth — the persisted dense vector (``embedding`` blob), the
+        sparse vector (``sparse`` blob), the search point, and the graph node —
+        and re-publish exactly the stage(s) that are missing:
+
+          - no dense blob   -> embed.dense   (which fans into index.search)
+          - no sparse blob  -> embed.sparse  (which fans into index.search)
+          - both vectors present but no search point -> index.search directly
+          - no graph node   -> index.graph
+
+        This is the safety net for the best-effort publish model: anything dropped
+        during a broker outage shows up as drift here and is re-enqueued at the
+        right stage. Progress counts catalog images probed; cancellation is
+        checked between probes and between publishes.
         """
+        STAGES = (
+            broker.EMBED_DENSE_QUEUE,
+            broker.EMBED_SPARSE_QUEUE,
+            broker.INDEX_SEARCH_QUEUE,
+            broker.INDEX_GRAPH_QUEUE,
+        )
         catalog = await asyncio.to_thread(pipeline.list_catalog_sha256)
         job.progress.total = len(catalog)
 
         images: dict[str, dict[str, Any]] = {}
-        search_drift: list[str] = []
-        graph_drift: list[str] = []
+        drift: dict[str, list[str]] = {s: [] for s in STAGES}
 
-        # -- coverage probe (per catalog image) --
+        # -- per-stage coverage probe (per catalog image) --
         for sha in catalog:
             if job.cancel_requested:
                 job.status = CANCELLED
                 return
+            dense_ok = await asyncio.to_thread(pipeline.load_dense_blob, sha) is not None
+            sparse_ok = await asyncio.to_thread(pipeline.load_sparse_blob, sha) is not None
             in_search = await asyncio.to_thread(pipeline.search_has, sha)
             in_graph = await asyncio.to_thread(pipeline.graph_has, sha)
-            images[sha] = {"in_search": in_search, "in_graph": in_graph, "enqueued": False}
-            if not in_search:
-                search_drift.append(sha)
+
+            need: list[str] = []
+            if not dense_ok:
+                need.append(broker.EMBED_DENSE_QUEUE)
+            if not sparse_ok:
+                need.append(broker.EMBED_SPARSE_QUEUE)
+            # Only re-publish index.search directly when both vectors already exist
+            # (otherwise it would no-op); a missing vector's embed stage fans in.
+            if dense_ok and sparse_ok and not in_search:
+                need.append(broker.INDEX_SEARCH_QUEUE)
             if not in_graph:
-                graph_drift.append(sha)
+                need.append(broker.INDEX_GRAPH_QUEUE)
+
+            images[sha] = {
+                "dense": dense_ok, "sparse": sparse_ok,
+                "in_search": in_search, "in_graph": in_graph,
+                "enqueued": [],
+            }
+            for stage in need:
+                drift[stage].append(sha)
             job.progress.done += 1
 
         if job.cancel_requested:
             job.status = CANCELLED
             return
 
-        # -- re-enqueue an index task per drifted image (one task fixes both) --
-        enqueued: list[str] = []
-        for sha in sorted(set(search_drift) | set(graph_drift)):
-            if job.cancel_requested:
-                job.status = CANCELLED
-                return
-            if await _publish_index_best_effort(sha, parent_op_id=job.id):
-                images[sha]["enqueued"] = True
-                enqueued.append(sha)
+        # -- re-enqueue exactly the drifted stage(s) per image --
+        publishers = {
+            broker.EMBED_DENSE_QUEUE: _publish_embed_dense_best_effort,
+            broker.EMBED_SPARSE_QUEUE: _publish_embed_sparse_best_effort,
+            broker.INDEX_SEARCH_QUEUE: _publish_index_search_best_effort,
+            broker.INDEX_GRAPH_QUEUE: _publish_index_graph_best_effort,
+        }
+        enqueued: dict[str, list[str]] = {s: [] for s in STAGES}
+        for stage in STAGES:
+            for sha in drift[stage]:
+                if job.cancel_requested:
+                    job.status = CANCELLED
+                    return
+                if await publishers[stage](sha, parent_op_id=job.id):
+                    images[sha]["enqueued"].append(stage)
+                    enqueued[stage].append(sha)
 
         job.report = {
             "catalog_count": len(catalog),
-            "search_drift": search_drift,
-            "graph_drift": graph_drift,
-            "enqueued": sorted(enqueued),
-            "repair_strategy": "enqueue-index",
+            "drift": drift,
+            "enqueued": enqueued,
+            "repair_strategy": "enqueue-per-stage",
             "images": images,
         }
         job.status = COMPLETED
@@ -528,6 +682,25 @@ class JobStore:
     async def _process_one(self, job: Job, path: Path) -> None:
         started = time.perf_counter()
         try:
+            # Opt-in cross-process mode (ADR 0002): publish a cheap ingest task and
+            # let the ingest-worker pool catalog it. Falls through to the inline
+            # fast path below when the broker is down, so the catalog write still
+            # lands (preserving the durability boundary).
+            if ingest_via_queue():
+                on_stage = job.stage_callback()
+                on_stage("publish")
+                if await _publish_ingest_best_effort(
+                    str(path), source_folder_id=job.source_folder_id, parent_op_id=job.id
+                ):
+                    job.progress.done += 1
+                    log.info(
+                        "enqueued(ingest) %s in %.0f ms (%d/%d)", path.name,
+                        (time.perf_counter() - started) * 1000,
+                        job.progress.done, job.progress.total,
+                    )
+                    return
+                # broker down -> fall through to the inline fast path below
+
             data = await asyncio.to_thread(path.read_bytes)
             sha256 = pipeline.compute_sha256(data)
             if sha256 in self._seen_sha256:
@@ -544,13 +717,12 @@ class JobStore:
             await asyncio.to_thread(
                 pipeline.ingest_fast, data, path.name, str(path), on_stage
             )
-            # Enqueue the async tasks: index (build the projection) AND label
-            # (describe -> patch catalog -> re-index). Best-effort: a broker
-            # outage must not fail the catalog write — reconcile re-enqueues the
-            # index and label-backfill re-enqueues the label once it is back.
+            # Enqueue the per-stage DAG (ADR 0002): embed.dense + embed.sparse
+            # (-> index.search fan-in), index.graph, and label. Best-effort: a
+            # broker outage must not fail the catalog write — the reconcile and
+            # label-backfill sweeps re-enqueue once the broker is back.
             on_stage("publish")
-            await _publish_index_best_effort(sha256, parent_op_id=job.id)
-            await _publish_label_best_effort(sha256, parent_op_id=job.id)
+            await _publish_post_ingest_best_effort(sha256, parent_op_id=job.id)
             self._seen_sha256.add(sha256)
             job.progress.done += 1
             log.info(

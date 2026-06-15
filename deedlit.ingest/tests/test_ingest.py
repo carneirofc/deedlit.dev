@@ -55,7 +55,8 @@ def mock_outbound(monkeypatch):
     """
     calls: dict = {
         "fanout": [], "extract": 0, "image": 0, "sparse": 0,
-        "fast": [], "published": [], "published_label": [],
+        "fast": [], "pub_ingest": [],
+        "pub_dense": [], "pub_sparse": [], "pub_graph": [], "pub_label": [],
     }
 
     def fake_extract(data, filename, mime):
@@ -97,20 +98,28 @@ def mock_outbound(monkeypatch):
         calls["fast"].append({"sha256": sha, "filename": filename, "source_path": source_path})
         return sha
 
-    async def fake_publish(sha256, parent_op_id=None):
-        calls["published"].append(sha256)
-
-    async def fake_publish_label(sha256, parent_op_id=None):
-        calls["published_label"].append(sha256)
+    # The fast path now fans out the per-stage DAG (ADR 0002): embed.dense +
+    # embed.sparse + index.graph + label. Record each so the folder-walk tests can
+    # assert per-file enqueue of every stage.
+    def _record(key):
+        async def pub(sha256, parent_op_id=None):
+            calls[key].append(sha256)
+        return pub
 
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", fake_image)
-    monkeypatch.setattr(pipeline, "embed_sparse", fake_sparse)
+    monkeypatch.setattr(pipeline, "embed_sparse_text", fake_sparse)
     monkeypatch.setattr(pipeline, "describe_image", fake_describe)
     monkeypatch.setattr(pipeline, "fan_out_writes", fake_fanout)
     monkeypatch.setattr(pipeline, "ingest_fast", fake_ingest_fast)
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish)
-    monkeypatch.setattr(broker_module, "publish_label_task", fake_publish_label)
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        calls["pub_ingest"].append(path)
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("pub_dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("pub_sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("pub_graph"))
+    monkeypatch.setattr(broker_module, "publish_label_task", _record("pub_label"))
     return calls
 
 
@@ -145,20 +154,22 @@ def test_ingest_returns_job_and_processes_files(tmp_path, fresh_store, mock_outb
         assert final["progress"]["done"] == 3
         assert final["progress"]["skipped"] == 0
         assert final["progress"]["failed"] == 0
-    # Fast path: each file is cataloged synchronously and BOTH an index and a
-    # label task are published (projection + labelling happen async in the
-    # worker) — no inline fan-out.
+    # Fast path: each file is cataloged synchronously and the per-stage DAG is
+    # enqueued (embed.dense + embed.sparse + index.graph + label) — projection /
+    # labelling happen async in the workers, so no inline fan-out.
     assert len(mock_outbound["fast"]) == 3
-    assert len(mock_outbound["published"]) == 3
-    assert len(mock_outbound["published_label"]) == 3
+    for key in ("pub_dense", "pub_sparse", "pub_graph", "pub_label"):
+        assert len(mock_outbound[key]) == 3, key
     assert mock_outbound["fanout"] == []
     # Each file's real on-disk path is carried into the fast path (so the catalog
     # record stays identifiable by its source file).
     for entry in mock_outbound["fast"]:
         assert entry["source_path"] is not None
         assert str(tmp_path) in entry["source_path"]
-    # The published index tasks correspond to the cataloged images.
-    assert set(mock_outbound["published"]) == {e["sha256"] for e in mock_outbound["fast"]}
+    # The enqueued stage tasks correspond to the cataloged images.
+    cataloged = {e["sha256"] for e in mock_outbound["fast"]}
+    assert set(mock_outbound["pub_dense"]) == cataloged
+    assert set(mock_outbound["pub_label"]) == cataloged
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +188,52 @@ def test_dedup_skips_unchanged_on_rerun(tmp_path, fresh_store, mock_outbound):
         assert f2["progress"]["total"] == 2
         assert f2["progress"]["done"] == 0
         assert f2["progress"]["skipped"] == 2
-    # Only the first run ran the fast path + published (2 files); the re-run
+    # Only the first run ran the fast path + enqueued (2 files); the re-run
     # skipped both (process-local sha256 dedup).
     assert len(mock_outbound["fast"]) == 2
-    assert len(mock_outbound["published"]) == 2
+    assert len(mock_outbound["pub_dense"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# (2c) opt-in ingest-queue mode (ADR 0002): producer enqueues, worker catalogs
+# ---------------------------------------------------------------------------
+def test_ingest_via_queue_publishes_ingest_tasks(tmp_path, fresh_store, mock_outbound, monkeypatch):
+    monkeypatch.setenv("INGEST_VIA_QUEUE", "true")
+    _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
+    with TestClient(app_module.app) as client:
+        job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
+        final = _wait_for(client, job_id, {"completed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["done"] == 3
+    # The producer only enqueues ingest tasks; the fast path + downstream stages
+    # run in the ingest-worker (not exercised here), so no inline fast path and no
+    # downstream publish on this side.
+    assert len(mock_outbound["pub_ingest"]) == 3
+    assert all(str(tmp_path) in p for p in mock_outbound["pub_ingest"])
+    assert mock_outbound["fast"] == []
+    assert mock_outbound["pub_dense"] == []
+
+
+def test_ingest_via_queue_falls_back_inline_when_broker_down(
+    tmp_path, fresh_store, mock_outbound, monkeypatch
+):
+    monkeypatch.setenv("INGEST_VIA_QUEUE", "true")
+
+    async def boom(path, source_folder_id=None, parent_op_id=None):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", boom)
+    _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0)])
+    with TestClient(app_module.app) as client:
+        job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
+        final = _wait_for(client, job_id, {"completed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["done"] == 2
+    # ingest publish failed -> inline fast path ran and the per-stage DAG was
+    # published best-effort, so the catalog write still landed.
+    assert len(mock_outbound["fast"]) == 2
+    assert len(mock_outbound["pub_dense"]) == 2
+    assert mock_outbound["pub_ingest"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +290,15 @@ def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
     async def noop_publish(sha256, parent_op_id=None):
         return None
 
+    # Pin to serial so the cancel point is deterministic (this test is about
+    # cancellation, not concurrency).
+    monkeypatch.setenv("INGEST_CONCURRENCY", "1")
     monkeypatch.setattr(pipeline, "ingest_fast", slow_fast)
-    monkeypatch.setattr(broker_module, "publish_index_task", noop_publish)
-    monkeypatch.setattr(broker_module, "publish_label_task", noop_publish)
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_graph_task", "publish_label_task",
+    ):
+        monkeypatch.setattr(broker_module, name, noop_publish)
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
@@ -273,6 +332,17 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     assert thumb is not None
     with Image.open(io.BytesIO(thumb)) as im:
         assert im.format == "WEBP"
+        # 32px source is below the 1080 short-edge floor -> kept at native size
+        # (downscale only, never upscaled).
+        assert im.size == (32, 32)
+
+    # A source larger than the floor is downscaled so its SHORTER edge == floor,
+    # preserving aspect; the longer edge stays proportionally larger.
+    big = _png_bytes((10, 20, 30), size=400)  # 400x400 square
+    big_thumb = pipeline.make_webp_thumbnail(big, min_edge=100)
+    assert big_thumb is not None
+    with Image.open(io.BytesIO(big_thumb)) as im:
+        assert min(im.size) == 100
 
     rec = pipeline.process_file(data, "img.png", source_path="/library/sub/img.png")
     assert rec.sha256 == pipeline.compute_sha256(data)

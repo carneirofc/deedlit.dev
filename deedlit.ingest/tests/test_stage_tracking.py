@@ -68,7 +68,7 @@ def test_process_file_emits_stages_in_order(monkeypatch):
     # so the staircase drops the "label" stage.
     monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "x", "tags": []})
     monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1])
-    monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [], "values": []})
+    monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [], "values": []})
 
     stages: list[str] = []
     pipeline.process_file(_png_bytes(), "img.png", None, stages.append)
@@ -124,8 +124,11 @@ def test_ingest_run_sets_timestamps_and_fast_path_staircase(tmp_path, monkeypatc
     async def noop_publish(sha256, parent_op_id=None):
         return None
 
-    monkeypatch.setattr(broker_module, "publish_index_task", noop_publish)
-    monkeypatch.setattr(broker_module, "publish_label_task", noop_publish)
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_graph_task", "publish_label_task",
+    ):
+        monkeypatch.setattr(broker_module, name, noop_publish)
 
     (tmp_path / "a.png").write_bytes(_png_bytes((1, 2, 3)))
     (tmp_path / "b.png").write_bytes(_png_bytes((4, 5, 6)))

@@ -23,13 +23,14 @@ re-points it at the owning service contracts (contracts/{catalog,search,graph}
 .openapi.yaml) so the TS app is UI-only.
 
 The outbound HTTP boundary lives in small module-level functions
-(``extract_metadata``, ``embed_image``, ``embed_sparse``, ``fan_out_writes``)
+(``extract_metadata``, ``embed_image``, ``embed_sparse_text``, ``fan_out_writes``)
 so tests can monkeypatch them and stay offline/deterministic.
 """
 from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 from collections.abc import Callable
@@ -79,6 +80,11 @@ COMFYHELPER_PUBLIC_URL = os.getenv("COMFYHELPER_PUBLIC_URL", "http://localhost:3
 # (or front the object store directly) can re-point without code changes.
 CATALOG_ORIGINAL_BLOB_KIND = os.getenv("CATALOG_ORIGINAL_BLOB_KIND", "original")
 
+# Catalog blob kind holding the persisted DENSE vector (ADR 0002). The embed.dense
+# stage writes it; index.search + reconcile read it back. Reuses the existing
+# catalog ``embedding`` blob kind so the GPU result is durable and reused.
+CATALOG_DENSE_BLOB_KIND = os.getenv("CATALOG_DENSE_BLOB_KIND", "embedding")
+
 HTTP_TIMEOUT = float(os.getenv("INGEST_HTTP_TIMEOUT", "30.0"))
 FANOUT_RETRIES = int(os.getenv("INGEST_FANOUT_RETRIES", "3"))
 
@@ -87,8 +93,11 @@ CATALOG_PAGE_SIZE = int(os.getenv("RECONCILE_CATALOG_PAGE_SIZE", "500"))
 
 SUPPORTED_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
 
-# Thumbnail geometry (longest edge, px). WebP output.
-THUMBNAIL_MAX_EDGE = int(os.getenv("INGEST_THUMBNAIL_MAX_EDGE", "1080"))
+# Thumbnail geometry: keep the SHORTER edge at >= this many px (true "1080p"
+# class), downscaling ONLY — a smaller source is kept untouched (never upscaled).
+# These double as the viewer image, so they are encoded LOSSLESS WebP.
+THUMBNAIL_MIN_EDGE = int(os.getenv("INGEST_THUMBNAIL_MIN_EDGE", "1080"))
+# Compression EFFORT for the lossless encode (0-100, higher = smaller + slower).
 THUMBNAIL_QUALITY = int(os.getenv("INGEST_THUMBNAIL_QUALITY", "100"))
 
 
@@ -128,14 +137,23 @@ def compute_dims(data: bytes) -> tuple[int | None, int | None]:
         return None, None
 
 
-def make_webp_thumbnail(data: bytes, max_edge: int = THUMBNAIL_MAX_EDGE) -> bytes | None:
-    """Downscale to fit ``max_edge`` and encode as WebP. Returns bytes or None."""
+def make_webp_thumbnail(data: bytes, min_edge: int = THUMBNAIL_MIN_EDGE) -> bytes | None:
+    """Downscale so the SHORTER edge is ``min_edge`` px and encode as LOSSLESS
+    WebP. Downscale only — a source already <= ``min_edge`` on its short side is
+    kept at native size (never upscaled). Returns bytes or None.
+    """
     try:
         with Image.open(io.BytesIO(data)) as im:
             im = im.convert("RGB")
-            im.thumbnail((max_edge, max_edge))
+            width, height = im.size
+            short = min(width, height)
+            if short > min_edge:  # downscale only; keep smaller sources untouched
+                scale = min_edge / short
+                im = im.resize(
+                    (round(width * scale), round(height * scale)), Image.LANCZOS
+                )
             out = io.BytesIO()
-            im.save(out, format="WEBP", quality=THUMBNAIL_QUALITY)
+            im.save(out, format="WEBP", lossless=True, quality=THUMBNAIL_QUALITY)
             return out.getvalue()
     except Exception:
         return None
@@ -177,8 +195,13 @@ def embed_image(data: bytes, filename: str, mime: str) -> list[float]:
     return body.get("vector") or body.get("embedding") or []
 
 
-def embed_sparse(text: str) -> dict[str, list]:
-    """POST text to deedlit.vision /embed/sparse; return {indices, values}."""
+def embed_sparse_text(text: str) -> dict[str, list]:
+    """POST text to deedlit.vision /embed/sparse; return {indices, values}.
+
+    The sparse-vector vision client. Named ``_text`` to distinguish it from the
+    ``embed_sparse`` DAG stage (ADR 0002), which embeds an image's catalog text
+    and persists the result.
+    """
     resp = httpx.post(
         f"{VISION_URL}/embed/sparse", json={"text": text}, timeout=HTTP_TIMEOUT
     )
@@ -523,6 +546,168 @@ def _reconcile_ext_for_mime(mime: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-stage DAG (ADR 0002) — catalog is the fan-in rendezvous
+#
+# The monolithic ``index`` task (ADR 0001) is split into four independently
+# scalable stages. Each stage persists its output to CATALOG TRUTH and the worker
+# publishes the next stage; the one fan-in (``index.search`` needs both vectors)
+# is resolved by reading both back from catalog — no coordinator. The dense vector
+# is persisted once (the ``embedding`` blob) and reused, so a relabel/reindex
+# never recomputes the GPU result (this removes ADR 0001's 2x dense embed).
+#
+# Vectors round-trip through catalog blobs as JSON:
+#   dense  -> /blobs/{sha}/embedding   [floats]
+#   sparse -> /blobs/{sha}/sparse      {indices, values}
+# These thin boundary wrappers are monkeypatched in tests to stay offline.
+# ---------------------------------------------------------------------------
+def store_dense_blob(sha256: str, dense: list[float]) -> None:
+    """Persist the dense vector to the catalog ``embedding`` blob (JSON floats)."""
+    _put_blob_with_retry(
+        f"{CATALOG_URL}/blobs/{sha256}/{CATALOG_DENSE_BLOB_KIND}",
+        json.dumps(dense).encode("utf-8"),
+        "application/octet-stream",
+    )
+
+
+def store_sparse_blob(sha256: str, sparse: dict[str, list]) -> None:
+    """Persist the sparse vector to the catalog ``sparse`` blob (JSON)."""
+    _put_blob_with_retry(
+        f"{CATALOG_URL}/blobs/{sha256}/sparse",
+        json.dumps(sparse).encode("utf-8"),
+        "application/json",
+    )
+
+
+def _load_json_blob(sha256: str, kind: str) -> Any | None:
+    """GET a catalog blob and parse it as JSON, or None if absent/unreadable.
+
+    A missing blob (404) is the normal "stage hasn't run yet" signal for the
+    fan-in, so it degrades to None rather than raising.
+    """
+    try:
+        resp = httpx.get(f"{CATALOG_URL}/blobs/{sha256}/{kind}", timeout=HTTP_TIMEOUT)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def load_dense_blob(sha256: str) -> list[float] | None:
+    """Read the persisted dense vector from catalog, or None if not embedded yet."""
+    return _load_json_blob(sha256, CATALOG_DENSE_BLOB_KIND)
+
+
+def load_sparse_blob(sha256: str) -> dict[str, list] | None:
+    """Read the persisted sparse vector from catalog, or None if not embedded yet."""
+    return _load_json_blob(sha256, "sparse")
+
+
+def embed_dense(sha256: str) -> None:
+    """``embed.dense`` stage: GPU dense-embed one image, persist to catalog.
+
+    Reads the bytes (sha -> catalog filepath -> shared disk), runs the dense
+    image embedding, and stores the vector as the catalog ``embedding`` blob. The
+    worker then publishes ``index.search``; the vector is now durable and reused
+    by every later reprojection. A vision/transport error propagates so the broker
+    retries / dead-letters.
+    """
+    data, mime = fetch_image_bytes(sha256)
+    filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
+    dense = embed_image(data, filename, mime)
+    store_dense_blob(sha256, dense)
+
+
+def embed_sparse(sha256: str) -> None:
+    """``embed.sparse`` stage: sparse-embed one image's text, persist to catalog.
+
+    No bytes / no GPU: the sparse vector is over the lexical text held in catalog
+    truth — SD prompt + AI description + tags. Re-running after a label patch
+    folds the new description/tags into the sparse vector. Stores the result as
+    the catalog ``sparse`` blob; the worker then publishes ``index.search``.
+    """
+    record = fetch_image_record(sha256) or {}
+    tags = record.get("tags") or []
+    sparse_text = " ".join(
+        s.strip()
+        for s in (record.get("prompt"), record.get("description"), " ".join(tags))
+        if s and s.strip()
+    )
+    sparse = embed_sparse_text(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
+    store_sparse_blob(sha256, sparse)
+
+
+def build_search_point(
+    sha256: str, dense: list[float], sparse: dict[str, list], record: dict[str, Any]
+) -> dict[str, Any]:
+    """Assemble the search UpsertPoint from the two vectors + catalog truth.
+
+    Mirrors :func:`assemble_record`'s point/payload shape, but sources the payload
+    fields (tags/filepath/description/safety) from the catalog record instead of a
+    fresh extract — the index.search stage projects from truth, not from bytes.
+    """
+    filepath = record.get("filepath")
+    ext = os.path.splitext(filepath)[1].lower() if filepath else ""
+    image_url, thumbnail_url = _proxy_urls(sha256, ext)
+    tags = record.get("tags") or []
+    payload: dict[str, Any] = {
+        "sha256": sha256,
+        "point_id": point_id_for_sha256(sha256),
+        "tags": tags,
+        "image_url": image_url,
+        "thumbnail_url": thumbnail_url,
+    }
+    if filepath:
+        payload["filepath"] = filepath
+    if record.get("description"):
+        payload["description"] = record["description"]
+    if record.get("safety"):
+        payload["safety"] = record["safety"]
+    return {"sha256": sha256, "dense": dense, "sparse": sparse, "payload": payload}
+
+
+def index_search(sha256: str) -> bool:
+    """``index.search`` stage: FAN-IN dense+sparse -> upsert the search point.
+
+    Reads BOTH vectors back from catalog (the rendezvous). When either is missing
+    the stage is a clean no-op (returns False) — the sibling embed stage publishes
+    ``index.search`` again on its own completion, and whichever runs second finds
+    both present and upserts. Idempotent: a duplicate upsert is wasted work, never
+    incorrect. Returns True when the point was upserted.
+    """
+    dense = load_dense_blob(sha256)
+    sparse = load_sparse_blob(sha256)
+    if dense is None or sparse is None:
+        log.debug(
+            "index.search %s waiting on vectors (dense=%s sparse=%s)",
+            sha256[:12], dense is not None, sparse is not None,
+        )
+        return False
+    record = fetch_image_record(sha256) or {}
+    point = build_search_point(sha256, dense, sparse, record)
+    _post_with_retry(f"{SEARCH_URL}/points", point)
+    return True
+
+
+def index_graph(sha256: str) -> None:
+    """``index.graph`` stage: upsert graph edges from catalog truth (no vectors).
+
+    References/tags/lineage come straight from the catalog record (the references
+    are already the flat AssetRef list), so this stage needs neither bytes nor
+    embeddings and runs in parallel with the embed stages.
+    """
+    record = fetch_image_record(sha256) or {}
+    edges = {
+        "sha256": sha256,
+        "references": record.get("references") or [],
+        "tags": record.get("tags") or [],
+        "lineage": [],
+    }
+    _post_with_retry(f"{GRAPH_URL}/edges", edges)
+
+
+# ---------------------------------------------------------------------------
 # Record assembly
 # ---------------------------------------------------------------------------
 def _references_list(references: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -769,7 +954,7 @@ def process_file(
     sparse_text = " ".join(
         s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
     )
-    sparse = embed_sparse(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
+    sparse = embed_sparse_text(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
     log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
 
     return assemble_record(
@@ -842,6 +1027,18 @@ def ingest_fast(
             f"{CATALOG_URL}/blobs/{sha256}/thumbnail", thumbnail, "image/webp"
         )
     return sha256
+
+
+def ingest_path(path: str) -> str:
+    """Read one source file and run the synchronous fast path (ADR 0002).
+
+    The ``ingest`` queue handler's body: read the bytes from the shared disk path
+    and fast-path them (catalog record + thumbnail), returning the sha256 so the
+    worker can publish the downstream stage tasks. Read errors propagate so the
+    broker retries / dead-letters the ingest task.
+    """
+    p = Path(path)
+    return ingest_fast(p.read_bytes(), p.name, str(p))
 
 
 # ---------------------------------------------------------------------------

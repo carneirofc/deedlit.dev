@@ -56,32 +56,46 @@ def _wait_for(client: TestClient, job_id: str, statuses: set[str], timeout: floa
 
 @pytest.fixture
 def mock_projections(monkeypatch):
-    """Mock catalog list + search/graph coverage probes + the index publisher.
+    """Mock catalog list + the four per-stage coverage probes + per-stage pubs.
 
-    Catalog has A, B, C. Search has A, B (C missing). Graph has A (B, C missing).
-    So search-drift = {C}, graph-drift = {B, C}; the drift UNION is {B, C}.
+    Catalog has A, B, C.
+      A: dense+sparse blobs, search point, graph node — fully projected.
+      B: dense+sparse blobs + graph node, but NO search point -> index.search.
+      C: nothing — no dense, no sparse, no search, no graph.
+    So per-stage drift is: embed.dense={C}, embed.sparse={C},
+    index.search={B} (B has both vectors but no point; C's vectors are missing so
+    its embed stages fan in instead), index.graph={C}.
     """
     state: dict = {
-        "search_ids": {SHA_A, SHA_B},
-        "graph_ids": {SHA_A},
-        "published": [],
+        "dense_ids": {SHA_A, SHA_B},
+        "sparse_ids": {SHA_A, SHA_B},
+        "search_ids": {SHA_A},
+        "graph_ids": {SHA_A, SHA_B},
+        "pub": {"embed.dense": [], "embed.sparse": [], "index.search": [], "index.graph": []},
     }
 
     monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A, SHA_B, SHA_C])
+    monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1] if sha in state["dense_ids"] else None)
+    monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": []} if sha in state["sparse_ids"] else None)
     monkeypatch.setattr(pipeline, "search_has", lambda sha: sha in state["search_ids"])
     monkeypatch.setattr(pipeline, "graph_has", lambda sha: sha in state["graph_ids"])
 
-    async def fake_publish_index(sha256, parent_op_id=None):
-        state["published"].append(sha256)
+    def _record(key):
+        async def pub(sha256, parent_op_id=None):
+            state["pub"][key].append(sha256)
+        return pub
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish_index)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("embed.dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("embed.sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_search_task", _record("index.search"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("index.graph"))
     return state
 
 
 # ---------------------------------------------------------------------------
-# (1) detects drift + (2) re-enqueues an index task per drifter + (3) report
+# (1) detects per-stage drift + (2) re-enqueues the right stage + (3) report
 # ---------------------------------------------------------------------------
-def test_reconcile_detects_drift_and_reenqueues_index(fresh_store, mock_projections):
+def test_reconcile_detects_drift_and_reenqueues_per_stage(fresh_store, mock_projections):
     with TestClient(app_module.app) as client:
         r = client.post("/reconcile", json={})
         assert r.status_code == 202
@@ -97,42 +111,51 @@ def test_reconcile_detects_drift_and_reenqueues_index(fresh_store, mock_projecti
         job = fresh_store.get(job_id)
         report = job.report
 
-    # Per-image projection status report.
+    # Per-image stage status report.
     images = report["images"]
-    assert images[SHA_A]["in_search"] is True
-    assert images[SHA_A]["in_graph"] is True
-    assert images[SHA_A]["enqueued"] is False
+    assert images[SHA_A]["enqueued"] == []  # fully projected
 
-    # C was missing from both -> re-enqueued.
-    assert images[SHA_C]["in_search"] is False
-    assert images[SHA_C]["in_graph"] is False
-    assert images[SHA_C]["enqueued"] is True
+    # B: both vectors present but no search point -> only index.search.
+    assert images[SHA_B]["dense"] is True and images[SHA_B]["sparse"] is True
+    assert images[SHA_B]["in_search"] is False
+    assert images[SHA_B]["enqueued"] == ["index.search"]
 
-    # B was missing from graph only -> re-enqueued.
-    assert images[SHA_B]["in_search"] is True
-    assert images[SHA_B]["in_graph"] is False
-    assert images[SHA_B]["enqueued"] is True
+    # C: nothing present -> embed.dense + embed.sparse + index.graph (NOT
+    # index.search: its vectors are missing, so the embed stages fan it in).
+    assert images[SHA_C]["enqueued"] == ["embed.dense", "embed.sparse", "index.graph"]
 
-    # Summary drift sets + the repair strategy.
-    assert set(report["search_drift"]) == {SHA_C}
-    assert set(report["graph_drift"]) == {SHA_B, SHA_C}
-    assert set(report["enqueued"]) == {SHA_B, SHA_C}
-    assert report["repair_strategy"] == "enqueue-index"
+    # Per-stage drift + repair strategy.
+    assert report["drift"]["embed.dense"] == [SHA_C]
+    assert report["drift"]["embed.sparse"] == [SHA_C]
+    assert report["drift"]["index.search"] == [SHA_B]
+    assert report["drift"]["index.graph"] == [SHA_C]
+    assert report["repair_strategy"] == "enqueue-per-stage"
 
-    # Exactly one index task per drifted image (the union), not per drift entry.
-    assert sorted(mock_projections["published"]) == sorted([SHA_B, SHA_C])
+    # Exactly the right stage task published per drifted image.
+    assert mock_projections["pub"]["embed.dense"] == [SHA_C]
+    assert mock_projections["pub"]["embed.sparse"] == [SHA_C]
+    assert mock_projections["pub"]["index.search"] == [SHA_B]
+    assert mock_projections["pub"]["index.graph"] == [SHA_C]
 
 
 def test_reconcile_no_drift_enqueues_nothing(fresh_store, monkeypatch):
     monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A])
+    monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1])
+    monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": []})
     monkeypatch.setattr(pipeline, "search_has", lambda sha: True)
     monkeypatch.setattr(pipeline, "graph_has", lambda sha: True)
     published: list[str] = []
 
-    async def fake_publish_index(sha256, parent_op_id=None):
-        published.append(sha256)
+    def _record(_key):
+        async def pub(sha256, parent_op_id=None):
+            published.append(sha256)
+        return pub
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish_index)
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_search_task", "publish_index_graph_task",
+    ):
+        monkeypatch.setattr(broker_module, name, _record(name))
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/reconcile", json={}).json()["id"]
@@ -141,35 +164,8 @@ def test_reconcile_no_drift_enqueues_nothing(fresh_store, monkeypatch):
         report = fresh_store.get(job_id).report
 
     assert published == []
-    assert report["search_drift"] == []
-    assert report["graph_drift"] == []
-    assert report["enqueued"] == []
-    assert report["images"][SHA_A]["enqueued"] is False
-
-
-# ---------------------------------------------------------------------------
-# One index task per drifted image (an index task re-projects BOTH stores)
-# ---------------------------------------------------------------------------
-def test_reconcile_enqueues_index_per_drifted_image(fresh_store, monkeypatch):
-    monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A, SHA_B])
-    monkeypatch.setattr(pipeline, "search_has", lambda sha: sha == SHA_A)  # B missing
-    monkeypatch.setattr(pipeline, "graph_has", lambda sha: True)
-    published: list[str] = []
-
-    async def fake_publish_index(sha256, parent_op_id=None):
-        published.append(sha256)
-
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish_index)
-
-    with TestClient(app_module.app) as client:
-        job_id = client.post("/reconcile", json={}).json()["id"]
-        final = _wait_for(client, job_id, {"completed", "failed"})
-        assert final["status"] == "completed"
-        report = fresh_store.get(job_id).report
-
-    assert published == [SHA_B]
-    assert report["images"][SHA_B]["enqueued"] is True
-    assert report["repair_strategy"] == "enqueue-index"
+    assert all(report["drift"][s] == [] for s in report["drift"])
+    assert report["images"][SHA_A]["enqueued"] == []
 
 
 # ---------------------------------------------------------------------------

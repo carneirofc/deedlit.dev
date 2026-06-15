@@ -505,6 +505,36 @@ export async function listTasks(
 }
 
 // ---------------------------------------------------------------------------
+// Ingest runtime config (ADR 0002) — the live producer parallelism knobs the
+// settings panel tunes. Folder-scan concurrency + the opt-in ingest-queue route.
+// Consumer-side parallelism (broker prefetch, worker replicas) is deploy-time
+// and not settable here.
+// ---------------------------------------------------------------------------
+
+export interface IngestConfig {
+  /** How many files a folder scan fast-paths at once (inline mode). */
+  ingest_concurrency: number;
+  /** Route the scan through the `ingest` queue (cross-process worker pool). */
+  ingest_via_queue: boolean;
+}
+
+export async function getIngestConfig(signal?: AbortSignal): Promise<IngestConfig> {
+  const res = await request<Partial<IngestConfig>>("/ingest/config", { signal });
+  return {
+    ingest_concurrency:
+      typeof res?.ingest_concurrency === "number" ? res.ingest_concurrency : 8,
+    ingest_via_queue: Boolean(res?.ingest_via_queue),
+  };
+}
+
+export async function updateIngestConfig(
+  patch: Partial<IngestConfig>,
+  signal?: AbortSignal,
+): Promise<IngestConfig> {
+  return request<IngestConfig>("/ingest/config", { method: "PUT", body: patch, signal });
+}
+
+// ---------------------------------------------------------------------------
 // Catalog admin (#30) — the DB power-user page works against the RAW catalog
 // records (full prompt/params/workflow_json/api_prompt_json), not the search
 // CompactResult shape. List/patch proxy the gateway /images routes; re-index /

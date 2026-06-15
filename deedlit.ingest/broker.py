@@ -37,10 +37,38 @@ log = logging.getLogger("deedlit.ingest.broker")
 # ---------------------------------------------------------------------------
 AMQP_URL = os.getenv("AMQP_URL", "amqp://deedlit:deedlit@localhost:5672/")
 
-# Task queue names (also the routing keys). These are the per-image task types.
-INDEX_QUEUE = "index"
+# Per-stage task queues (ADR 0002), also the routing keys. The ingest DAG, driven
+# by choreography with the catalog as the fan-in rendezvous:
+#
+#   ingest ─┬─> embed.dense  ─┐
+#           ├─> embed.sparse ─┴─> index.search   (fan-in: needs both vectors)
+#           ├─> index.graph
+#           └─> label ─┬─> embed.sparse           (description/tags changed it)
+#                      └─> index.graph            (tags changed)
+#
+# Each queue is drained by whichever worker replica names it in QUEUES, so the
+# GPU-bound embed.dense pool scales independently of the cheap I/O stages.
+INGEST_QUEUE = "ingest"
+EMBED_DENSE_QUEUE = "embed.dense"
+EMBED_SPARSE_QUEUE = "embed.sparse"
+INDEX_SEARCH_QUEUE = "index.search"
+INDEX_GRAPH_QUEUE = "index.graph"
 LABEL_QUEUE = "label"
-TASK_QUEUES = (INDEX_QUEUE, LABEL_QUEUE)
+
+# Legacy monolithic index queue (ADR 0001). Kept DECLARED through the 0002
+# migration so any in-flight `index` messages still drain; the per-stage queues
+# above replace it. Drop from TASK_QUEUES once nothing publishes `index`.
+INDEX_QUEUE = "index"
+
+TASK_QUEUES = (
+    INGEST_QUEUE,
+    EMBED_DENSE_QUEUE,
+    EMBED_SPARSE_QUEUE,
+    INDEX_SEARCH_QUEUE,
+    INDEX_GRAPH_QUEUE,
+    LABEL_QUEUE,
+    INDEX_QUEUE,
+)
 
 # Retry/backoff. A message is retried up to MAX_RETRIES times (counting from the
 # first failure) before it is dead-lettered. Backoff is exponential, capped.
@@ -48,9 +76,28 @@ MAX_RETRIES = int(os.getenv("TASK_MAX_RETRIES", "5"))
 BACKOFF_BASE_MS = int(os.getenv("TASK_BACKOFF_BASE_MS", "2000"))
 BACKOFF_CAP_MS = int(os.getenv("TASK_BACKOFF_CAP_MS", "60000"))
 
-# How many unacked messages a single consumer holds at once. Kept modest so a
-# slow handler (GPU/LLM) doesn't hoard the queue across replicas.
-PREFETCH = int(os.getenv("TASK_PREFETCH", "4"))
+# How many unacked messages a single FAST-queue consumer holds at once — the
+# parallelism knob for the cheap stages (ingest/embed/index). High by default so
+# a worker keeps many in-flight; the work is I/O-bound (awaits vision/catalog) so
+# the deliveries overlap. Raise it (or add worker replicas) to go faster.
+PREFETCH = int(os.getenv("TASK_PREFETCH", "16"))
+
+# The LLM (label) queue is a SINGLE, SERIAL consumer: prefetch 1 + an exclusive
+# consumer (see exclusive_for), so the llama-server only ever sees one request at
+# a time no matter how many workers start. Not tunable — it's a correctness
+# constraint of the single-threaded model server.
+LABEL_PREFETCH = 1
+
+
+def prefetch_for(queue: str) -> int:
+    """Per-queue unacked window: 1 for the serial LLM queue, PREFETCH otherwise."""
+    return LABEL_PREFETCH if queue == LABEL_QUEUE else PREFETCH
+
+
+def exclusive_for(queue: str) -> bool:
+    """The LLM queue is an EXCLUSIVE consumer — the broker rejects a second one,
+    guaranteeing a single consumer process for the serial llama-server."""
+    return queue == LABEL_QUEUE
 
 # Header carrying the (1-based) failed-attempt count across retry hops.
 ATTEMPT_HEADER = "x-attempt"
@@ -94,20 +141,33 @@ _connection: Any = None
 _channel: Any = None
 
 
-async def get_channel() -> Any:
-    """Return a cached robust channel, connecting + declaring topology on first use.
+async def get_connection() -> Any:
+    """Return a cached robust connection, opening it on first use.
 
-    Uses ``aio_pika.connect_robust`` so a dropped connection self-heals. Declares
-    the full topology (both task queues + their retry/dlq) so a publisher or
-    consumer can start in any order.
+    ``aio_pika.connect_robust`` self-heals a dropped connection. Shared by the
+    publish channel and the per-queue consume channels (run_worker).
     """
-    global _connection, _channel
-    if _channel is not None and not _channel.is_closed:
-        return _channel
+    global _connection
+    if _connection is not None and not _connection.is_closed:
+        return _connection
     import aio_pika  # lazy: only needed when we actually talk to the broker
 
     _connection = await aio_pika.connect_robust(AMQP_URL)
-    _channel = await _connection.channel()
+    return _connection
+
+
+async def get_channel() -> Any:
+    """Return a cached robust PUBLISH channel, declaring topology on first use.
+
+    Declares the full topology (every task queue + its retry/dlq) so a publisher
+    or consumer can start in any order. Consumers use their own per-queue channels
+    (run_worker) so each can carry its own QoS.
+    """
+    global _channel
+    if _channel is not None and not _channel.is_closed:
+        return _channel
+    conn = await get_connection()
+    _channel = await conn.channel()
     await _channel.set_qos(prefetch_count=PREFETCH)
     await declare_topology(_channel, TASK_QUEUES)
     return _channel
@@ -167,18 +227,82 @@ async def publish_task(
     await channel.default_exchange.publish(message, routing_key=queue)
 
 
-async def publish_index_task(sha256: str, *, parent_op_id: str | None = None) -> None:
-    """Enqueue an ``index`` task: (re)build the search+graph projection for sha256."""
+async def _publish_sha_task(queue: str, sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Publish a per-image stage task keyed by ``sha256`` (the common DAG shape).
+
+    Every per-stage queue except ``ingest`` operates on an already-cataloged
+    image, so they share one payload shape: ``{sha256, type, parent_op_id}``. The
+    thin wrappers below name the queue so callers (and tests) read clearly.
+    """
+    await publish_task(queue, {"sha256": sha256, "type": queue, "parent_op_id": parent_op_id})
+
+
+async def publish_ingest_task(
+    path: str,
+    *,
+    source_folder_id: str | None = None,
+    parent_op_id: str | None = None,
+) -> None:
+    """Enqueue an ``ingest`` task: run the fast path for one source file (ADR 0002).
+
+    Unlike the other stages this is keyed by the on-disk ``path`` (the sha256 is
+    not known until the worker hashes the bytes), so it carries its own payload
+    shape. ``source_folder_id`` rides along so the worker can attribute the scan.
+    """
     await publish_task(
-        INDEX_QUEUE, {"sha256": sha256, "type": INDEX_QUEUE, "parent_op_id": parent_op_id}
+        INGEST_QUEUE,
+        {
+            "path": path,
+            "type": INGEST_QUEUE,
+            "source_folder_id": source_folder_id,
+            "parent_op_id": parent_op_id,
+        },
     )
+
+
+async def publish_embed_dense_task(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Enqueue an ``embed.dense`` task: GPU dense-embed sha256, persist to catalog."""
+    await _publish_sha_task(EMBED_DENSE_QUEUE, sha256, parent_op_id=parent_op_id)
+
+
+async def publish_embed_sparse_task(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Enqueue an ``embed.sparse`` task: sparse-embed sha256's text, persist it."""
+    await _publish_sha_task(EMBED_SPARSE_QUEUE, sha256, parent_op_id=parent_op_id)
+
+
+async def publish_index_search_task(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Enqueue an ``index.search`` task: fan-in dense+sparse -> upsert search point."""
+    await _publish_sha_task(INDEX_SEARCH_QUEUE, sha256, parent_op_id=parent_op_id)
+
+
+async def publish_index_graph_task(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Enqueue an ``index.graph`` task: upsert sha256's graph edges from catalog."""
+    await _publish_sha_task(INDEX_GRAPH_QUEUE, sha256, parent_op_id=parent_op_id)
+
+
+async def publish_index_task(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Enqueue a legacy ``index`` task (ADR 0001). Retained for in-flight messages
+    during the 0002 migration; new code publishes the per-stage tasks above."""
+    await _publish_sha_task(INDEX_QUEUE, sha256, parent_op_id=parent_op_id)
 
 
 async def publish_label_task(sha256: str, *, parent_op_id: str | None = None) -> None:
     """Enqueue a ``label`` task: describe sha256, patch catalog, re-index (#26)."""
-    await publish_task(
-        LABEL_QUEUE, {"sha256": sha256, "type": LABEL_QUEUE, "parent_op_id": parent_op_id}
-    )
+    await _publish_sha_task(LABEL_QUEUE, sha256, parent_op_id=parent_op_id)
+
+
+async def publish_post_ingest(sha256: str, *, parent_op_id: str | None = None) -> None:
+    """Publish the four downstream stages after a fast-path ingest (ADR 0002).
+
+    embed.dense + embed.sparse (both fan into index.search) + index.graph + label.
+    Errors PROPAGATE (unlike the producer's best-effort fan-out) so the caller —
+    the ``ingest`` queue handler — fails and the broker retries the whole ingest
+    task, which re-runs the idempotent fast path and re-publishes these.
+    """
+    await publish_embed_dense_task(sha256, parent_op_id=parent_op_id)
+    await publish_embed_sparse_task(sha256, parent_op_id=parent_op_id)
+    await publish_index_graph_task(sha256, parent_op_id=parent_op_id)
+    await publish_label_task(sha256, parent_op_id=parent_op_id)
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +388,21 @@ async def run_worker(
     so label workers can scale independently of index workers. Manual ack: the
     delivery is acked after :func:`process_delivery` settles it (ok/retry/dlq).
 
+    Each queue gets its OWN channel so it can carry its own QoS (:func:`prefetch_for`)
+    — the fast queues run with a high prefetch for maximum overlap, while the LLM
+    ``label`` queue runs prefetch 1 + an EXCLUSIVE consumer (:func:`exclusive_for`)
+    so the broker guarantees a single, serial consumer.
+
     ``on_event_factory(queue, payload)`` (optional) returns the per-message ledger
     hook passed to :func:`process_delivery` (#27).
     """
-    channel = await get_channel()
+    await get_channel()  # ensure the connection + topology exist (publish channel)
+    connection = await get_connection()
     consumed: list[Any] = []
     for q in queues:
-        queue = await channel.get_queue(q)
+        ch = await connection.channel()
+        await ch.set_qos(prefetch_count=prefetch_for(q))
+        queue = await ch.get_queue(q)
         handler = handlers[q]
 
         async def _on_message(message: Any, _q: str = q, _h: Handler = handler) -> None:
@@ -287,9 +419,12 @@ async def run_worker(
                     publish=publish_task, on_event=on_event,
                 )
 
-        tag = await queue.consume(_on_message)
+        tag = await queue.consume(_on_message, exclusive=exclusive_for(q))
         consumed.append((queue, tag))
-        log.info("consuming queue %s", q)
+        log.info(
+            "consuming queue %s (prefetch=%d exclusive=%s)",
+            q, prefetch_for(q), exclusive_for(q),
+        )
 
     # Block forever; the robust connection keeps the consumers alive.
     import asyncio

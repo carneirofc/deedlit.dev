@@ -256,6 +256,27 @@ async def list_jobs() -> Any:
     return res if isinstance(res, list) else []
 
 
+@app.get("/ingest/config")
+async def get_ingest_config() -> Any:
+    """Live ingest producer config (folder-scan parallelism), proxied to ingest.
+
+    Backs the settings panel's "Ingest & indexing" section. Degrades to an empty
+    object when ingest is down so the panel stays renderable."""
+    try:
+        return await clients.ingest("GET", "/config")
+    except DownstreamError:
+        return {}
+
+
+@app.put("/ingest/config")
+async def put_ingest_config(payload: dict[str, Any]) -> Any:
+    """Update the live ingest producer config (settings panel → ingest)."""
+    try:
+        return await clients.ingest("PUT", "/config", json=payload)
+    except DownstreamError as exc:
+        raise HTTPException(status_code=502, detail=f"ingest unavailable: {exc.detail}")
+
+
 @app.get("/fs/browse")
 async def fs_browse(path: str | None = None) -> Any:
     """List a directory on the ingest host for the admin folder picker.
@@ -464,9 +485,20 @@ async def read_task(task_id: str) -> Any:
 # comes from the catalog tasks ledger (GET /tasks above). Destructive actions
 # (purge, requeue) are confirmed in the UI and assume localhost binding.
 # ---------------------------------------------------------------------------
-# The async task queues + their retry/dlq companions (mirror deedlit.ingest).
-QUEUE_NAMES = ["index", "index.retry", "index.dlq", "label", "label.retry", "label.dlq"]
-TASK_QUEUE_BASES = ["index", "label"]
+# The per-stage DAG queues (ADR 0002) + the opt-in ingest queue + the legacy
+# index queue, each with its retry/dlq companions (mirror deedlit.ingest broker).
+TASK_QUEUE_BASES = [
+    "ingest",
+    "embed.dense",
+    "embed.sparse",
+    "index.search",
+    "index.graph",
+    "label",
+    "index",
+]
+QUEUE_NAMES = [
+    name for base in TASK_QUEUE_BASES for name in (base, f"{base}.retry", f"{base}.dlq")
+]
 
 
 def _vhost() -> str:

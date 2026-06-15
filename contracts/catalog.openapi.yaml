@@ -67,7 +67,7 @@ paths:
   /blobs/{sha256}/{kind}:
     parameters:
       - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
-      - { name: kind, in: path, required: true, schema: { type: string, enum: [thumbnail, embedding] } }
+      - { name: kind, in: path, required: true, schema: { type: string, enum: [thumbnail, embedding, sparse] } }
     get: { summary: Fetch a RustFS blob, responses: { "200": { description: Blob, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "404": { description: Not found } } }
     put:
       summary: Store a RustFS blob (sha256-keyed)

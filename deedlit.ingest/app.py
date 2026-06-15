@@ -38,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
+import config
 from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
 from jobs import (
@@ -157,6 +158,33 @@ class ReconcileRequest(BaseModel):
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+class ConfigPatch(BaseModel):
+    """PUT /config body — partial update of the live producer knobs (ADR 0002).
+
+    Both optional so the settings panel can patch one field; None leaves it
+    unchanged. ``ingest_concurrency`` is clamped to >= 1 by the config layer.
+    """
+
+    ingest_concurrency: int | None = None
+    ingest_via_queue: bool | None = None
+
+
+@app.get("/config")
+def get_config() -> dict:
+    """Effective runtime producer config (env defaults + live overrides)."""
+    return config.runtime()
+
+
+@app.put("/config")
+def put_config(patch: ConfigPatch) -> dict:
+    """Update the live producer config; returns the new effective config.
+
+    Tunes folder-scan parallelism from the settings panel without a restart.
+    Consumer-side parallelism (broker prefetch / worker replicas) is deploy-time
+    and not settable here."""
+    return config.update(patch.model_dump(exclude_none=True))
 
 
 @app.get("/fs/browse")

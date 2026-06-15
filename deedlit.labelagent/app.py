@@ -11,6 +11,7 @@ Run (matches the sibling services): ``uvicorn app:app --port 8006``. AgentOS's
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -71,11 +72,85 @@ def _format_for(content_type: str | None) -> str:
     return _FORMAT_FOR_MIME.get(content_type.split(";")[0].strip().lower(), "png")
 
 
+# The content-safety classes the catalog/search/UI agree on (mirror agent.Safety).
+_SAFETY_CLASSES = ("sfw", "nsfw", "explicit")
+# Off-enum synonyms a local GGUF might emit, mapped onto the contract class.
+_SAFETY_ALIASES = {
+    "safe": "sfw",
+    "clean": "sfw",
+    "general": "sfw",
+    "g": "sfw",
+    "pg": "sfw",
+    "questionable": "nsfw",
+    "suggestive": "nsfw",
+    "mature": "nsfw",
+    "r": "nsfw",
+    "18+": "nsfw",
+    "hardcore": "explicit",
+    "porn": "explicit",
+    "pornographic": "explicit",
+    "xxx": "explicit",
+    "x": "explicit",
+}
+
+
+def _coerce_safety(value: object) -> str:
+    """Normalize the model's safety value to exactly one of the contract classes.
+
+    Local GGUFs don't honor a provider structured-output API, so ``safety`` can
+    come back with odd casing/whitespace or an out-of-enum synonym. Map it onto
+    sfw/nsfw/explicit; anything unrecognized defaults to the LOWER class (``sfw``)
+    — both to match the agent's "when in doubt, choose lower" instruction and,
+    critically, so a bad string can't make the label task raise and dead-letter
+    (which would leave the image with NO detected safety class).
+    """
+    s = str(value or "").strip().lower()
+    if s in _SAFETY_CLASSES:
+        return s
+    return _SAFETY_ALIASES.get(s, "sfw")
+
+
+def _coerce_label(content: object) -> dict:
+    """Coerce arbitrary agent output into a valid ImageLabel-shaped dict.
+
+    ``agent.run`` may yield the parsed ImageLabel, a plain dict, or — when the
+    GGUF's JSON-mode completion fails to parse into the schema — a raw string.
+    Salvage all three (parse a JSON string; otherwise keep the prose as the
+    description) and always emit a valid ``safety`` so the label task produces a
+    usable, persistable result instead of raising on malformed model output.
+    """
+    if hasattr(content, "model_dump"):  # ImageLabel (output_schema)
+        data = content.model_dump()
+    elif isinstance(content, dict):
+        data = dict(content)
+    else:
+        text = str(content or "").strip()
+        data = {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                data = parsed
+        except (ValueError, TypeError):
+            pass
+        if not data:
+            # Unparseable completion: keep the raw text as the description so the
+            # image is still labeled/searchable, with a safe default class.
+            data = {"description": text}
+    return {
+        "label": str(data.get("label") or ""),
+        "description": str(data.get("description") or ""),
+        "tags": [str(t) for t in (data.get("tags") or []) if str(t).strip()],
+        "safety": _coerce_safety(data.get("safety")),
+    }
+
+
 def run_label(data: bytes, fmt: str, prompt_hint: str | None = None) -> dict:
-    """Run the agent over one image and return ``{label, description, tags}``.
+    """Run the agent over one image and return ``{label, description, tags, safety}``.
 
     This is the agent boundary — monkeypatched in tests so the suite stays
-    offline (no llama-server required).
+    offline (no llama-server required). Output is normalized via
+    :func:`_coerce_label` so a malformed/off-enum completion still yields a valid
+    label (and safety class) rather than raising.
     """
     user_msg = "Label and describe this image."
     if prompt_hint:
@@ -87,10 +162,7 @@ def run_label(data: bytes, fmt: str, prompt_hint: str | None = None) -> dict:
     started = time.perf_counter()
     resp = agent.run(user_msg, images=[Image(content=data, format=fmt)])
     log.info("labeled image in %.0f ms", (time.perf_counter() - started) * 1000)
-    content = resp.content
-    if hasattr(content, "model_dump"):  # ImageLabel (output_schema)
-        return content.model_dump()
-    return dict(content)
+    return _coerce_label(resp.content)
 
 
 @app.post("/describe", response_model=ImageLabel, tags=["labelagent"])

@@ -254,8 +254,14 @@ def test_folder_ingest_completes_when_broker_is_down(tmp_path, monkeypatch):
     async def boom(sha256, parent_op_id=None):
         raise RuntimeError("broker down")
 
-    monkeypatch.setattr(broker_module, "publish_index_task", boom)
-    monkeypatch.setattr(broker_module, "publish_label_task", boom)
+    # Every per-stage publish fails (broker down). The inline fast-path catalog
+    # write still lands, so the image is cataloged-but-unprojected and the job
+    # completes; reconcile / backfill re-enqueue the stages later (ADR 0002).
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_graph_task", "publish_label_task",
+    ):
+        monkeypatch.setattr(broker_module, name, boom)
 
     (tmp_path / "a.png").write_bytes(_png_bytes((7, 8, 9)))
     with TestClient(app_module.app) as client:
@@ -340,26 +346,40 @@ def test_label_image_is_noop_when_describe_empty(monkeypatch):
     assert posts == []  # nothing patched -> no catalog write
 
 
-def test_label_handler_patches_then_reenqueues_index(monkeypatch):
+def test_label_handler_patches_then_reprojects_sparse_and_graph(monkeypatch):
+    # ADR 0002: a label patch re-runs only the cheap stages — embed.sparse (which
+    # fans into index.search) + index.graph — never embed.dense (bytes unchanged).
     published: list[tuple] = []
 
     monkeypatch.setattr(pipeline, "label_image", lambda sha256: True)
 
-    async def fake_index(sha256, parent_op_id=None):
-        published.append((sha256, parent_op_id))
+    async def fake_sparse(sha256, parent_op_id=None):
+        published.append(("embed.sparse", sha256, parent_op_id))
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_index)
+    async def fake_graph(sha256, parent_op_id=None):
+        published.append(("index.graph", sha256, parent_op_id))
+
+    async def boom_dense(*a, **k):  # pragma: no cover - must not re-embed the GPU vector
+        raise AssertionError("label must not re-publish embed.dense")
+
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", fake_sparse)
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", fake_graph)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", boom_dense)
     asyncio.run(worker_module.label_handler({"sha256": "a" * 64, "parent_op_id": "op1"}))
-    assert published == [("a" * 64, "op1")]
+    assert published == [
+        ("embed.sparse", "a" * 64, "op1"),
+        ("index.graph", "a" * 64, "op1"),
+    ]
 
 
-def test_label_handler_noop_does_not_reenqueue(monkeypatch):
+def test_label_handler_noop_does_not_reproject(monkeypatch):
     monkeypatch.setattr(pipeline, "label_image", lambda sha256: False)
 
     async def boom(*a, **k):  # pragma: no cover - must not run
-        raise AssertionError("should not re-enqueue on a no-op label")
+        raise AssertionError("should not re-project on a no-op label")
 
-    monkeypatch.setattr(broker_module, "publish_index_task", boom)
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", boom)
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", boom)
     asyncio.run(worker_module.label_handler({"sha256": "a" * 64}))
 
 
@@ -368,8 +388,18 @@ def test_label_handler_requires_sha():
         asyncio.run(worker_module.label_handler({"type": "label"}))
 
 
-def test_worker_registers_index_and_label_handlers():
-    assert set(worker_module.HANDLERS) == {broker_module.INDEX_QUEUE, broker_module.LABEL_QUEUE}
+def test_worker_registers_all_stage_handlers():
+    # Per-stage DAG (ADR 0002) + the opt-in ingest queue + the retained legacy
+    # `index` handler.
+    assert set(worker_module.HANDLERS) == {
+        broker_module.INGEST_QUEUE,
+        broker_module.EMBED_DENSE_QUEUE,
+        broker_module.EMBED_SPARSE_QUEUE,
+        broker_module.INDEX_SEARCH_QUEUE,
+        broker_module.INDEX_GRAPH_QUEUE,
+        broker_module.LABEL_QUEUE,
+        broker_module.INDEX_QUEUE,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -54,26 +54,100 @@ async def index_handler(payload: dict) -> None:
 
 
 async def label_handler(payload: dict) -> None:
-    """Label one image, patch the catalog, then re-enqueue an index task (#26).
+    """Label one image, patch the catalog, then re-project the cheap stages (#26).
 
     ``label_image`` describes the image and patches catalog description/safety/
-    AI-tags; when it actually patched (returns True) we publish a fresh ``index``
-    task so the description flows into the sparse vector + payload + graph edges.
-    A labelagent failure propagates so the broker retries / dead-letters; a
-    disabled labelagent is a no-op (no re-index). Runs in a thread (httpx).
+    AI-tags. When it actually patched (returns True) we re-run only the stages the
+    new text affects: ``embed.sparse`` (description/tags feed the sparse vector +
+    payload, and it fans into ``index.search``) and ``index.graph`` (tags changed
+    the edges). We deliberately do NOT re-publish ``embed.dense`` — the image bytes
+    are unchanged, so the persisted dense vector is stable; this removes ADR 0001's
+    2x dense embed (ADR 0002). A labelagent failure propagates so the broker
+    retries / dead-letters; a disabled labelagent is a no-op. Runs in a thread.
     """
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("label task missing sha256")
     changed = await asyncio.to_thread(pipeline.label_image, sha256)
     if changed:
-        await broker.publish_index_task(sha256, parent_op_id=payload.get("parent_op_id"))
+        parent = payload.get("parent_op_id")
+        await broker.publish_embed_sparse_task(sha256, parent_op_id=parent)
+        await broker.publish_index_graph_task(sha256, parent_op_id=parent)
 
 
-# Per-queue handlers — a replica drains the subset named in QUEUES.
+async def ingest_handler(payload: dict) -> None:
+    """``ingest`` stage: run the fast path for one source file, then fan out.
+
+    Opt-in cross-process producer (ADR 0002): when ``INGEST_VIA_QUEUE`` routes the
+    folder scan through this queue, replicas catalog files in parallel. Reads the
+    bytes (shared disk path in the payload), writes the catalog record + thumbnail,
+    then publishes the four downstream stages. Downstream-publish errors propagate
+    so the broker retries the whole (idempotent) ingest task. Runs the sync fast
+    path in a thread.
+    """
+    path = payload.get("path")
+    if not path:
+        raise ValueError("ingest task missing path")
+    sha256 = await asyncio.to_thread(pipeline.ingest_path, path)
+    await broker.publish_post_ingest(sha256, parent_op_id=payload.get("parent_op_id"))
+
+
+async def embed_dense_handler(payload: dict) -> None:
+    """``embed.dense`` stage: GPU dense-embed, persist to catalog, fan to search.
+
+    On success publishes ``index.search`` — the fan-in stage reads this vector
+    (and the sparse one) back from catalog. A vision/transport error propagates so
+    the broker retries / dead-letters. Runs in a thread (httpx is sync).
+    """
+    sha256 = payload.get("sha256")
+    if not sha256:
+        raise ValueError("embed.dense task missing sha256")
+    await asyncio.to_thread(pipeline.embed_dense, sha256)
+    await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
+
+
+async def embed_sparse_handler(payload: dict) -> None:
+    """``embed.sparse`` stage: sparse-embed catalog text, persist, fan to search."""
+    sha256 = payload.get("sha256")
+    if not sha256:
+        raise ValueError("embed.sparse task missing sha256")
+    await asyncio.to_thread(pipeline.embed_sparse, sha256)
+    await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
+
+
+async def index_search_handler(payload: dict) -> None:
+    """``index.search`` stage: FAN-IN dense+sparse -> upsert the search point.
+
+    A no-op when one vector is still missing (the sibling embed stage re-publishes
+    this task on its own completion); idempotent when both are present. Publishes
+    nothing downstream — it is a DAG leaf.
+    """
+    sha256 = payload.get("sha256")
+    if not sha256:
+        raise ValueError("index.search task missing sha256")
+    await asyncio.to_thread(pipeline.index_search, sha256)
+
+
+async def index_graph_handler(payload: dict) -> None:
+    """``index.graph`` stage: upsert graph edges from catalog truth (DAG leaf)."""
+    sha256 = payload.get("sha256")
+    if not sha256:
+        raise ValueError("index.graph task missing sha256")
+    await asyncio.to_thread(pipeline.index_graph, sha256)
+
+
+# Per-queue handlers — a replica drains the subset named in QUEUES (ADR 0002).
+# The GPU-bound embed.dense is its own queue so a `QUEUES=embed.dense` replica set
+# scales independently of the cheap I/O stages. ``index`` is the legacy ADR 0001
+# monolith, retained so in-flight messages drain during the migration.
 HANDLERS = {
-    broker.INDEX_QUEUE: index_handler,
+    broker.INGEST_QUEUE: ingest_handler,
+    broker.EMBED_DENSE_QUEUE: embed_dense_handler,
+    broker.EMBED_SPARSE_QUEUE: embed_sparse_handler,
+    broker.INDEX_SEARCH_QUEUE: index_search_handler,
+    broker.INDEX_GRAPH_QUEUE: index_graph_handler,
     broker.LABEL_QUEUE: label_handler,
+    broker.INDEX_QUEUE: index_handler,
 }
 
 
@@ -88,6 +162,12 @@ def _ledger_event_factory(queue: str, payload: dict):
     task_type = payload.get("type") or queue
     parent_op_id = payload.get("parent_op_id")
 
+    # The ledger is per-image (keyed by sha256). An ``ingest`` task is keyed by
+    # path (the sha isn't known until the bytes are hashed), so it has no ledger
+    # row of its own — the downstream per-image stages it publishes do.
+    if not sha256:
+        return None
+
     async def on_event(status: str, attempts: int, error: str | None) -> None:
         await asyncio.to_thread(
             ledger.record_task, sha256, task_type, status, attempts, error, parent_op_id
@@ -101,7 +181,26 @@ def _queues_from_env() -> list[str]:
     return [q.strip() for q in raw.split(",") if q.strip()]
 
 
+def _install_thread_pool() -> None:
+    """Size the default executor for high fan-out (ADR 0002 perf).
+
+    The fast stage handlers offload their sync httpx call via ``asyncio.to_thread``
+    (the shared default executor). Its default cap is ``min(32, cpu+4)``, which
+    would throttle a high broker prefetch — concurrent deliveries would queue on
+    threads instead of overlapping their I/O. Size the pool to comfortably exceed
+    the fast-queue prefetch so the only real limit is the downstream service. No
+    locks: ``to_thread`` blocks on I/O (GIL released), so threads overlap freely.
+    """
+    import concurrent.futures
+
+    workers = int(os.getenv("WORKER_THREADS", "64"))
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=workers))
+    log.info("worker thread pool sized to %d", workers)
+
+
 async def main() -> None:
+    _install_thread_pool()
     requested = _queues_from_env()
     queues = [q for q in requested if q in HANDLERS]
     for q in requested:

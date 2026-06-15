@@ -397,6 +397,35 @@ def test_jobs_get_degrades_to_empty_when_ingest_down(rec, client):
     assert r.json() == []
 
 
+def test_ingest_config_get_proxies_to_ingest(rec, client):
+    rec.on("GET", "/config", lambda r: {"ingest_concurrency": 8, "ingest_via_queue": False})
+    r = client.get("/ingest/config")
+    assert r.status_code == 200
+    assert r.json()["ingest_concurrency"] == 8
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+def test_ingest_config_put_proxies_to_ingest(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ingest_concurrency": 12, "ingest_via_queue": True})
+
+    rec.on("PUT", "/config", handler)
+    r = client.put("/ingest/config", json={"ingest_concurrency": 12, "ingest_via_queue": True})
+    assert r.status_code == 200
+    assert r.json() == {"ingest_concurrency": 12, "ingest_via_queue": True}
+    assert seen["body"]["ingest_concurrency"] == 12
+
+
+def test_ingest_config_get_degrades_when_ingest_down(rec, client):
+    rec.on("GET", "/config", lambda r: httpx.Response(500))
+    r = client.get("/ingest/config")
+    assert r.status_code == 200
+    assert r.json() == {}
+
+
 # ---------------------------------------------------------------------------
 # (5b) GET /tasks — async queue ledger proxy to catalog (#27)
 # ---------------------------------------------------------------------------
@@ -429,7 +458,9 @@ def test_task_by_id_proxies_and_passes_404(rec, client):
 # httpx decodes the %2F vhost in .path to ///, so the recorder matches paths like
 # /api/queues///index (the wire request still sends %2F to RabbitMQ).
 # ---------------------------------------------------------------------------
-_QUEUE_NAMES = ["index", "index.retry", "index.dlq", "label", "label.retry", "label.dlq"]
+# Mirror the gateway's actual queue set (per-stage DAG, ADR 0002) so this test
+# tracks the topology instead of a frozen copy.
+_QUEUE_NAMES = app_module.QUEUE_NAMES
 
 
 def test_queues_lists_task_queue_stats(rec, client):
@@ -447,7 +478,7 @@ def test_queues_lists_task_queue_stats(rec, client):
         )
     body = client.get("/queues").json()
     qs = body["queues"]
-    assert len(qs) == 6
+    assert len(qs) == len(_QUEUE_NAMES)
     idx = next(x for x in qs if x["name"] == "index")
     assert idx["reachable"] is True
     assert idx["messages"] == 3 and idx["consumers"] == 1

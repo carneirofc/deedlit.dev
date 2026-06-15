@@ -209,6 +209,13 @@ services:
       # publishes here best-effort; a publish failure never fails the catalog
       # write (reconcile/backfill re-enqueue later).
       AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      # Producer parallelism (ADR 0002). INGEST_CONCURRENCY: how many files a
+      # folder scan fast-paths at once (inline, default mode). INGEST_VIA_QUEUE:
+      # opt in to route the scan through the `ingest` queue instead, so the
+      # ingest-worker pool catalogs across processes (falls back to inline on a
+      # broker outage). Default off keeps the catalog write the durability boundary.
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-4}
+      INGEST_VIA_QUEUE: ${INGEST_VIA_QUEUE:-}
       # Background schedulers (0/unset disables each). Folder scan re-walks the
       # configured-folder registry on each folder's own interval; label backfill
       # periodically relabels images missing an AI description.
@@ -223,10 +230,13 @@ services:
       rabbitmq: { condition: service_healthy }
     healthcheck: *app-healthcheck
 
-  # Async task worker(s): same image as ingest, run via the worker.py entrypoint
-  # instead of the API. QUEUES selects which queue(s) this replica drains (ADR
-  # 0001) — run dedicated replicas with QUEUES=label to scale LLM/GPU-bound
-  # labelling independently of index. No HTTP server, so no healthcheck.
+  # FAST worker pool (ADR 0002): same image as ingest, run via worker.py. Drains
+  # the cheap, parallel stages (ingest fast path + embed + index), NOT the LLM
+  # `label` queue. Tune throughput with TASK_PREFETCH (per-worker concurrency) +
+  # WORKER_THREADS (the executor that runs the sync httpx calls) and scale out:
+  #   docker compose up -d --scale ingest-worker=4
+  # `index` is the legacy ADR 0001 queue, kept to drain in-flight messages during
+  # the migration. No HTTP server, so no healthcheck.
   ingest-worker:
     build: { context: ./deedlit.ingest }
     restart: unless-stopped
@@ -234,7 +244,35 @@ services:
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: deedlit-ingest-worker
-      QUEUES: ${INGEST_WORKER_QUEUES:-index,label}
+      QUEUES: ${INGEST_WORKER_QUEUES:-ingest,embed.dense,embed.sparse,index.search,index.graph,index}
+      TASK_PREFETCH: ${TASK_PREFETCH:-16}
+      WORKER_THREADS: ${WORKER_THREADS:-64}
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      METADATA_URL: http://metadata:8000
+      VISION_URL: http://vision:8000
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+      LABELAGENT_URL: http://labelagent:8000
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+      metadata: { condition: service_healthy }
+
+  # LLM worker (ADR 0002): drains ONLY the `label` queue. The label queue is an
+  # EXCLUSIVE consumer with prefetch 1 (enforced in broker.py), so the
+  # single-threaded llama-server is never hit concurrently — keep this at ONE
+  # replica (a second would be rejected by the broker anyway). Slow + isolated, so
+  # backlog here never blocks the fast pool above.
+  ingest-worker-label:
+    build: { context: ./deedlit.ingest }
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "python", "worker.py"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest-worker-label
+      QUEUES: label
       AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
       METADATA_URL: http://metadata:8000
       VISION_URL: http://vision:8000
@@ -278,7 +316,12 @@ services:
       OTEL_SERVICE_NAME: deedlit-vision
       COMFYUI_ROOT: /comfyui
       CLIP_DEVICE: cuda
+      # Pin to the single smaller tower (vit_h). Without CLIP_MODELS set, the
+      # default enabled set is "vit_h,big_g" — leaving the 3.7 GB big_g tower
+      # loadable on request, which on a tight box exhausts VRAM / Windows commit
+      # (os error 1455). Enable only vit_h so big_g can never be loaded.
       CLIP_MODEL_PRESET: vit_h
+      CLIP_MODELS: vit_h
       CLIP_FP16: "true"
     volumes:
       - "${COMFYUI_ROOT_HOST:-K:/comfyui/ComfyUI_windows_portable/ComfyUI}:/comfyui:ro"

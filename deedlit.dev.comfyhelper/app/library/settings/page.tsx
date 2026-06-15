@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
+import { getIngestConfig, updateIngestConfig, type IngestConfig } from "@/lib/api-client";
 import {
   DEFAULT_SETTINGS,
   useSettings,
@@ -44,6 +45,20 @@ function Row({ label, hint, control }: { label: string; hint?: string; control: 
         {hint && <p className="text-ui-2xs text-ui-ink-muted">{hint}</p>}
       </div>
       <div className="shrink-0">{control}</div>
+    </div>
+  );
+}
+
+function InfoRow({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2.5">
+      <div className="min-w-0">
+        <p className="text-ui-sm text-ui-ink">{label}</p>
+        {hint && <p className="text-ui-2xs text-ui-ink-muted">{hint}</p>}
+      </div>
+      <span className="shrink-0 rounded-md border border-ui-border/60 bg-ui-bg px-2 py-1 text-ui-2xs text-ui-ink-muted">
+        {value}
+      </span>
     </div>
   );
 }
@@ -132,6 +147,96 @@ function NumberSlider({
 }
 
 // ---------------------------------------------------------------------------
+// Ingest & indexing — SERVER-backed (deedlit.ingest /config via the gateway),
+// unlike the rest of this page (browser localStorage). Tunes the producer
+// fast-path parallelism live; consumer/deploy knobs are shown read-only.
+// ---------------------------------------------------------------------------
+
+function IngestSettingsSection() {
+  const [cfg, setCfg] = useState<IngestConfig | null>(null);
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+
+  useEffect(() => {
+    let alive = true;
+    getIngestConfig()
+      .then((c) => alive && setCfg(c))
+      .catch(() => alive && setStatus("error"));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const save = useCallback(async (patch: Partial<IngestConfig>) => {
+    setCfg((prev) => (prev ? { ...prev, ...patch } : prev)); // optimistic
+    setStatus("saving");
+    try {
+      setCfg(await updateIngestConfig(patch));
+      setStatus("saved");
+    } catch {
+      setStatus("error");
+    }
+  }, []);
+
+  return (
+    <Section
+      title="Ingest & indexing"
+      hint="Server-side ingest parallelism. Applies to the next folder scan — not stored in this browser."
+    >
+      {cfg === null ? (
+        <p className="py-2 text-ui-2xs text-ui-ink-muted">
+          {status === "error" ? "Ingest service unreachable." : "Loading…"}
+        </p>
+      ) : (
+        <>
+          <Row
+            label="Folder-scan concurrency"
+            hint="How many files are cataloged in parallel during a scan (the fast path)."
+            control={
+              <NumberSlider
+                value={cfg.ingest_concurrency}
+                min={1}
+                max={32}
+                step={1}
+                onChange={(v) => save({ ingest_concurrency: v })}
+              />
+            }
+          />
+          <Row
+            label="Route scans via the ingest queue"
+            hint="Catalog files across worker processes instead of inline. Falls back to inline if the broker is down."
+            control={
+              <Toggle
+                checked={cfg.ingest_via_queue}
+                onChange={(v) => save({ ingest_via_queue: v })}
+              />
+            }
+          />
+          <InfoRow
+            label="Consumer prefetch (fast queues)"
+            value="TASK_PREFETCH"
+            hint="Tasks each fast worker runs at once. Deploy-time: set in docker-compose, scale with --scale ingest-worker=N."
+          />
+          <InfoRow
+            label="LLM (label) queue"
+            value="single · prefetch 1"
+            hint="Exclusive consumer + prefetch 1 so the vision model is never hit concurrently. Fixed."
+          />
+          <p className="pt-2 text-ui-2xs text-ui-ink-muted" aria-live="polite" data-testid="ingest-config-status">
+            {status === "saving"
+              ? "Saving…"
+              : status === "saved"
+                ? "Saved."
+                : status === "error"
+                  ? "Save failed — is the ingest service up?"
+                  : ""}
+          </p>
+        </>
+      )}
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export default function SettingsPage() {
   const { settings, setKey, reset, hydrated } = useSettings();
@@ -155,7 +260,7 @@ export default function SettingsPage() {
   );
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-6" data-testid="settings-page">
+    <div className="mx-auto flex w-full max-w-[1700px] flex-col gap-6" data-testid="settings-page">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Settings</h1>
@@ -183,6 +288,9 @@ export default function SettingsPage() {
         <p className="text-ui-xs text-ui-ink-muted">Loading saved settings…</p>
       )}
 
+      {/* Cards flow into 2–3 balanced columns on wide desktops. CSS multi-column
+          (not grid) so uneven card heights pack without leaving row gaps. */}
+      <div className="columns-1 gap-6 lg:columns-2 2xl:columns-3 [&>section]:mb-6 [&>section]:break-inside-avoid">
       {/* Browsing & pagination */}
       <Section
         title="Browsing & pagination"
@@ -385,6 +493,10 @@ export default function SettingsPage() {
           }
         />
       </Section>
+
+      {/* Ingest & indexing (server-backed, not localStorage) */}
+      <IngestSettingsSection />
+      </div>
     </div>
   );
 }

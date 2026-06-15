@@ -60,3 +60,43 @@ def test_describe_works_without_prompt_hint(mock_agent):
     assert r.json()["label"] == "abstract swatch"
     assert mock_agent["fmt"] == "webp"
     assert mock_agent["prompt_hint"] is None
+
+
+# ---------------------------------------------------------------------------
+# _coerce_label / _coerce_safety: the GGUF output normalizer. Ensures the label
+# task always gets a valid safety class so it can't dead-letter on malformed
+# model output (i.e. safety is reliably DETECTED on the label queue).
+# ---------------------------------------------------------------------------
+def test_coerce_label_passes_through_valid_dict():
+    out = app_module._coerce_label(
+        {"label": "x", "description": "d", "tags": ["a", "b"], "safety": "explicit"}
+    )
+    assert out == {"label": "x", "description": "d", "tags": ["a", "b"], "safety": "explicit"}
+
+
+def test_coerce_label_normalizes_offenum_safety():
+    # Odd casing / synonym -> mapped onto the contract enum, not rejected.
+    assert app_module._coerce_label({"safety": "  Questionable "})["safety"] == "nsfw"
+    assert app_module._coerce_label({"safety": "SFW"})["safety"] == "sfw"
+    assert app_module._coerce_label({"safety": "hardcore"})["safety"] == "explicit"
+
+
+def test_coerce_label_missing_safety_defaults_sfw():
+    out = app_module._coerce_label({"description": "d"})
+    assert out["safety"] == "sfw"
+
+
+def test_coerce_label_salvages_json_string():
+    out = app_module._coerce_label('{"label":"k","description":"d","tags":[],"safety":"EXPLICIT"}')
+    assert out["label"] == "k"
+    assert out["safety"] == "explicit"
+
+
+def test_coerce_label_unparseable_string_keeps_prose_and_defaults_sfw():
+    out = app_module._coerce_label("the model rambled without emitting json")
+    assert out["safety"] == "sfw"
+    assert "rambled" in out["description"]
+
+
+def test_coerce_label_unknown_safety_defaults_sfw():
+    assert app_module._coerce_label({"safety": "weird-value"})["safety"] == "sfw"

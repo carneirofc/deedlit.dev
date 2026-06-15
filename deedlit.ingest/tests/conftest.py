@@ -10,7 +10,17 @@ from __future__ import annotations
 
 import pytest
 
+import config
 import ledger
+
+
+@pytest.fixture(autouse=True)
+def reset_runtime_config():
+    """Drop live config overrides before+after each test so a PUT /config in one
+    test never leaks its producer knobs into another (config is a module global)."""
+    config.reset()
+    yield
+    config.reset()
 
 
 @pytest.fixture(autouse=True)

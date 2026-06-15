@@ -8,6 +8,7 @@ if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
 import asyncio
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 import warnings
@@ -445,6 +446,24 @@ _tokenizers: dict[str, object] = {}
 _sparse_models: dict[str, object] = {}
 
 
+# All model loads and forward passes run on this one worker thread. The (async)
+# routes ``await`` it, which buys two things:
+#   1. Responsiveness — heavy torch work runs off the asyncio event loop, so a
+#      slow first-use load or a long embed no longer freezes the whole worker
+#      (health checks and concurrent requests keep answering).
+#   2. Single-flight — a single worker serializes GPU work, so concurrent
+#      first-requests can't both enter ``_load_*_model`` and double-load a tower,
+#      which on a tight box exhausts VRAM / Windows commit and crashes with
+#      "paging file is too small" (os error 1455). Requests queue here instead.
+_gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-gpu")
+
+
+async def _run_gpu(fn, *args):
+    """Run a blocking GPU/CPU torch call on the single inference worker thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_gpu_pool, fn, *args)
+
+
 def _normalize(x: torch.Tensor) -> torch.Tensor:
     return x / x.norm(dim=-1, keepdim=True)
 
@@ -501,6 +520,24 @@ def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.
         " fp16" if (USE_FP16 and DEVICE.startswith("cuda")) else "",
     )
     return vec[0]
+
+
+# Worker-thread entry points: run the full embed + ``.cpu().tolist()`` copy off
+# the event loop and return a plain list, so the routes only build the response.
+def _embed_image_list(image: Image.Image, preset: str) -> list[float]:
+    return _embed_image_vec(image, preset).float().cpu().tolist()
+
+
+def _embed_text_list(text: str, preset: str) -> list[float]:
+    return _embed_text_vec(text, preset).float().cpu().tolist()
+
+
+def _embed_images_list(items: list[tuple[str, Image.Image]], preset: str) -> list[tuple[str, list[float]]]:
+    return [(label, _embed_image_list(image, preset)) for label, image in items]
+
+
+def _embed_texts_list(texts: list[str], preset: str) -> list[tuple[str, list[float]]]:
+    return [(text, _embed_text_list(text, preset)) for text in texts]
 
 
 async def _read_image_upload(file: UploadFile) -> Image.Image:
@@ -750,13 +787,12 @@ def models() -> ModelsResponse:
     tags=["embeddings"],
     description="Encode a single text with the OpenCLIP text tower and return its L2-normalized embedding.",
 )
-def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
+async def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     preset = _resolve_preset(request.model)
-    vec = _embed_text_vec(request.text, preset)
-    embedding = vec.float().cpu().tolist()
+    embedding = await _run_gpu(_embed_text_list, request.text, preset)
 
     return EmbeddingResponse(
         model_preset=preset,
@@ -780,11 +816,11 @@ def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
         "The SPLADE model loads lazily on first use."
     ),
 )
-def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
+async def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    indices, values = _embed_sparse(request.text)
+    indices, values = await _run_gpu(_embed_sparse, request.text)
 
     return SparseEmbeddingResponse(
         model=SPARSE_MODEL_NAME,
@@ -802,15 +838,16 @@ def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
     tags=["embeddings"],
     description="Encode one or more texts with the OpenCLIP text tower and return one L2-normalized embedding per text, in order.",
 )
-def embed_texts(request: TextsEmbeddingRequest) -> BatchEmbeddingResponse:
+async def embed_texts(request: TextsEmbeddingRequest) -> BatchEmbeddingResponse:
     preset = _resolve_preset(request.model)
-    results = []
     for i, text in enumerate(request.texts):
         if not text.strip():
             raise HTTPException(status_code=400, detail=f"texts[{i}] cannot be empty.")
-        vec = _embed_text_vec(text, preset)
-        embedding = vec.float().cpu().tolist()
-        results.append(EmbeddingResult(index=i, label=text, dim=len(embedding), embedding=embedding))
+    embeddings = await _run_gpu(_embed_texts_list, list(request.texts), preset)
+    results = [
+        EmbeddingResult(index=i, label=label, dim=len(embedding), embedding=embedding)
+        for i, (label, embedding) in enumerate(embeddings)
+    ]
 
     return BatchEmbeddingResponse(
         model_preset=preset,
@@ -835,8 +872,7 @@ async def embed_image(
 ) -> EmbeddingResponse:
     preset = _resolve_preset(model)
     image = await _read_image_upload(file)
-    vec = _embed_image_vec(image, preset)
-    embedding = vec.float().cpu().tolist()
+    embedding = await _run_gpu(_embed_image_list, image, preset)
 
     return EmbeddingResponse(
         model_preset=preset,
@@ -864,14 +900,17 @@ async def embed_images(
         raise HTTPException(status_code=400, detail="files cannot be empty.")
 
     preset = _resolve_preset(model)
-    results = []
-    for i, file in enumerate(files):
-        image = await _read_image_upload(file)
-        vec = _embed_image_vec(image, preset)
-        embedding = vec.float().cpu().tolist()
-        results.append(
-            EmbeddingResult(index=i, label=file.filename or f"image_{i}", dim=len(embedding), embedding=embedding)
-        )
+    # Read all uploads on the event loop, then embed the whole batch in one GPU
+    # job so the worker is held once for the batch rather than per round-trip.
+    items = [
+        (file.filename or f"image_{i}", await _read_image_upload(file))
+        for i, file in enumerate(files)
+    ]
+    embeddings = await _run_gpu(_embed_images_list, items, preset)
+    results = [
+        EmbeddingResult(index=i, label=label, dim=len(embedding), embedding=embedding)
+        for i, (label, embedding) in enumerate(embeddings)
+    ]
 
     return BatchEmbeddingResponse(
         model_preset=preset,
@@ -889,6 +928,31 @@ def _ranked_results(reference: torch.Tensor, candidates: list[tuple[str, torch.T
     return sorted(results, key=lambda r: r.similarity, reverse=True)
 
 
+# Worker-thread entry points for the similarity routes: embed reference +
+# candidates and rank, all in one serialized GPU job (uploads are read on the
+# event loop first and passed in as already-decoded PIL images).
+def _rank_text_similarity(reference: str, candidates: list[str], preset: str) -> list[SimilarityResult]:
+    ref_vec = _embed_text_vec(reference, preset)
+    cand = [(text, _embed_text_vec(text, preset)) for text in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
+def _rank_image_similarity(
+    reference: Image.Image, candidates: list[tuple[str, Image.Image]], preset: str
+) -> list[SimilarityResult]:
+    ref_vec = _embed_image_vec(reference, preset)
+    cand = [(label, _embed_image_vec(image, preset)) for label, image in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
+def _rank_text_to_image_similarity(
+    text: str, candidates: list[tuple[str, Image.Image]], preset: str
+) -> list[SimilarityResult]:
+    ref_vec = _embed_text_vec(text, preset)
+    cand = [(label, _embed_image_vec(image, preset)) for label, image in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
 @app.post(
     "/similarity/text",
     response_model=SimilarityResponse,
@@ -901,26 +965,23 @@ def _ranked_results(reference: torch.Tensor, candidates: list[tuple[str, torch.T
         "ranked by cosine similarity to the reference (descending)."
     ),
 )
-def similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
+async def similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
     if not request.reference.strip():
         raise HTTPException(status_code=400, detail="reference cannot be empty.")
     if not request.candidates:
         raise HTTPException(status_code=400, detail="candidates cannot be empty.")
-
-    preset = _resolve_preset(request.model)
-    ref_vec = _embed_text_vec(request.reference, preset)
-
-    candidates = []
     for i, text in enumerate(request.candidates):
         if not text.strip():
             raise HTTPException(status_code=400, detail=f"candidates[{i}] cannot be empty.")
-        candidates.append((text, _embed_text_vec(text, preset)))
+
+    preset = _resolve_preset(request.model)
+    results = await _run_gpu(_rank_text_similarity, request.reference, list(request.candidates), preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=request.reference,
-        results=_ranked_results(ref_vec, candidates),
+        results=results,
     )
 
 
@@ -954,18 +1015,17 @@ async def similarity_image(
 
     preset = _resolve_preset(model)
     ref_image = await _read_image_upload(reference)
-    ref_vec = _embed_image_vec(ref_image, preset)
-
-    candidate_vecs = []
-    for i, file in enumerate(candidates):
-        image = await _read_image_upload(file)
-        candidate_vecs.append((file.filename or f"candidate_{i}", _embed_image_vec(image, preset)))
+    cand_items = [
+        (file.filename or f"candidate_{i}", await _read_image_upload(file))
+        for i, file in enumerate(candidates)
+    ]
+    results = await _run_gpu(_rank_image_similarity, ref_image, cand_items, preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=reference.filename or "reference",
-        results=_ranked_results(ref_vec, candidate_vecs),
+        results=results,
     )
 
 
@@ -997,24 +1057,23 @@ async def similarity_text_to_image(
         raise HTTPException(status_code=400, detail="images cannot be empty.")
 
     preset = _resolve_preset(model)
-    ref_vec = _embed_text_vec(text, preset)
-
-    candidate_vecs = []
-    for i, file in enumerate(images):
-        image = await _read_image_upload(file)
-        candidate_vecs.append((file.filename or f"image_{i}", _embed_image_vec(image, preset)))
+    cand_items = [
+        (file.filename or f"image_{i}", await _read_image_upload(file))
+        for i, file in enumerate(images)
+    ]
+    results = await _run_gpu(_rank_text_to_image_similarity, text, cand_items, preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=text,
-        results=_ranked_results(ref_vec, candidate_vecs),
+        results=results,
     )
 
 
 @app.post("/simillarity/text", response_model=SimilarityResponse, include_in_schema=False)
-def misspelled_similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
-    return similarity_text(request)
+async def misspelled_similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
+    return await similarity_text(request)
 
 
 @app.post("/simillarity/image", response_model=SimilarityResponse, include_in_schema=False)
@@ -1192,7 +1251,7 @@ async def qdrant_search_text(request: QdrantTextSearchRequest) -> QdrantSearchRe
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty.")
     preset = _resolve_preset(request.model)
-    vector = _embed_text_vec(request.text, preset).float().cpu().tolist()
+    vector = await _run_gpu(_embed_text_list, request.text, preset)
     results = await _qdrant_search(vector, request.limit, preset)
     return QdrantSearchResponse(
         collection=QDRANT_COLLECTION,
@@ -1221,7 +1280,7 @@ async def qdrant_search_image(
 ) -> QdrantSearchResponse:
     preset = _resolve_preset(model)
     image = await _read_image_upload(file)
-    vector = _embed_image_vec(image, preset).float().cpu().tolist()
+    vector = await _run_gpu(_embed_image_list, image, preset)
     results = await _qdrant_search(vector, limit, preset)
     return QdrantSearchResponse(
         collection=QDRANT_COLLECTION,

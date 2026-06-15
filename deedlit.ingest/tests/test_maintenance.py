@@ -60,11 +60,12 @@ def mock_outbound(monkeypatch):
     write + broker publish so the pipeline runs offline (ADR 0001).
 
     ``fanout`` records worker-path (reindex) fan-outs; ``fast`` records fast-path
-    catalog writes (folder-walk / rescan); ``published`` records index tasks.
+    catalog writes (folder-walk / rescan); ``pub_*`` record the per-stage DAG
+    tasks the fast path enqueues (ADR 0002).
     """
     calls: dict = {
         "fanout": [], "extract": 0, "image": 0, "sparse": 0,
-        "fast": [], "published": [], "published_label": [],
+        "fast": [], "pub_dense": [], "pub_sparse": [], "pub_graph": [], "pub_label": [],
     }
 
     def fake_extract(data, filename, mime):
@@ -85,19 +86,20 @@ def mock_outbound(monkeypatch):
         calls["fast"].append(sha)
         return sha
 
-    async def fake_publish(sha256, parent_op_id=None):
-        calls["published"].append(sha256)
-
-    async def fake_publish_label(sha256, parent_op_id=None):
-        calls["published_label"].append(sha256)
+    def _record(key):
+        async def pub(sha256, parent_op_id=None):
+            calls[key].append(sha256)
+        return pub
 
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
-    monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [1], "values": [0.5]})
+    monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [1], "values": [0.5]})
     monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: calls["fanout"].append(rec))
     monkeypatch.setattr(pipeline, "ingest_fast", fake_ingest_fast)
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish)
-    monkeypatch.setattr(broker_module, "publish_label_task", fake_publish_label)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("pub_dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("pub_sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("pub_graph"))
+    monkeypatch.setattr(broker_module, "publish_label_task", _record("pub_label"))
     return calls
 
 
@@ -167,10 +169,10 @@ def test_rescan_files_walks_library_root(tmp_path, fresh_store, mock_outbound, m
         assert final["progress"]["skipped"] == 0
 
     # rescan now runs the synchronous fast path per file (catalog write) and
-    # publishes an index + label task each — projection/labelling happen async.
+    # enqueues the per-stage DAG each — projection/labelling happen async.
     assert len(mock_outbound["fast"]) == 3
-    assert len(mock_outbound["published"]) == 3
-    assert len(mock_outbound["published_label"]) == 3
+    for key in ("pub_dense", "pub_sparse", "pub_graph", "pub_label"):
+        assert len(mock_outbound[key]) == 3, key
     assert mock_outbound["fanout"] == []
 
 
@@ -209,17 +211,22 @@ def test_rebuild_thumbnails_drives_catalog_rebuild(fresh_store, monkeypatch):
 
 
 @pytest.mark.parametrize("rtype", ["rebuild-search", "rebuild-graph"])
-def test_rebuild_search_graph_bulk_publish_index(fresh_store, monkeypatch, rtype):
-    """rebuild-search / rebuild-graph are bulk PRODUCERS now (ADR 0001): they
-    publish an index task per cataloged image (an index task re-projects both
-    stores), instead of calling an owning-service /rebuild inline."""
+def test_rebuild_search_graph_bulk_reproject(fresh_store, monkeypatch, rtype):
+    """rebuild-search / rebuild-graph are bulk PRODUCERS (ADR 0002): they
+    re-publish the projection stages (embed.dense + embed.sparse -> index.search,
+    plus index.graph) per cataloged image, instead of calling an owning-service
+    /rebuild inline."""
     monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: ["a" * 64, "b" * 64])
-    published: list[str] = []
+    pub: dict[str, list[str]] = {"embed.dense": [], "embed.sparse": [], "index.graph": []}
 
-    async def fake_publish_index(sha256, parent_op_id=None):
-        published.append(sha256)
+    def _record(key):
+        async def fake(sha256, parent_op_id=None):
+            pub[key].append(sha256)
+        return fake
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake_publish_index)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("embed.dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("embed.sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("index.graph"))
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": rtype})
@@ -230,7 +237,8 @@ def test_rebuild_search_graph_bulk_publish_index(fresh_store, monkeypatch, rtype
         assert final["progress"]["total"] == 2
         assert final["progress"]["done"] == 2
 
-    assert sorted(published) == ["a" * 64, "b" * 64]
+    for key in pub:
+        assert sorted(pub[key]) == ["a" * 64, "b" * 64], key
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,7 @@ def delete_image(sha256: str = SHA256) -> dict:
     """
     if not repository.delete_image(sha256):
         raise HTTPException(status_code=404, detail="image not found")
-    for kind in ("thumbnail", "embedding"):
+    for kind in object_store.BLOB_KINDS:
         object_store.delete_blob(sha256, kind)
     return {"status": "ok"}
 
@@ -111,7 +111,7 @@ def set_favorite(payload: FavoriteBody, sha256: str = SHA256) -> dict:
 
 @router.get("/blobs/{sha256}/{kind}")
 def get_blob(sha256: str = SHA256, kind: str = Path(...)) -> Response:
-    if kind not in ("thumbnail", "embedding"):
+    if kind not in object_store.BLOB_KINDS:
         raise HTTPException(status_code=422, detail="invalid blob kind")
     data = object_store.get_blob(sha256, kind)
     if data is None:
@@ -125,7 +125,7 @@ def get_blob(sha256: str = SHA256, kind: str = Path(...)) -> Response:
 async def put_blob(
     request: Request, sha256: str = SHA256, kind: str = Path(...)
 ) -> dict:
-    if kind not in ("thumbnail", "embedding"):
+    if kind not in object_store.BLOB_KINDS:
         raise HTTPException(status_code=422, detail="invalid blob kind")
     body = await request.body()
     uri = object_store.put_blob(sha256, kind, body)

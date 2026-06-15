@@ -286,6 +286,36 @@ def test_put_get_embedding_blob(client) -> None:
     assert g.headers["content-type"] == "application/octet-stream"
 
 
+def test_put_get_sparse_blob(client) -> None:
+    # The embed.sparse stage (ADR 0002) persists the sparse vector as JSON; the
+    # index.search fan-in reads it back. Round-trip the bytes + content type.
+    sha = _sha()
+    payload = b'{"indices":[1,7,42],"values":[0.5,0.25,0.1]}'
+    r = client.put(
+        f"/blobs/{sha}/sparse",
+        content=payload,
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 200, r.text
+
+    g = client.get(f"/blobs/{sha}/sparse")
+    assert g.status_code == 200
+    assert g.content == payload
+    assert g.headers["content-type"] == "application/json"
+
+
+def test_blob_rejects_unknown_kind(client) -> None:
+    assert client.get(f"/blobs/{_sha()}/bogus").status_code == 422
+    assert (
+        client.put(
+            f"/blobs/{_sha()}/bogus",
+            content=b"x",
+            headers={"content-type": "application/octet-stream"},
+        ).status_code
+        == 422
+    )
+
+
 def test_blob_not_found_404(client) -> None:
     assert client.get(f"/blobs/{_sha()}/thumbnail").status_code == 404
 
@@ -296,6 +326,7 @@ def test_blob_key_layout() -> None:
     sha = "ab" + "0" * 62
     assert blob_key(sha, "thumbnail") == f"thumbnails/ab/{sha}.webp"
     assert blob_key(sha, "embedding") == f"embeddings/ab/{sha}.bin"
+    assert blob_key(sha, "sparse") == f"sparse/ab/{sha}.json"
 
 
 def test_notes_and_collections(client) -> None:
