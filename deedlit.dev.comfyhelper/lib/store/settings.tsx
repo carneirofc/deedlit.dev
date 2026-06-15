@@ -18,6 +18,30 @@ export type GridDensity = "compact" | "comfortable" | "spacious";
 export type ImageFit = "contain" | "cover";
 
 /**
+ * Result ordering. `relevance` is the vector-search ranking (only meaningful
+ * when there is a text/image query); the rest are server-side catalog sorts used
+ * by the filter-only browse grid. Mirrors the catalog `sort` enum + relevance.
+ */
+export type SortMode =
+  | "relevance"
+  | "newest"
+  | "oldest"
+  | "rating_desc"
+  | "rating_asc"
+  | "name_asc"
+  | "name_desc";
+
+export const SORT_MODES: readonly SortMode[] = [
+  "relevance",
+  "newest",
+  "oldest",
+  "rating_desc",
+  "rating_asc",
+  "name_asc",
+  "name_desc",
+] as const;
+
+/**
  * User-tunable preferences for the image library UI.  Persisted to
  * localStorage (survives across sessions) and consumed by the browse page,
  * the image viewer, and the suggestion / related-item panels.
@@ -32,6 +56,9 @@ export interface LibrarySettings {
   infiniteScroll: boolean;
   /** How result cards are laid out. */
   viewMode: ViewMode;
+  /** Result ordering. Defaults to newest-first for browse; relevance is applied
+   * automatically when a text/image query is active. */
+  sortMode: SortMode;
   /** Card size / column count for grid & masonry views. */
   gridDensity: GridDensity;
   /** Show the similarity-score chip on cards. */
@@ -84,6 +111,7 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   defaultMode: "browse",
   infiniteScroll: false,
   viewMode: "grid",
+  sortMode: "newest",
   gridDensity: "comfortable",
   showScores: true,
   showCardMeta: true,
@@ -137,6 +165,7 @@ function mergeSettings(raw: unknown): LibrarySettings {
     defaultMode: oneOf("defaultMode", ["browse", "semantic", "image"] as const),
     infiniteScroll: bool("infiniteScroll"),
     viewMode: oneOf("viewMode", ["grid", "list", "masonry"] as const),
+    sortMode: oneOf("sortMode", SORT_MODES),
     gridDensity: oneOf("gridDensity", ["compact", "comfortable", "spacious"] as const),
     showScores: bool("showScores"),
     showCardMeta: bool("showCardMeta"),

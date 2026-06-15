@@ -554,6 +554,39 @@ def test_images_list_degrades_to_empty_when_catalog_down(rec, client):
     assert client.get("/images").json() == []
 
 
+def test_images_list_threads_browse_filters_into_catalog(rec, client):
+    # The library browse grid sends repeatable tag/exclude_tag, a sort, and a
+    # rating floor; the gateway forwards them verbatim to catalog GET /images.
+    seen = {}
+
+    def images_handler(request: httpx.Request):
+        p = request.url.params
+        seen["tag"] = p.get_list("tag")
+        seen["exclude_tag"] = p.get_list("exclude_tag")
+        seen["sort"] = p.get("sort")
+        seen["rating_gte"] = p.get("rating_gte")
+        return []
+
+    rec.on("GET", "/images", images_handler)
+
+    r = client.get(
+        "/images",
+        params=[
+            ("tag", "knight"),
+            ("tag", "castle"),
+            ("exclude_tag", "blurry"),
+            ("sort", "rating_desc"),
+            ("rating_gte", "3"),
+        ],
+    )
+    assert r.status_code == 200
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["tag"] == ["knight", "castle"]
+    assert seen["exclude_tag"] == ["blurry"]
+    assert seen["sort"] == "rating_desc"
+    assert seen["rating_gte"] == "3"
+
+
 def test_patch_image_proxies_and_passes_404(rec, client):
     rec.on("PATCH", f"/images/{SHA}", lambda r: {"sha256": SHA, "safety": "nsfw"})
     r = client.patch(f"/images/{SHA}", json={"safety": "nsfw"})

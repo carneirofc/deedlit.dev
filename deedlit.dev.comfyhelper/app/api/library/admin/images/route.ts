@@ -16,9 +16,11 @@ export async function GET(request: Request) {
     const limit = Number(sp.get("limit") ?? "50");
     const offset = Number(sp.get("offset") ?? "0");
     const favoriteParam = sp.get("favorite");
+    const tag = sp.get("tag")?.trim();
+    const safety = sp.get("safety")?.trim();
     const images = await listCatalogImages({
-      tag: sp.get("tag") ?? undefined,
-      safety: sp.get("safety") ?? undefined,
+      tags: tag ? [tag] : undefined,
+      safety: safety ? [safety] : undefined,
       favorite: favoriteParam === "true" ? true : undefined,
       limit: Number.isFinite(limit) ? limit : 50,
       offset: Number.isFinite(offset) ? offset : 0,

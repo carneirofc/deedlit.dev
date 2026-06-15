@@ -79,8 +79,11 @@ export class GatewayError extends Error {
 interface RequestOptions {
   method?: string;
   body?: unknown;
-  /** Query params appended to the path. */
-  query?: Record<string, string | number | boolean | undefined>;
+  /**
+   * Query params appended to the path. An array value is emitted as a repeated
+   * param (?k=a&k=b); undefined values and empty arrays are skipped.
+   */
+  query?: Record<string, string | number | boolean | string[] | undefined>;
   signal?: AbortSignal;
 }
 
@@ -89,7 +92,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const url = new URL(`${base}${path}`);
   if (opts.query) {
     for (const [k, v] of Object.entries(opts.query)) {
-      if (v !== undefined) url.searchParams.set(k, String(v));
+      if (v === undefined) continue;
+      if (Array.isArray(v)) {
+        for (const item of v) url.searchParams.append(k, String(item));
+      } else {
+        url.searchParams.set(k, String(v));
+      }
     }
   }
   const method = opts.method ?? "GET";
@@ -542,18 +550,48 @@ export async function updateIngestConfig(
 // deleteImage (the fan-out un-index above).
 // ---------------------------------------------------------------------------
 
-/** Browse raw catalog records (gateway GET /images). */
+/** Server-side browse/sort/filter knobs for the catalog `GET /images` grid. */
+export type CatalogSort =
+  | "newest"
+  | "oldest"
+  | "rating_desc"
+  | "rating_asc"
+  | "name_asc"
+  | "name_desc";
+
+export interface CatalogBrowseParams {
+  /** Include tags — image must carry ALL of them (AND). */
+  tags?: string[];
+  /** Exclude tags — image must carry NONE of them. */
+  excludeTags?: string[];
+  favorite?: boolean;
+  /** Keep images rated at least this (0–5). */
+  ratingGte?: number;
+  /** Content-safety classes to include; omit/empty = all. */
+  safety?: string[];
+  sort?: CatalogSort;
+  limit?: number;
+  offset?: number;
+}
+
+/** Browse raw catalog records (gateway GET /images), sorted + paginated. */
 export async function listCatalogImages(
-  params: {
-    tag?: string;
-    favorite?: boolean;
-    safety?: string;
-    limit?: number;
-    offset?: number;
-  } = {},
+  params: CatalogBrowseParams = {},
   signal?: AbortSignal,
 ): Promise<CatalogImage[]> {
-  const res = await request<unknown>("/images", { query: params, signal });
+  const res = await request<unknown>("/images", {
+    query: {
+      tag: params.tags,
+      exclude_tag: params.excludeTags,
+      favorite: params.favorite,
+      rating_gte: params.ratingGte,
+      safety: params.safety,
+      sort: params.sort,
+      limit: params.limit,
+      offset: params.offset,
+    },
+    signal,
+  });
   return Array.isArray(res) ? (res as CatalogImage[]) : [];
 }
 
@@ -802,6 +840,39 @@ export function hitToCompactResult(hit: SearchHit): CompactResult {
 
 export function hitsToCompactResults(hits: SearchHit[]): CompactResult[] {
   return hits.map(hitToCompactResult);
+}
+
+/**
+ * Map a catalog Image record -> CompactResult for the browse grid. The catalog
+ * browse path (filter + server sort + pagination) feeds the same card UI as the
+ * vector search path, so the two converge on this shape. `score` is null (browse
+ * has no relevance ranking); the summary mirrors {@link summarizePayload}.
+ */
+export function catalogImageToCompactResult(image: CatalogImage): CompactResult {
+  const tags = stringArray(image.tags);
+  const prompt = str(image.prompt);
+  const filePath = str(image.filePath) ?? str(image.file_path);
+  const filename = filePath ? filePath.replace(/^.*[/\\]/, "") : null;
+  const summary =
+    (prompt ? prompt.replace(/\s+/g, " ").trim().slice(0, 140) : null) ??
+    (tags.length ? tags.slice(0, 8).join(", ") : null) ??
+    filename ??
+    image.sha256;
+  const checkpoint = refName(image, "checkpoint");
+  return {
+    imageId: image.sha256,
+    score: null,
+    thumbnailUrl: thumbnailUrl(image.sha256),
+    summary,
+    tags,
+    model: checkpoint ?? str(image.model),
+    checkpoint,
+    rating: typeof image.rating === "number" ? image.rating : null,
+    safety:
+      image.safety === "sfw" || image.safety === "nsfw" || image.safety === "explicit"
+        ? image.safety
+        : null,
+  };
 }
 
 /** First reference of a given kind (e.g. checkpoint). */

@@ -1,16 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";
 import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
+import { TagSelect } from "@/components/TagSelect";
 import { deleteImages } from "@/lib/library/bulk-delete";
-import type { GraphScope } from "@/lib/library/schemas";
+import type { CatalogSort, GraphScope } from "@/lib/library/schemas";
 import {
   gridColumnsClass,
   masonryColumnsClass,
   useSettings,
+  type SortMode,
   type ViewMode,
 } from "@/lib/store/settings";
 
@@ -51,6 +53,37 @@ interface SimilarRef {
 
 type BrowseMode = "browse" | "semantic" | "image" | "similar";
 
+const SORT_LABEL: Record<SortMode, string> = {
+  relevance: "Relevance",
+  newest: "Newest",
+  oldest: "Oldest",
+  rating_desc: "Rating ↓",
+  rating_asc: "Rating ↑",
+  name_asc: "Name A–Z",
+  name_desc: "Name Z–A",
+};
+
+// Sort options offered per context. The vector-search path is relevance-ranked
+// and its results carry no date/filename, so only relevance + rating (a
+// client-side reorder of the loaded window) make sense there; browse offers the
+// full server-side set.
+const BROWSE_SORTS: SortMode[] = ["newest", "oldest", "rating_desc", "rating_asc", "name_asc", "name_desc"];
+const SEARCH_SORTS: SortMode[] = ["relevance", "rating_desc", "rating_asc"];
+
+/** The catalog browse path is used only for filter-only browsing (no query). */
+function isBrowsePath(mode: BrowseMode, query: string): boolean {
+  return mode === "browse" && query.trim() === "";
+}
+
+/** Rank tags by frequency across the loaded results for the autocomplete. */
+function rankTags(results: CompactResult[]): string[] {
+  const counts = new Map<string, number>();
+  for (const r of results) {
+    for (const t of r.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t]) => t);
+}
+
 const cls = {
   card: "rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-4",
   input: "w-full rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-2 text-ui-sm outline-none focus:border-accent-cyan",
@@ -77,8 +110,8 @@ export default function LibraryPage() {
   // Browse / filter state — seeded from saved settings (defaults until hydrated).
   const [mode, setMode] = useState<BrowseMode>("browse");
   const [query, setQuery] = useState("");
-  const [tags, setTags] = useState("");
-  const [excludeTags, setExcludeTags] = useState("");
+  const [tags, setTags] = useState<string[]>([]);
+  const [excludeTags, setExcludeTags] = useState<string[]>([]);
   const [modelFamily, setModelFamily] = useState("");
   const [checkpoint, setCheckpoint] = useState("");
   const [loras, setLoras] = useState("");
@@ -108,6 +141,11 @@ export default function LibraryPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Freshness: while browsing newest-first, a background poll watches the head
+  // of the catalog so newly-ingested images surface without a manual reload.
+  const [hasNew, setHasNew] = useState(false);
+  const newestIdRef = useRef<string | null>(null);
+
   // Fullscreen viewer / slideshow
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
   const [lightboxAutoPlay, setLightboxAutoPlay] = useState(false);
@@ -131,11 +169,13 @@ export default function LibraryPage() {
   const filtersRef = useRef({
     mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
     favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
+    sort: settings.sortMode,
   });
   useEffect(() => {
     filtersRef.current = {
       mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
       favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
+      sort: settings.sortMode,
     };
   });
 
@@ -145,10 +185,14 @@ export default function LibraryPage() {
 
       // A fresh search invalidates the open viewer (its indices no longer map)
       // and any pending bulk selection (those ids may not be in the new set).
+      // It also re-baselines the freshness poll: whatever we load now becomes
+      // the "seen" head, so the New-images banner only fires on later arrivals.
       if (!append) {
         setLightboxIndex(null);
         setSelected(new Set());
         setConfirmingBulk(false);
+        setHasNew(false);
+        newestIdRef.current = null;
       }
 
       // Image mode with no image yet: nothing to search.
@@ -163,21 +207,21 @@ export default function LibraryPage() {
 
       const pageSize = s.limit;
       const pageOffset = append ? pageRef.current * pageSize : 0;
+      const safetySubset =
+        s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length ? s.safety : undefined;
+      const ratingGte = s.minRating > 0 ? s.minRating : undefined;
       const filters = {
-        tags: csv(s.tags).length ? csv(s.tags) : undefined,
-        excludeTags: csv(s.excludeTags).length ? csv(s.excludeTags) : undefined,
+        tags: s.tags.length ? s.tags : undefined,
+        excludeTags: s.excludeTags.length ? s.excludeTags : undefined,
         modelFamily: s.modelFamily.trim() || undefined,
         checkpoint: s.checkpoint.trim() || undefined,
         loras: csv(s.loras).length ? csv(s.loras) : undefined,
         sourceTool: s.sourceTool.trim() || undefined,
         favorite: s.favorites || undefined,
-        ratingGte: s.minRating > 0 ? s.minRating : undefined,
+        ratingGte,
         // Only send a safety filter when a strict subset is selected; all (or
         // none) selected means "no filter" so unclassified images stay visible.
-        safety:
-          s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length
-            ? s.safety
-            : undefined,
+        safety: safetySubset,
       };
 
       try {
@@ -206,6 +250,31 @@ export default function LibraryPage() {
               ? `Visual similarity · ${j.provider}`
               : "Visual similarity · local color/layout features (CLIP not configured)",
           );
+        } else if (isBrowsePath(s.mode, s.query)) {
+          // Filter-only browse over the catalog truth: real server-side sort +
+          // offset pagination (the vector /search needs a query and can't sort by
+          // date/name). `relevance` has no meaning without a query, so it maps to
+          // newest here. Only catalog-backed filters apply (model/lora/source-tool
+          // are vector-only and silently skipped on this path).
+          const browseSort: CatalogSort = s.sort === "relevance" ? "newest" : s.sort;
+          const r = await fetch("/api/library/browse", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              tags: filters.tags,
+              excludeTags: filters.excludeTags,
+              favorite: filters.favorite,
+              ratingGte: filters.ratingGte,
+              safety: filters.safety,
+              sort: browseSort,
+              limit: pageSize,
+              offset: pageOffset,
+            }),
+          });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error ?? "Browse failed");
+          fresh = j.results ?? [];
+          more = j.hasMore ?? fresh.length === pageSize;
         } else {
           // Unified text / filter search. The gateway encodes the text query into
           // dense+sparse vectors, so this is the hybrid "browse + semantic" path.
@@ -399,13 +468,13 @@ export default function LibraryPage() {
     didInit.current = true;
 
     const sp = new URLSearchParams(window.location.search);
-    const qpTags = sp.get("tags") ?? "";
+    const qpTags = csv(sp.get("tags") ?? "");
     const qpQuery = sp.get("q") ?? "";
     const qpMode = sp.get("mode");
     const wantImage = qpMode === "image" || (!qpMode && settings.defaultMode === "image");
     const initialMode: BrowseMode = wantImage ? "image" : "browse";
 
-    if (qpTags) setTags(qpTags);
+    if (qpTags.length) setTags(qpTags);
     if (qpQuery) setQuery(qpQuery);
     if (wantImage) setShowImageSearch(true);
     setMode(initialMode);
@@ -441,6 +510,54 @@ export default function LibraryPage() {
     return () => ob.disconnect();
   }, [settings.infiniteScroll, hasMore, loading, loadMore]);
 
+  // Freshness poll: while filter-only browsing, watch the newest catalog head for
+  // the current filter set. When a newer image than the one we baselined appears
+  // (ingest finished, a backfill landed), raise the "new images" banner instead
+  // of silently going stale. Only runs on the browse path — search results are a
+  // point-in-time ranking, not a live feed.
+  useEffect(() => {
+    if (!isBrowsePath(mode, query)) {
+      setHasNew(false);
+      return;
+    }
+    const safetySubset =
+      safety.length > 0 && safety.length < SAFETY_CLASSES.length ? safety : undefined;
+    const body = {
+      tags: tags.length ? tags : undefined,
+      excludeTags: excludeTags.length ? excludeTags : undefined,
+      favorite: favorites || undefined,
+      ratingGte: minRating > 0 ? minRating : undefined,
+      safety: safetySubset,
+      sort: "newest" as const,
+      limit: 1,
+      offset: 0,
+    };
+    let alive = true;
+    const check = async () => {
+      try {
+        const r = await fetch("/api/library/browse", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) return;
+        const j = await r.json();
+        const topId: string | null = j.results?.[0]?.imageId ?? null;
+        if (!alive || !topId) return;
+        if (newestIdRef.current === null) newestIdRef.current = topId;
+        else if (topId !== newestIdRef.current) setHasNew(true);
+      } catch {
+        // transient — try again next tick
+      }
+    };
+    check();
+    const id = setInterval(check, 15000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [mode, query, tags, excludeTags, favorites, minRating, safety]);
+
   const startIngest = async () => {
     if (!folderPath.trim()) return;
     try {
@@ -457,6 +574,40 @@ export default function LibraryPage() {
   };
 
   const imagePanelOpen = showImageSearch || mode === "image";
+
+  // Which result source is live. Browse is server-sorted + paginated; the vector
+  // path is relevance-ranked, so it only offers relevance + a client rating sort.
+  const browsePath = isBrowsePath(mode, query);
+  const sortOptions = browsePath ? BROWSE_SORTS : SEARCH_SORTS;
+  const sortValue: SortMode = sortOptions.includes(settings.sortMode)
+    ? settings.sortMode
+    : sortOptions[0];
+
+  // Autocomplete pool for the tag pickers — tags on the loaded results, most
+  // common first (we have no library-wide tag-list endpoint).
+  const tagSuggestions = useMemo(() => rankTags(results), [results]);
+
+  // The vector path can't sort by date/name (its rows lack them), so honour a
+  // rating sort by reordering the loaded window client-side. Browse is already
+  // ordered by the server, so it passes through untouched. The grid AND the
+  // lightbox both read this so their indices stay in lockstep.
+  const displayResults = useMemo(() => {
+    if (browsePath || (sortValue !== "rating_desc" && sortValue !== "rating_asc")) {
+      return results;
+    }
+    const dir = sortValue === "rating_desc" ? -1 : 1;
+    const nullVal = dir === -1 ? -Infinity : Infinity;
+    return [...results].sort(
+      (a, b) => ((a.rating ?? nullVal) - (b.rating ?? nullVal)) * dir,
+    );
+  }, [results, browsePath, sortValue]);
+
+  const changeSort = (next: SortMode) => {
+    setKey("sortMode", next);
+    // Browse ordering lives on the server, so a change must re-page from the top;
+    // the vector path only needs the client reorder above.
+    if (browsePath) doFetch(false, { sort: next });
+  };
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-6">
@@ -499,6 +650,21 @@ export default function LibraryPage() {
             </svg>
             Slideshow
           </button>
+          <label className="flex items-center gap-1.5 rounded-lg border border-ui-border/60 bg-ui-bg px-2 py-1 text-ui-2xs text-ui-ink-muted">
+            <span className="hidden sm:inline">Sort</span>
+            <select
+              value={sortValue}
+              onChange={(e) => changeSort(e.target.value as SortMode)}
+              className="bg-transparent text-ui-2xs font-medium text-ui-ink outline-none"
+              aria-label="Sort results"
+            >
+              {sortOptions.map((s) => (
+                <option key={s} value={s}>
+                  {SORT_LABEL[s]}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="flex gap-0.5 rounded-lg border border-ui-border/60 bg-ui-bg p-0.5" role="group" aria-label="Result layout">
             {([
               ["grid", "Grid"],
@@ -614,15 +780,17 @@ export default function LibraryPage() {
             </div>
           )}
 
-          {/* Filters */}
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-            <input
-              className={cls.input}
-              placeholder="tags, comma-separated"
-              value={tags}
-              onChange={(e) => setTags(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && search()}
-            />
+          {/* Filters. Tags / favorites / rating apply instantly (they're cheap
+              server filters); the free-text model field still commits on Enter. */}
+          <TagSelect
+            value={tags}
+            onChange={setTags}
+            onCommit={(next) => doFetch(false, { tags: next })}
+            suggestions={tagSuggestions}
+            placeholder="filter by tag — type to add, pick from suggestions…"
+            variant="include"
+          />
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             <input
               className={cls.input}
               placeholder="model family (sdxl…)"
@@ -634,7 +802,10 @@ export default function LibraryPage() {
               <input
                 type="checkbox"
                 checked={favorites}
-                onChange={(e) => setFavorites(e.target.checked)}
+                onChange={(e) => {
+                  setFavorites(e.target.checked);
+                  doFetch(false, { favorites: e.target.checked });
+                }}
                 className="rounded"
               />
               Favorites only
@@ -642,7 +813,11 @@ export default function LibraryPage() {
             <select
               className="rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-2 text-ui-xs outline-none focus:border-accent-cyan"
               value={minRating}
-              onChange={(e) => setMinRating(Number(e.target.value))}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setMinRating(v);
+                doFetch(false, { minRating: v });
+              }}
             >
               <option value={0}>Any rating</option>
               <option value={1}>★+</option>
@@ -711,13 +886,19 @@ export default function LibraryPage() {
 
           {showAdvanced && (
             <div className="grid gap-3 rounded-lg border border-ui-border/40 bg-ui-bg/40 p-3 sm:grid-cols-2 lg:grid-cols-3">
+              <p className="col-span-full text-ui-2xs text-ui-ink-muted/70">
+                Tags, rating, favorite & safety filter plain browsing too. Model,
+                checkpoint, LoRA & source-tool apply when a text or image search is active.
+              </p>
               <label className={cls.label}>
                 Exclude tags
-                <input
-                  className={cls.input}
-                  placeholder="comma-separated"
+                <TagSelect
                   value={excludeTags}
-                  onChange={(e) => setExcludeTags(e.target.value)}
+                  onChange={setExcludeTags}
+                  onCommit={(next) => doFetch(false, { excludeTags: next })}
+                  suggestions={tagSuggestions}
+                  placeholder="tags to hide…"
+                  variant="exclude"
                 />
               </label>
               <label className={cls.label}>
@@ -781,6 +962,20 @@ export default function LibraryPage() {
 
       {error && <p className="text-ui-sm text-rose-500">{error}</p>}
 
+      {/* Freshness banner — newer images landed while browsing; reload from top. */}
+      {hasNew && (
+        <button
+          onClick={() => doFetch(false)}
+          className="sticky top-2 z-20 mx-auto flex items-center gap-2 rounded-full border border-accent-cyan/50 bg-accent-cyan/15 px-4 py-1.5 text-ui-xs font-medium text-accent-cyan shadow-sm backdrop-blur-sm transition hover:bg-accent-cyan/25"
+        >
+          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-9-9" />
+            <path d="M21 3v6h-6" />
+          </svg>
+          New images available — refresh
+        </button>
+      )}
+
       {/* Image grid */}
       {results.length === 0 && !loading && (
         <p className="text-ui-sm text-ui-ink-muted">
@@ -842,7 +1037,7 @@ export default function LibraryPage() {
 
       {results.length > 0 && (
         <ResultsView
-          results={results}
+          results={displayResults}
           viewMode={settings.viewMode}
           density={settings.gridDensity}
           showScores={settings.showScores}
@@ -933,9 +1128,9 @@ export default function LibraryPage() {
       </section>
 
       {/* Fullscreen viewer / slideshow */}
-      {lightboxIndex !== null && results[lightboxIndex] && (
+      {lightboxIndex !== null && displayResults[lightboxIndex] && (
         <Lightbox
-          items={results}
+          items={displayResults}
           initialIndex={lightboxIndex}
           fullResolution={settings.viewerFullResolution}
           slideshow={{

@@ -181,28 +181,69 @@ def get_image(sha256: str) -> Image | None:
         )
 
 
+# Browse sort orders. WHITELISTED: the `sort` key is looked up here and never
+# interpolated from caller input, so the ORDER BY clause can be safely embedded
+# in the SQL string. `name_*` sorts by the OS-agnostic basename of file_path
+# (strip everything up to the last / or \) so "name" means filename, not folder.
+_NAME_EXPR = r"lower(regexp_replace(i.file_path, '^.*[/\\]', ''))"
+_ORDER_BY: dict[str, str] = {
+    "newest": "i.imported_at DESC",
+    "oldest": "i.imported_at ASC",
+    "rating_desc": "i.rating DESC NULLS LAST, i.imported_at DESC",
+    "rating_asc": "i.rating ASC NULLS LAST, i.imported_at DESC",
+    "name_asc": f"{_NAME_EXPR} ASC, i.imported_at DESC",
+    "name_desc": f"{_NAME_EXPR} DESC, i.imported_at DESC",
+}
+
+
 def list_images(
     *,
-    tag: str | None,
-    favorite: bool | None,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    favorite: bool | None = None,
+    rating_gte: int | None = None,
     limit: int,
     offset: int,
     safety: list[str] | None = None,
+    sort: str = "newest",
 ) -> list[Image]:
+    """Browse the catalog with AND-combined filters and a whitelisted sort.
+
+    `tags` matches images carrying EVERY listed tag; `exclude_tags` drops images
+    carrying ANY of them. Tag membership uses correlated EXISTS subqueries so the
+    row set never multiplies (no JOIN/DISTINCT) and the ORDER BY can reference the
+    image columns directly. Unknown `sort` falls back to newest-first.
+    """
     eng = get_engine()
     clauses = ["i.deleted = false"]
     params: dict[str, Any] = {"limit": limit, "offset": offset}
-    join = ""
-    if tag is not None:
-        join = (
-            " JOIN image_tags it ON it.image_id = i.id"
-            " JOIN tags t ON t.id = it.tag_id"
+
+    # Include tags — image must carry EVERY requested tag (AND semantics).
+    for idx, tag in enumerate(tags or []):
+        key = f"tag{idx}"
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM image_tags it{idx}"
+            f" JOIN tags tg{idx} ON tg{idx}.id = it{idx}.tag_id"
+            f" WHERE it{idx}.image_id = i.id AND tg{idx}.normalized_name = :{key})"
         )
-        clauses.append("t.normalized_name = :tag")
-        params["tag"] = _normalize_tag(tag)
+        params[key] = _normalize_tag(tag)
+
+    # Exclude tags — image must carry NONE of these.
+    for idx, tag in enumerate(exclude_tags or []):
+        key = f"xtag{idx}"
+        clauses.append(
+            f"NOT EXISTS (SELECT 1 FROM image_tags xt{idx}"
+            f" JOIN tags xg{idx} ON xg{idx}.id = xt{idx}.tag_id"
+            f" WHERE xt{idx}.image_id = i.id AND xg{idx}.normalized_name = :{key})"
+        )
+        params[key] = _normalize_tag(tag)
+
     if favorite is not None:
         clauses.append("i.favorite = :favorite")
         params["favorite"] = favorite
+    if rating_gte is not None:
+        clauses.append("i.rating >= :rating_gte")
+        params["rating_gte"] = rating_gte
     if safety:
         # Multi-select content-safety filter: keep rows whose class is among the
         # requested set. Unclassified (NULL) rows are excluded by an explicit
@@ -211,14 +252,15 @@ def list_images(
         params["safety"] = list(safety)
 
     where = " AND ".join(clauses)
+    order_by = _ORDER_BY.get(sort, _ORDER_BY["newest"])
     with eng.connect() as conn:
         rows = conn.execute(
             text(
                 f"""
-                SELECT DISTINCT i.sha256_hash, i.imported_at
-                FROM images i{join}
+                SELECT i.sha256_hash
+                FROM images i
                 WHERE {where}
-                ORDER BY i.imported_at DESC
+                ORDER BY {order_by}
                 LIMIT :limit OFFSET :offset
                 """
             ),

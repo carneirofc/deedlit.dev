@@ -154,6 +154,36 @@ export const MetadataSearchRequestSchema = z.object({
 });
 export type MetadataSearchRequest = z.infer<typeof MetadataSearchRequestSchema>;
 
+/** Server-side browse ordering for the catalog grid (no relevance — that's the
+ * vector search path). Mirrors the catalog `sort` enum. */
+export const CatalogSortSchema = z.enum([
+  "newest",
+  "oldest",
+  "rating_desc",
+  "rating_asc",
+  "name_asc",
+  "name_desc",
+]);
+export type CatalogSort = z.infer<typeof CatalogSortSchema>;
+
+/**
+ * Filter-only browse over the catalog truth (gateway GET /images): real
+ * server-side sort + offset pagination, used when there is no text query. Only
+ * the catalog-backed filters live here; model/checkpoint/lora/source-tool are
+ * vector-search-only and stay on {@link MetadataSearchRequestSchema}.
+ */
+export const CatalogBrowseRequestSchema = z.object({
+  tags: z.array(z.string()).optional(),
+  excludeTags: z.array(z.string()).optional(),
+  favorite: z.boolean().optional(),
+  ratingGte: z.number().int().min(0).max(5).optional(),
+  safety: z.array(SafetySchema).optional(),
+  sort: CatalogSortSchema.default("newest"),
+  limit: z.number().int().min(1).max(200).default(40),
+  offset: z.number().int().min(0).default(0),
+});
+export type CatalogBrowseRequest = z.infer<typeof CatalogBrowseRequestSchema>;
+
 export const SemanticSearchRequestSchema = z.object({
   query: z.string().min(1),
   filters: SearchFiltersSchema.optional(),

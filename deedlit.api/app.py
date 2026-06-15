@@ -31,7 +31,7 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -630,21 +630,35 @@ async def requeue_dlq(base: str, limit: int = 100) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.get("/images")
 async def list_images(
-    tag: str | None = None,
+    tag: list[str] | None = Query(default=None),
+    exclude_tag: list[str] | None = Query(default=None),
     favorite: bool | None = None,
-    safety: str | None = None,
+    rating_gte: int | None = Query(default=None, ge=0, le=5),
+    safety: list[str] | None = Query(default=None),
+    sort: str = "newest",
     limit: int = 50,
     offset: int = 0,
 ) -> Any:
+    """Browse the catalog truth. `tag`/`exclude_tag`/`safety` are repeatable
+    (?tag=a&tag=b); `sort` and `rating_gte` drive server-side ordering/filtering
+    for the library browse grid. All filters are forwarded verbatim to catalog."""
     from urllib.parse import urlencode
 
-    params: list[tuple[str, str]] = [("limit", str(int(limit))), ("offset", str(int(offset)))]
-    if tag:
-        params.append(("tag", tag))
+    params: list[tuple[str, str]] = [
+        ("limit", str(int(limit))),
+        ("offset", str(int(offset))),
+        ("sort", sort),
+    ]
+    for t in tag or []:
+        params.append(("tag", t))
+    for t in exclude_tag or []:
+        params.append(("exclude_tag", t))
     if favorite is not None:
         params.append(("favorite", "true" if favorite else "false"))
-    if safety:
-        params.append(("safety", safety))
+    if rating_gte is not None:
+        params.append(("rating_gte", str(int(rating_gte))))
+    for s in safety or []:
+        params.append(("safety", s))
     try:
         res = await clients.catalog("GET", f"/images?{urlencode(params)}")
     except DownstreamError:

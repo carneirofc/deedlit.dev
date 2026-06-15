@@ -124,6 +124,46 @@ def test_set_favorite(client) -> None:
     assert any(i["sha256"] == sha for i in listed)
 
 
+def _make_image(client, *, filepath, tags, rating=None) -> str:
+    """Create an image with tags / filepath (+ optional rating) and return its sha."""
+    sha = _sha()
+    r = client.post("/images", json={"sha256": sha, "filepath": filepath, "tags": tags})
+    assert r.status_code == 200, r.text
+    if rating is not None:
+        client.put(f"/images/{sha}/rating", json={"rating": rating})
+    return sha
+
+
+def test_list_browse_sort_and_tag_filters(client) -> None:
+    # Three images created oldest->newest. Names chosen so basename sort differs
+    # from insert order: a_apple < b_banana < c_cat.
+    a = _make_image(client, filepath="/lib/a_apple.png", tags=["knight", "castle"], rating=5)
+    b = _make_image(client, filepath="/lib/c_cat.png", tags=["knight"], rating=2)
+    c = _make_image(client, filepath="/lib/b_banana.png", tags=["knight", "castle", "blurry"])
+
+    def shas(params):
+        return [i["sha256"] for i in client.get("/images", params=params).json()]
+
+    # Newest-first (default) vs oldest-first.
+    assert shas({"sort": "newest"}) == [c, b, a]
+    assert shas({"sort": "oldest"}) == [a, b, c]
+
+    # Include tags AND together: only images carrying BOTH knight + castle.
+    assert set(shas([("tag", "knight"), ("tag", "castle")])) == {a, c}
+
+    # Exclude drops any match: knight minus blurry leaves a, b.
+    assert set(shas([("tag", "knight"), ("exclude_tag", "blurry")])) == {a, b}
+
+    # Rating floor keeps only sufficiently-rated images.
+    assert shas({"rating_gte": 3}) == [a]
+
+    # Rating sort: highest first, unrated (NULL) sorts last.
+    assert shas({"sort": "rating_desc"}) == [a, b, c]
+
+    # Name sort uses the basename, not insert order.
+    assert shas({"sort": "name_asc"}) == [a, c, b]
+
+
 def test_delete_image_removes_record_refs_and_blob(client) -> None:
     sha = _sha()
     client.post(

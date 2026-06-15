@@ -38,14 +38,26 @@ def create_image(payload: ImageUpsert) -> Image:
 
 @router.get("/images", response_model=list[Image])
 def list_images(
-    tag: str | None = Query(default=None),
+    tag: list[str] | None = Query(default=None),
+    exclude_tag: list[str] | None = Query(default=None),
     favorite: bool | None = Query(default=None),
+    rating_gte: int | None = Query(default=None, ge=0, le=5),
     safety: list[str] | None = Query(default=None),
+    sort: str = Query(default="newest"),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
 ) -> list[Image]:
+    # `tag`/`exclude_tag` are repeatable (?tag=a&tag=b). A single ?tag=a still
+    # arrives as a one-element list, so legacy single-tag callers keep working.
     return repository.list_images(
-        tag=tag, favorite=favorite, safety=safety, limit=limit, offset=offset
+        tags=tag,
+        exclude_tags=exclude_tag,
+        favorite=favorite,
+        rating_gte=rating_gte,
+        safety=safety,
+        sort=sort,
+        limit=limit,
+        offset=offset,
     )
 
 

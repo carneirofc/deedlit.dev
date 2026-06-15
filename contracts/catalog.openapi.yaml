@@ -19,9 +19,12 @@ paths:
     get:
       summary: List/search images
       parameters:
-        - { name: tag, in: query, schema: { type: string } }
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
         - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, description: "Keep images rated at least this (0-5).", schema: { type: integer, minimum: 0, maximum: 5 } }
         - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: sort, in: query, description: "Server-side ordering for the browse grid.", schema: { type: string, enum: [newest, oldest, rating_desc, rating_asc, name_asc, name_desc], default: newest } }
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }

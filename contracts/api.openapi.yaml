@@ -27,6 +27,24 @@ paths:
       parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
       summary: Aggregated detail (catalog + search neighbors + graph), parallel fan-out
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Detail" } } } } }
+  /images:
+    get:
+      summary: Browse the catalog truth (filter + sort + paginate) for the library grid
+      description: >
+        Proxies catalog GET /images. `tag`/`exclude_tag`/`safety` are repeatable
+        (?tag=a&tag=b); include-tags AND together, exclude-tags drop any match.
+        `sort` is server-side; an empty query browse uses this (the vector /search
+        needs a query). Degrades to [] when catalog is unavailable.
+      parameters:
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
+        - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: sort, in: query, schema: { type: string, enum: [newest, oldest, rating_desc, rating_asc, name_asc, name_desc], default: newest } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true, description: "catalog Image record, forwarded verbatim" } } } } } }
   /images/{sha256}:
     delete:
       parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
