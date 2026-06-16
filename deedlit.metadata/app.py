@@ -14,6 +14,7 @@ if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
 import logging
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 from activity import install_activity
 from extract import interpret_metadata
@@ -36,6 +37,7 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.metadata", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 install_activity(app)
 
 

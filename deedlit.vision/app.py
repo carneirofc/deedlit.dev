@@ -30,6 +30,7 @@ import httpx
 import open_clip
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from PIL import Image
@@ -229,6 +230,7 @@ app = FastAPI(
         {"name": "services", "description": "Reachability of the backing data-stack services (used by the test UI)."},
     ],
 )
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 install_activity(app)
 
 

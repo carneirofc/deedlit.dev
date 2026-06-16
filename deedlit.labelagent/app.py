@@ -19,6 +19,7 @@ import time
 from agno.media import Image
 from agno.os import AgentOS
 from fastapi import File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 from activity import install_activity
 from agent import ImageLabel, agent
@@ -54,6 +55,7 @@ log.setLevel(os.getenv("LABELAGENT_LOG_LEVEL", "INFO").upper())
 
 agent_os = AgentOS(name="deedlit.labelagent", agents=[agent])
 app = agent_os.get_app()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 install_activity(app)
 
 

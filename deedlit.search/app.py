@@ -18,6 +18,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 
 from activity import install_activity
 from search.config import get_config
@@ -67,6 +68,7 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.search", version="0.1.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 install_activity(app)
 
 

@@ -32,6 +32,7 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -58,6 +59,12 @@ class _HealthAccessFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.api", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Middleware only: the gateway serves an AGGREGATED /activity (every service's
 # snapshot) defined below, so the per-service route must not shadow it.
 install_activity(app, register_route=False)
