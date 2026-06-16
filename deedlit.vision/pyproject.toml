@@ -6,7 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.116.0",
-    "fastembed>=0.4.0",
+    # fastembed-gpu pulls onnxruntime-gpu so SPLADE sparse embeddings run on the
+    # GPU (CUDAExecutionProvider). Plain `fastembed` ships CPU-only onnxruntime
+    # and pinned sparse to the CPU. onnxruntime-gpu is floored at 1.22 for sm_120
+    # (Blackwell / RTX 50-series) kernels + CUDA 12 / cuDNN 9. Set SPARSE_DEVICE=cpu
+    # to force CPU.
+    "fastembed-gpu>=0.8.0",
+    "onnxruntime-gpu>=1.22.0",
     "httpx>=0.27.0",
     "open-clip-torch>=2.24.0",
     "pillow>=10.0.0",

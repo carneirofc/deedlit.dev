@@ -87,6 +87,20 @@ if DEVICE.startswith("cuda") and not torch.cuda.is_available():
 # fastembed downloads the (small) ONNX model from the Hub on first use.
 SPARSE_MODEL_NAME = os.getenv("SPARSE_MODEL", "prithivida/Splade_PP_en_v1")
 
+# SPLADE runs on onnxruntime, NOT torch — so it needs its OWN device switch and
+# the onnxruntime CUDA provider (shipped by the `fastembed-gpu` package). Without
+# this it silently used the CPUExecutionProvider while the CLIP towers ran on the
+# GPU. Defaults to the CLIP device so a CUDA deployment puts sparse on the GPU
+# too; set SPARSE_DEVICE=cpu to keep SPLADE on CPU intentionally.
+SPARSE_DEVICE = os.getenv("SPARSE_DEVICE", DEVICE)
+SPARSE_USE_GPU = SPARSE_DEVICE.startswith("cuda")
+
+
+def _cuda_index(device: str) -> int:
+    """GPU ordinal from a torch-style device string (``cuda`` -> 0, ``cuda:1`` -> 1)."""
+    _, _, idx = device.partition(":")
+    return int(idx) if idx.isdigit() else 0
+
 # Standard CLIP image normalization (OpenAI dataset stats, used by OpenCLIP too).
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -355,6 +369,7 @@ class HealthResponse(BaseModel):
     vision_ready: bool = Field(..., description="Whether the vision tower (image embeddings) is loaded.")
     text_ready: bool = Field(..., description="Whether the text tower (text embeddings) is loaded.")
     sparse_model: str = Field(..., description="SPLADE model name used for sparse text embeddings.")
+    sparse_device: str = Field(..., description="Device SPLADE runs on (`cpu` or `cuda`); onnxruntime, separate from the CLIP towers.")
     sparse_ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
 
 
@@ -423,6 +438,7 @@ class ModelInfo(BaseModel):
 
 class SparseModelInfo(BaseModel):
     name: str = Field(..., description="SPLADE model name for sparse text embeddings.")
+    device: str = Field(..., description="Device SPLADE runs on (`cpu` or `cuda`); onnxruntime, separate from the CLIP towers.")
     ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
 
 
@@ -459,11 +475,26 @@ _sparse_models: dict[str, object] = {}
 #      "paging file is too small" (os error 1455). Requests queue here instead.
 _gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-gpu")
 
+# SPLADE (onnxruntime) runs on its OWN single worker thread, separate from the
+# torch ``_gpu_pool``. Dense (CLIP, torch) and sparse (SPLADE, onnxruntime) are
+# different runtimes with independent memory pools and CUDA contexts, so giving
+# sparse its own thread lets a sparse request overlap a CLIP forward instead of
+# queuing behind it on the single torch worker — the two embeddings now run in
+# parallel on the GPU. Still max_workers=1 so SPLADE keeps its own single-flight
+# (no double model load).
+_sparse_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-sparse")
+
 
 async def _run_gpu(fn, *args):
-    """Run a blocking GPU/CPU torch call on the single inference worker thread."""
+    """Run a blocking GPU/CPU torch call on the single torch inference worker thread."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_gpu_pool, fn, *args)
+
+
+async def _run_sparse(fn, *args):
+    """Run a blocking SPLADE/onnxruntime call on the dedicated sparse worker thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_sparse_pool, fn, *args)
 
 
 def _normalize(x: torch.Tensor) -> torch.Tensor:
@@ -658,8 +689,42 @@ def _load_sparse_model() -> object:
 
     from fastembed import SparseTextEmbedding
 
-    _sparse_models[SPARSE_MODEL_NAME] = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
-    return _sparse_models[SPARSE_MODEL_NAME]
+    # Drive onnxruntime onto the GPU when SPARSE_DEVICE is cuda. The CUDA provider
+    # is listed first with CPU as fallback, so onnxruntime uses the GPU when
+    # onnxruntime-gpu (the `fastembed-gpu` package) is installed and silently
+    # degrades to CPU — with an ORT warning — when it is not. `device_ids` pins
+    # the GPU ordinal. fastembed downloads the (small) ONNX model on first use.
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if SPARSE_USE_GPU
+        else ["CPUExecutionProvider"]
+    )
+    log.info("loading SPLADE sparse model %s (providers=%s) …", SPARSE_MODEL_NAME, providers)
+    _load_started = time.perf_counter()
+    model = SparseTextEmbedding(
+        model_name=SPARSE_MODEL_NAME,
+        providers=providers,
+        device_ids=[_cuda_index(SPARSE_DEVICE)] if SPARSE_USE_GPU else None,
+    )
+
+    # Surface the provider onnxruntime actually selected so a silent CPU fallback
+    # (e.g. CPU-only fastembed installed on a GPU box) is visible in the logs
+    # rather than hiding behind "sparse is slow". Best-effort across fastembed
+    # versions — never fail the load over an introspection miss.
+    active = None
+    try:
+        inner = getattr(getattr(model, "model", None), "model", None)
+        if inner is not None and hasattr(inner, "get_providers"):
+            active = inner.get_providers()
+    except Exception:
+        active = None
+    log.info(
+        "loaded SPLADE sparse model %s in %.0f ms (active providers=%s)",
+        SPARSE_MODEL_NAME, (time.perf_counter() - _load_started) * 1000, active or "unknown",
+    )
+
+    _sparse_models[SPARSE_MODEL_NAME] = model
+    return model
 
 
 def _embed_sparse(text: str) -> tuple[list[int], list[float]]:
@@ -670,9 +735,14 @@ def _embed_sparse(text: str) -> tuple[list[int], list[float]]:
     ``list[int]`` / ``list[float]``.
     """
     model = _load_sparse_model()
+    started = time.perf_counter()
     embedding = next(iter(model.embed([text])))
     indices = [int(i) for i in embedding.indices.tolist()]
     values = [float(v) for v in embedding.values.tolist()]
+    log.info(
+        "embed sparse %.0f ms on %s",
+        (time.perf_counter() - started) * 1000, SPARSE_DEVICE,
+    )
     return indices, values
 
 
@@ -726,6 +796,7 @@ def health() -> HealthResponse:
         vision_ready=DEFAULT_PRESET in _vision_models,
         text_ready=DEFAULT_PRESET in _text_models,
         sparse_model=SPARSE_MODEL_NAME,
+        sparse_device=SPARSE_DEVICE,
         sparse_ready=SPARSE_MODEL_NAME in _sparse_models,
     )
 
@@ -775,6 +846,7 @@ def models() -> ModelsResponse:
         models=[_model_info(p) for p in MODEL_CONFIGS],
         sparse=SparseModelInfo(
             name=SPARSE_MODEL_NAME,
+            device=SPARSE_DEVICE,
             ready=SPARSE_MODEL_NAME in _sparse_models,
         ),
     )
@@ -822,7 +894,7 @@ async def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingRespon
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    indices, values = await _run_gpu(_embed_sparse, request.text)
+    indices, values = await _run_sparse(_embed_sparse, request.text)
 
     return SparseEmbeddingResponse(
         model=SPARSE_MODEL_NAME,

@@ -1047,20 +1047,28 @@ async def process_file(
     final_tags = list(tags) if tags is not None else list(extract.get("tags") or [])
 
     log.debug("%s sha=%s tool=%s dims=%sx%s", filename, sha256[:12], extract.get("sourceTool"), width, height)
+    # Dense (CLIP image, torch GPU) and sparse (SPLADE text, onnxruntime GPU) are
+    # independent — dense reads the image bytes, sparse reads the lexical text (SD
+    # prompt + AI description + tags). deedlit.vision runs them on separate worker
+    # threads, so firing both at once lets the two embeddings overlap on the GPU
+    # instead of serializing one HTTP round-trip behind the other. The AI
+    # description (catalog truth) lets images with thin/absent embedded metadata
+    # still index on the sparse side.
     stage("vision:dense")
-    dense = await maybe_await(embed_image(data, filename, mime))
-    # Sparse vector is over the lexical text: SD prompt + AI description + tags
-    # (term weights for the hybrid sparse leg). The AI description (catalog truth)
-    # lets images with thin/absent embedded metadata still index on the sparse side.
     stage("vision:sparse")
     sparse_text = " ".join(
         s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
     )
-    sparse = (
-        await maybe_await(embed_sparse_text(sparse_text))
-        if sparse_text.strip()
-        else {"indices": [], "values": []}
-    )
+
+    async def _dense() -> list[float]:
+        return await maybe_await(embed_image(data, filename, mime))
+
+    async def _sparse() -> dict[str, list]:
+        if not sparse_text.strip():
+            return {"indices": [], "values": []}
+        return await maybe_await(embed_sparse_text(sparse_text))
+
+    dense, sparse = await asyncio.gather(_dense(), _sparse())
     log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
 
     return assemble_record(

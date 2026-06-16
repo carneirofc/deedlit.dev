@@ -5,7 +5,12 @@
 #
 # Build context: deedlit.vision/
 
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# CUDA 12.8 + cuDNN 9 runtime. CUDA 12.8 gives sm_120 (Blackwell / RTX 50-series)
+# kernels and matches the torch cu128 wheels below; cuDNN 9 is what onnxruntime-gpu
+# >=1.22 (SPLADE on the GPU) links against. The old 12.1-cudnn8 base ran torch on
+# the GPU but left onnxruntime's CUDA provider unable to init (cuDNN 8) so SPLADE
+# silently fell back to CPU.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,10 +33,16 @@ RUN python3 -m pip install --no-cache-dir \
 WORKDIR /app
 
 # Install remaining dependencies (torch already satisfied above).
+# fastembed-gpu pulls onnxruntime-gpu for SPLADE on the GPU. onnxruntime-gpu
+# dlopen's the system CUDA + cuDNN libs (NOT torch's bundled ones), so the base
+# image MUST ship a matching CUDA 12 + cuDNN 9 — which the 12.8-cudnn base above
+# now does. onnxruntime-gpu is floored at 1.22 for sm_120 (Blackwell) kernels.
+# SPARSE_DEVICE=cpu sidesteps the GPU provider entirely.
 COPY pyproject.toml ./
 RUN python3 -m pip install --no-cache-dir \
     "fastapi>=0.116.0" \
-    "fastembed>=0.4.0" \
+    "fastembed-gpu>=0.8.0" \
+    "onnxruntime-gpu>=1.22.0" \
     "httpx>=0.27.0" \
     "open-clip-torch>=2.24.0" \
     "pillow>=10.0.0" \
