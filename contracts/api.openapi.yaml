@@ -71,10 +71,55 @@ paths:
         browse is not yet supported here.
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { query: { type: string }, limit: { type: integer, default: 24 }, filter: { type: [object, "null"], additionalProperties: true } }, required: [query] } } } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
+  /images/count:
+    get:
+      summary: Total images matching a filter set (proxy to catalog)
+      description: >
+        Report/export helper: the count of images matching the same repeatable
+        filters as GET /images (no sort/paging), so a tool can size the export
+        before paging. Degrades to {count: 0} when catalog is unavailable.
+      parameters:
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
+        - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CountResult" } } } } }
+  /tags:
+    get:
+      summary: Tag-name autocomplete (proxy to catalog)
+      description: "Names matching `prefix`, most-used first. Degrades to [] when catalog is down."
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 10 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: string } } } } } }
+  /tags/report:
+    get:
+      summary: Full tag inventory with per-tag image counts, paged (proxy to catalog)
+      description: >
+        Report counterpart to GET /tags: every tag plus how many distinct live
+        images carry it (most-used first) and a `total` for paging the whole
+        inventory. Degrades to {total: 0, items: []} when catalog is down.
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, minimum: 1, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TagReport" } } } } }
   /stats:
     get:
-      summary: Aggregated library stats
+      summary: Aggregated library stats (proxy to catalog)
+      description: >
+        Library summary for dashboards + report tooling: image/tag/collection/
+        note/folder counts, favorites, labeled vs unlabeled, and the content-
+        safety breakdown. Degrades to a zero-filled shape when catalog is down.
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } } }
+  /reports/folders:
+    get:
+      summary: Per-folder coverage report (proxy to catalog)
+      description: >
+        Path + label + image/labeled/unlabeled counts for each registered source
+        folder — the where-are-my-images breakdown. Degrades to [] when down.
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/FolderReport" } } } } } }
   /jobs:
     post:
       summary: Dispatch an ingest/maintenance job (proxy to ingest)
@@ -180,7 +225,46 @@ components:
         tags: { type: integer }
         collections: { type: integer }
         notes: { type: integer }
+        folders: { type: integer }
+        favorites: { type: integer }
+        labeled: { type: integer, description: "Images with an AI label/description" }
+        unlabeled: { type: integer }
+        safety: { $ref: "#/components/schemas/SafetyBreakdown" }
       required: [images]
+    SafetyBreakdown:
+      type: object
+      description: "Live images per content-safety class; unclassified = NULL safety."
+      properties:
+        sfw: { type: integer }
+        nsfw: { type: integer }
+        explicit: { type: integer }
+        unclassified: { type: integer }
+    CountResult:
+      type: object
+      properties: { count: { type: integer } }
+      required: [count]
+    TagCount:
+      type: object
+      properties:
+        name: { type: string }
+        normalized_name: { type: string }
+        image_count: { type: integer, description: "Distinct live images carrying the tag" }
+      required: [name, normalized_name, image_count]
+    TagReport:
+      type: object
+      properties:
+        total: { type: integer, description: "Tags matching the prefix (for paging)" }
+        items: { type: array, items: { $ref: "#/components/schemas/TagCount" } }
+      required: [total, items]
+    FolderReport:
+      type: object
+      properties:
+        path: { type: string }
+        label: { type: [string, "null"] }
+        image_count: { type: integer }
+        labeled_count: { type: integer }
+        unlabeled_count: { type: integer }
+      required: [path, image_count, labeled_count, unlabeled_count]
     DeleteResult:
       type: object
       properties:

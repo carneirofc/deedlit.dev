@@ -57,6 +57,19 @@ paths:
       summary: Set favorite
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { favorite: { type: boolean } }, required: [favorite] } } } }
       responses: { "200": { description: OK } }
+  /images/count:
+    get:
+      summary: Total images matching a filter set
+      description: >
+        The count of images matching the same filters as GET /images (no
+        sort/paging). Lets a report/export tool size the work set before paging.
+      parameters:
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
+        - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CountResult" } } } } }
   /images/unlabeled:
     get:
       summary: sha256 of images missing an AI label/description
@@ -67,6 +80,36 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 500 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { sha256: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [sha256] } } } } }
+  /tags:
+    get:
+      summary: Tag-name autocomplete (names matching prefix, most-used first)
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 10, minimum: 1, maximum: 50 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: string } } } } } }
+  /tags/report:
+    get:
+      summary: Full tag inventory with per-tag image counts, paged
+      description: >
+        Every tag plus how many distinct live images carry it (most-used first),
+        with a `total` for paging the whole inventory. The report counterpart to
+        GET /tags (which is a capped autocomplete of bare names).
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, minimum: 1, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TagReport" } } } } }
+  /stats:
+    get:
+      summary: Aggregate library counts (the report summary)
+      description: >
+        image/tag/collection/note/folder counts, favorites, labeled vs unlabeled,
+        and the content-safety breakdown. All counts exclude soft-deleted images.
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } } }
+  /reports/folders:
+    get:
+      summary: Per-folder coverage (path + label + image/labeled/unlabeled counts)
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/FolderReport" } } } } } }
   /blobs/{sha256}/{kind}:
     parameters:
       - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
@@ -134,6 +177,53 @@ components:
         last_op: { type: [string, "null"], description: "Most recent non-probe request" }
       required: [inflight, per_min, busy, last_op]
     Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+    CountResult:
+      type: object
+      properties: { count: { type: integer } }
+      required: [count]
+    TagCount:
+      type: object
+      properties:
+        name: { type: string }
+        normalized_name: { type: string }
+        image_count: { type: integer, description: "Distinct live images carrying the tag" }
+      required: [name, normalized_name, image_count]
+    TagReport:
+      type: object
+      properties:
+        total: { type: integer, description: "Tags matching the prefix (for paging)" }
+        items: { type: array, items: { $ref: "#/components/schemas/TagCount" } }
+      required: [total, items]
+    SafetyBreakdown:
+      type: object
+      description: "Live images per content-safety class; unclassified = NULL safety."
+      properties:
+        sfw: { type: integer }
+        nsfw: { type: integer }
+        explicit: { type: integer }
+        unclassified: { type: integer }
+    Stats:
+      type: object
+      properties:
+        images: { type: integer }
+        tags: { type: integer }
+        collections: { type: integer }
+        notes: { type: integer }
+        folders: { type: integer }
+        favorites: { type: integer }
+        labeled: { type: integer, description: "Images with an AI label/description" }
+        unlabeled: { type: integer }
+        safety: { $ref: "#/components/schemas/SafetyBreakdown" }
+      required: [images]
+    FolderReport:
+      type: object
+      properties:
+        path: { type: string }
+        label: { type: [string, "null"] }
+        image_count: { type: integer }
+        labeled_count: { type: integer }
+        unlabeled_count: { type: integer }
+      required: [path, image_count, labeled_count, unlabeled_count]
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, db_ready: { type: boolean }, blob_ready: { type: boolean } }, required: [status] }
     AssetRef: { type: object, properties: { kind: { type: string, enum: [checkpoint, lora, embedding, vae, controlnet, upscaler] }, name: { type: string }, hash: { type: [string, "null"] } }, required: [kind, name] }
     Params:

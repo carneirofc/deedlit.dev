@@ -363,6 +363,121 @@ def test_stats_degrades_when_catalog_down(rec, client):
     assert r.json()["images"] == 0
 
 
+def test_tags_proxies_prefix_and_limit_to_catalog(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["prefix"] = request.url.params.get("prefix")
+        seen["limit"] = request.url.params.get("limit")
+        return ["cat", "cathedral"]
+
+    rec.on("GET", "/tags", handler)
+
+    r = client.get("/tags", params={"prefix": "cat", "limit": 5})
+    assert r.status_code == 200
+    assert r.json() == ["cat", "cathedral"]
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["prefix"] == "cat"
+    assert seen["limit"] == "5"
+
+
+def test_tags_degrades_to_empty_when_catalog_down(rec, client):
+    rec.on("GET", "/tags", lambda r: httpx.Response(503, json={"detail": "down"}))
+    r = client.get("/tags", params={"prefix": "x"})
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+# ---------------------------------------------------------------------------
+# (5e) Report endpoints — count / tag inventory / extended stats / folders
+# ---------------------------------------------------------------------------
+def test_images_count_proxies_filters_to_catalog(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        p = request.url.params
+        seen["tag"] = p.get_list("tag")
+        seen["rating_gte"] = p.get("rating_gte")
+        return {"count": 7}
+
+    rec.on("GET", "/images/count", handler)
+
+    r = client.get("/images/count", params=[("tag", "knight"), ("rating_gte", "3")])
+    assert r.status_code == 200
+    assert r.json() == {"count": 7}
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["tag"] == ["knight"]
+    assert seen["rating_gte"] == "3"
+
+
+def test_images_count_degrades_to_zero_when_catalog_down(rec, client):
+    rec.on("GET", "/images/count", lambda r: httpx.Response(500))
+    r = client.get("/images/count")
+    assert r.status_code == 200
+    assert r.json() == {"count": 0}
+
+
+def test_tags_report_proxies_to_catalog(rec, client):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["prefix"] = request.url.params.get("prefix")
+        seen["offset"] = request.url.params.get("offset")
+        return {"total": 2, "items": [{"name": "cat", "normalized_name": "cat", "image_count": 5}]}
+
+    rec.on("GET", "/tags/report", handler)
+
+    r = client.get("/tags/report", params={"prefix": "ca", "offset": 10})
+    assert r.status_code == 200
+    assert r.json()["items"][0]["image_count"] == 5
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["prefix"] == "ca"
+    assert seen["offset"] == "10"
+
+
+def test_tags_report_degrades_when_catalog_down(rec, client):
+    rec.on("GET", "/tags/report", lambda r: httpx.Response(503))
+    r = client.get("/tags/report")
+    assert r.status_code == 200
+    assert r.json() == {"total": 0, "items": []}
+
+
+def test_stats_passes_through_extended_report(rec, client):
+    rec.on("GET", "/stats", lambda r: {
+        "images": 10, "tags": 4, "collections": 1, "notes": 2,
+        "folders": 3, "favorites": 5, "labeled": 6, "unlabeled": 4,
+        "safety": {"sfw": 7, "nsfw": 2, "explicit": 1, "unclassified": 0},
+    })
+    body = client.get("/stats").json()
+    assert body["folders"] == 3
+    assert body["labeled"] == 6
+    assert body["safety"]["nsfw"] == 2
+
+
+def test_stats_degrade_has_extended_zero_shape(rec, client):
+    rec.on("GET", "/stats", lambda r: httpx.Response(503))
+    body = client.get("/stats").json()
+    assert body["images"] == 0 and body["folders"] == 0
+    assert body["safety"] == {"sfw": 0, "nsfw": 0, "explicit": 0, "unclassified": 0}
+
+
+def test_reports_folders_proxies_to_catalog(rec, client):
+    rec.on("GET", "/reports/folders", lambda r: [
+        {"path": "/lib", "label": None, "image_count": 9, "labeled_count": 4, "unlabeled_count": 5},
+    ])
+    r = client.get("/reports/folders")
+    assert r.status_code == 200
+    assert r.json()[0]["image_count"] == 9
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_reports_folders_degrades_to_empty(rec, client):
+    rec.on("GET", "/reports/folders", lambda r: httpx.Response(500))
+    r = client.get("/reports/folders")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
 # ---------------------------------------------------------------------------
 # (6) POST /jobs dispatches to ingest; GET /jobs proxies status
 # ---------------------------------------------------------------------------

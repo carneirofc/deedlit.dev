@@ -212,21 +212,37 @@ async def search(req: SearchRequest) -> Any:
 # ---------------------------------------------------------------------------
 @app.get("/stats")
 async def stats() -> dict[str, Any]:
-    """Aggregated library counts.
+    """Aggregated library counts, sourced from catalog ``GET /stats`` (the owner
+    of images/tags/notes/collections).
 
-    ASSUMPTION: counts are sourced from a catalog ``GET /stats`` endpoint (the
-    natural owner of images/tags/notes/collections). That route is not yet in
-    contracts/catalog.openapi.yaml; until catalog ships it this call fails and
-    the gateway degrades to a stable zero-filled shape rather than erroring.
+    Returns the catalog summary verbatim (image/tag/collection/note/folder
+    counts, favorites, labeled vs unlabeled, content-safety breakdown). When
+    catalog is unreachable, degrades to a stable zero-filled shape rather than
+    erroring so the dashboard/report tools stay renderable.
     """
-    base = {"images": 0, "tags": 0, "collections": 0, "notes": 0}
+    base: dict[str, Any] = {
+        "images": 0, "tags": 0, "collections": 0, "notes": 0,
+        "folders": 0, "favorites": 0, "labeled": 0, "unlabeled": 0,
+        "safety": {"sfw": 0, "nsfw": 0, "explicit": 0, "unclassified": 0},
+    }
     try:
         res = await clients.catalog("GET", "/stats")
     except DownstreamError:
         return base
     if isinstance(res, dict):
-        base.update({k: res.get(k, base[k]) for k in base})
+        base.update(res)
     return base
+
+
+@app.get("/reports/folders")
+async def reports_folders() -> Any:
+    """Per-folder coverage report (catalog proxy): path + label + image/labeled/
+    unlabeled counts for each source folder. Degrades to [] when catalog down."""
+    try:
+        res = await clients.catalog("GET", "/reports/folders")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +680,70 @@ async def list_images(
     except DownstreamError:
         return []
     return res if isinstance(res, list) else []
+
+
+@app.get("/images/count")
+async def count_images(
+    tag: list[str] | None = Query(default=None),
+    exclude_tag: list[str] | None = Query(default=None),
+    favorite: bool | None = None,
+    rating_gte: int | None = Query(default=None, ge=0, le=5),
+    safety: list[str] | None = Query(default=None),
+) -> Any:
+    """Total images matching a filter set (catalog proxy), for report tooling to
+    size the export before paging GET /images. Same repeatable filters as the
+    browse list; degrades to {count: 0} when catalog is down."""
+    from urllib.parse import urlencode
+
+    params: list[tuple[str, str]] = []
+    for t in tag or []:
+        params.append(("tag", t))
+    for t in exclude_tag or []:
+        params.append(("exclude_tag", t))
+    if favorite is not None:
+        params.append(("favorite", "true" if favorite else "false"))
+    if rating_gte is not None:
+        params.append(("rating_gte", str(int(rating_gte))))
+    for s in safety or []:
+        params.append(("safety", s))
+    qs = f"?{urlencode(params)}" if params else ""
+    try:
+        res = await clients.catalog("GET", f"/images/count{qs}")
+    except DownstreamError:
+        return {"count": 0}
+    return res if isinstance(res, dict) else {"count": 0}
+
+
+@app.get("/tags")
+async def suggest_tags(prefix: str = "", limit: int = 10) -> Any:
+    """Tag-name autocomplete for the filter UI — proxies catalog GET /tags.
+
+    Degrades to an empty list when catalog is unreachable so the type-ahead just
+    goes quiet rather than erroring the whole search panel."""
+    from urllib.parse import urlencode
+
+    params = urlencode({"prefix": prefix, "limit": int(limit)})
+    try:
+        res = await clients.catalog("GET", f"/tags?{params}")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
+
+
+@app.get("/tags/report")
+async def tags_report(prefix: str = "", limit: int = 200, offset: int = 0) -> Any:
+    """Full tag inventory with per-tag image counts, paged (catalog proxy).
+
+    The report counterpart to GET /tags: every tag + how many live images carry
+    it + a total for paging. Degrades to an empty report when catalog is down."""
+    from urllib.parse import urlencode
+
+    params = urlencode({"prefix": prefix, "limit": int(limit), "offset": int(offset)})
+    try:
+        res = await clients.catalog("GET", f"/tags/report?{params}")
+    except DownstreamError:
+        return {"total": 0, "items": []}
+    return res if isinstance(res, dict) else {"total": 0, "items": []}
 
 
 @app.patch("/images/{sha256}")
