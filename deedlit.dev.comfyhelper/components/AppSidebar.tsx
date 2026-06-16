@@ -171,26 +171,6 @@ export function AppSidebar() {
             }
           />
           <NavIconLink
-            href="/ui"
-            label="UI Showcase"
-            isActive={pathname.startsWith("/ui")}
-            testId="ui-showcase"
-            onNavigate={() => setIsMobileNavExpanded(false)}
-            icon={
-              <svg
-                aria-hidden="true"
-                viewBox="0 0 24 24"
-                className="h-5 w-5 fill-none stroke-current"
-                strokeWidth="1.8"
-              >
-                <rect x="3" y="4" width="18" height="16" rx="2" />
-                <path d="M3 9h18" />
-                <path d="M8 4v16" />
-              </svg>
-            }
-          />
-
-          <NavIconLink
             href="/admin"
             label="Backend Admin"
             isActive={pathname === "/admin"}
@@ -207,6 +187,26 @@ export function AppSidebar() {
               >
                 <path d="M12 2 4 5v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V5l-8-3z" />
                 <path d="m9 12 2 2 4-4" />
+              </svg>
+            }
+          />
+
+          <NavIconLink
+            href="/admin/health"
+            label="System Health"
+            isActive={pathname.startsWith("/admin/health")}
+            testId="health"
+            onNavigate={() => setIsMobileNavExpanded(false)}
+            icon={
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-5 w-5 fill-none stroke-current"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
               </svg>
             }
           />

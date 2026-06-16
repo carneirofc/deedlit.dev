@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
+import { CopyButton } from "@deedlit.dev/ui";
+
 import { useActivity } from "@/lib/store/activity";
 import { useSettings } from "@/lib/store/settings";
 
@@ -104,6 +106,9 @@ export default function ImageDetailPage() {
   // Two-step "remove from library" confirmation.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+
+  // Transient "Copied" state for the source-path copy button.
+  const [pathCopied, setPathCopied] = useState(false);
 
   // Detail load — independent of settings so the page renders immediately.
   const load = useCallback(async () => {
@@ -271,6 +276,17 @@ export default function ImageDetailPage() {
     }
   }, [imageId, debug, debugLoading]);
 
+  const copyPath = () => {
+    if (!detail?.filePath) return;
+    navigator.clipboard
+      ?.writeText(detail.filePath)
+      .then(() => {
+        setPathCopied(true);
+        setTimeout(() => setPathCopied(false), 1500);
+      })
+      .catch(() => {});
+  };
+
   if (error) return <p className="text-rose-500">{error}</p>;
   if (!detail) return <p className="text-ui-ink-muted">Loading…</p>;
 
@@ -325,6 +341,27 @@ export default function ImageDetailPage() {
               <dt>Source</dt><dd className="break-words text-ui-ink">{detail.sourceTool ?? "—"}</dd>
               <dt>Size</dt><dd className="break-words text-ui-ink">{detail.width}×{detail.height}</dd>
             </dl>
+
+            {/* Originating filesystem path, captured at ingest. The image's id is
+                the opaque sha256, so this is the only way back to the source file
+                on disk — surface it in full (and copyable), never truncated away. */}
+            {detail.filePath && (
+              <div className="mt-3 border-t border-ui-border/40 pt-3">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <p className="text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted">
+                    Source file
+                  </p>
+                  <CopyButton
+                    copied={pathCopied}
+                    onClick={copyPath}
+                    aria-label="Copy source file path"
+                  />
+                </div>
+                <p className="break-all font-mono text-ui-2xs text-ui-ink" title={detail.filePath}>
+                  {detail.filePath}
+                </p>
+              </div>
+            )}
 
             <div className="mt-3 border-t border-ui-border/40 pt-3">
               {!confirmingDelete ? (

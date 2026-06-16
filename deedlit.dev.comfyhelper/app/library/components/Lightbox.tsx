@@ -33,6 +33,8 @@ interface LightboxProps {
   onClose: () => void;
   onSimilar?: (item: LightboxItem) => void;
   onToggleFullResolution?: () => void;
+  /** Fires whenever the displayed image changes — drives URL sync. */
+  onCurrentChange?: (item: LightboxItem) => void;
 }
 
 const ctrlBtn =
@@ -66,30 +68,56 @@ export function Lightbox({
   onClose,
   onSimilar,
   onToggleFullResolution,
+  onCurrentChange,
 }: LightboxProps) {
-  const [index, setIndex] = useState(initialIndex);
+  // Track the displayed image by *id*, not by position. The result list can
+  // reorder, grow (load-more) or have rows spliced under the viewer; an index
+  // would then point at a different picture. The id keeps the same image on
+  // screen and we re-derive its index each render.
+  const [currentId, setCurrentId] = useState<string | null>(
+    () => items[initialIndex]?.imageId ?? items[0]?.imageId ?? null,
+  );
   const [playing, setPlaying] = useState(autoPlay);
   const [imgLoaded, setImgLoaded] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
 
+  // Resolve the live position of the tracked image each render. If it vanished
+  // (the list changed under us) land on the original open slot, clamped — a rare
+  // safety net; `go()` reads this resolved index so navigation continues cleanly.
+  const found = items.findIndex((it) => it.imageId === currentId);
+  const index =
+    found !== -1
+      ? found
+      : Math.min(Math.max(0, initialIndex), Math.max(0, items.length - 1));
+  const current = items[index];
+
   // Latest values for the slideshow timer, which closes over its first render.
-  const live = useRef({ index, items, hasMore, slideshow });
+  const live = useRef({ index, items, hasMore, slideshow, currentId });
   useEffect(() => {
-    live.current = { index, items, hasMore, slideshow };
+    live.current = { index, items, hasMore, slideshow, currentId };
   });
+
+  // Jump to a position by resolving it to the image id that lives there.
+  const goToIndex = useCallback((i: number) => {
+    const list = live.current.items;
+    const it = list[Math.max(0, Math.min(i, list.length - 1))];
+    if (it) setCurrentId(it.imageId);
+  }, []);
 
   const go = useCallback(
     (dir: 1 | -1) => {
-      const { index: i, items: list, hasMore: more, slideshow: ss } = live.current;
+      const { items: list, hasMore: more, slideshow: ss, currentId: cid } = live.current;
       if (list.length === 0) return;
+      let i = list.findIndex((it) => it.imageId === cid);
+      if (i === -1) i = Math.min(live.current.index, list.length - 1);
 
       if (dir === 1 && ss.shuffle && playing) {
-        setIndex(Math.floor(Math.random() * list.length));
+        setCurrentId(list[Math.floor(Math.random() * list.length)].imageId);
         return;
       }
       const next = i + dir;
       if (next < 0) {
-        setIndex(ss.loop ? list.length - 1 : 0);
+        setCurrentId(list[ss.loop ? list.length - 1 : 0].imageId);
         return;
       }
       if (next >= list.length) {
@@ -98,13 +126,13 @@ export function Lightbox({
           return;
         }
         if (ss.loop) {
-          setIndex(0);
+          setCurrentId(list[0].imageId);
           return;
         }
         setPlaying(false); // reached the end of a non-looping run
         return;
       }
-      setIndex(next);
+      setCurrentId(list[next].imageId);
     },
     [onLoadMore, playing],
   );
@@ -121,15 +149,20 @@ export function Lightbox({
     if (hasMore && !loadingMore && index >= items.length - 3) onLoadMore();
   }, [index, hasMore, loadingMore, items.length, onLoadMore]);
 
-  // Keep the index valid if the result list ever shrinks under us.
+  // Report the displayed image to the parent (URL sync) — only when it changes,
+  // not on every slideshow-timer render, so we don't thrash history state.
+  const onCurrentChangeRef = useRef(onCurrentChange);
   useEffect(() => {
-    if (index > items.length - 1) setIndex(Math.max(0, items.length - 1));
-  }, [items.length, index]);
+    onCurrentChangeRef.current = onCurrentChange;
+  });
+  useEffect(() => {
+    if (current) onCurrentChangeRef.current?.(current);
+  }, [current?.imageId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reset the load state whenever the displayed image changes.
   useEffect(() => {
     setImgLoaded(false);
-  }, [index, fullResolution]);
+  }, [current?.imageId, fullResolution]);
 
   // Preload the neighbours for smooth stepping / slideshow.
   useEffect(() => {
@@ -176,11 +209,11 @@ export function Lightbox({
           break;
         case "Home":
           e.preventDefault();
-          setIndex(0);
+          goToIndex(0);
           break;
         case "End":
           e.preventDefault();
-          setIndex(live.current.items.length - 1);
+          goToIndex(live.current.items.length - 1);
           break;
         case "Escape":
           onClose();
@@ -189,9 +222,8 @@ export function Lightbox({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [go, onClose]);
+  }, [go, goToIndex, onClose]);
 
-  const current = items[index];
   if (!current) return null;
 
   const atStart = index === 0 && !slideshow.loop;
@@ -355,7 +387,7 @@ export function Lightbox({
             key={it.imageId}
             data-idx={i}
             type="button"
-            onClick={() => setIndex(i)}
+            onClick={() => setCurrentId(it.imageId)}
             aria-label={`Go to image ${i + 1}`}
             aria-current={i === index}
             className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-md border transition ${

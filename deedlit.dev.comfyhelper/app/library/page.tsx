@@ -2,11 +2,23 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Gallery, TagSelect } from "@deedlit.dev/ui";
+
+import { BulkActionBar, type BulkBusy } from "@/app/library/components/BulkActionBar";
 import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";
 import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
-import { TagSelect } from "@/components/TagSelect";
+import type { ImagePatchBody } from "@/lib/api-client";
 import { deleteImages } from "@/lib/library/bulk-delete";
+import {
+  downloadCsv,
+  downloadJson,
+  downloadJsonl,
+  exportImages,
+  toSimpleRecord,
+  type ExportKind,
+} from "@/lib/library/bulk-export";
+import { patchImages } from "@/lib/library/bulk-patch";
 import type { CatalogSort, GraphScope } from "@/lib/library/schemas";
 import {
   gridColumnsClass,
@@ -55,8 +67,12 @@ type BrowseMode = "browse" | "semantic" | "image" | "similar";
 
 const SORT_LABEL: Record<SortMode, string> = {
   relevance: "Relevance",
-  newest: "Newest",
-  oldest: "Oldest",
+  // Ingested = catalog import date; Created = source-file creation date. They
+  // diverge when old images are bulk-imported long after they were made.
+  newest: "Ingested · newest",
+  oldest: "Ingested · oldest",
+  created_desc: "Created · newest",
+  created_asc: "Created · oldest",
   rating_desc: "Rating ↓",
   rating_asc: "Rating ↑",
   name_asc: "Name A–Z",
@@ -67,21 +83,12 @@ const SORT_LABEL: Record<SortMode, string> = {
 // and its results carry no date/filename, so only relevance + rating (a
 // client-side reorder of the loaded window) make sense there; browse offers the
 // full server-side set.
-const BROWSE_SORTS: SortMode[] = ["newest", "oldest", "rating_desc", "rating_asc", "name_asc", "name_desc"];
+const BROWSE_SORTS: SortMode[] = ["newest", "oldest", "created_desc", "created_asc", "rating_desc", "rating_asc", "name_asc", "name_desc"];
 const SEARCH_SORTS: SortMode[] = ["relevance", "rating_desc", "rating_asc"];
 
 /** The catalog browse path is used only for filter-only browsing (no query). */
 function isBrowsePath(mode: BrowseMode, query: string): boolean {
   return mode === "browse" && query.trim() === "";
-}
-
-/** Rank tags by frequency across the loaded results for the autocomplete. */
-function rankTags(results: CompactResult[]): string[] {
-  const counts = new Map<string, number>();
-  for (const r of results) {
-    for (const t of r.tags) counts.set(t, (counts.get(t) ?? 0) + 1);
-  }
-  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t]) => t);
 }
 
 const cls = {
@@ -158,16 +165,31 @@ export default function LibraryPage() {
     lightboxOpenRef.current = lightboxIndex !== null;
   }, [lightboxIndex]);
 
-  // Bulk selection / delete. In select mode a card click toggles selection
-  // instead of opening the viewer; "Delete selected" un-indexes each picked
-  // image (catalog + search + graph), leaving the originals on disk.
+  // Deep link: a `?view=<imageId>` in the address opens the viewer on that image
+  // once results load, so a copied URL returns to the same picture. Captured on
+  // init and consumed by the effect below; cleared from the URL on close/refetch.
+  const pendingViewRef = useRef<string | null>(null);
+  const syncViewUrl = useCallback((item: { imageId: string } | null) => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (item) url.searchParams.set("view", item.imageId);
+    else url.searchParams.delete("view");
+    window.history.replaceState(window.history.state, "", url);
+  }, []);
+
+  // Bulk selection + actions. In select mode a card click toggles selection
+  // instead of opening the viewer. "Export details" downloads each picked
+  // image's canonical catalog record as JSON; "Delete selected" un-indexes each
+  // (catalog + search + graph), leaving the originals on disk.
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [confirmingBulk, setConfirmingBulk] = useState(false);
-  const [bulkDeleting, setBulkDeleting] = useState(false);
+  // Which bulk action is mid-flight (favorite/rating/safety/tags/export/delete),
+  // and a transient success line for actions with no visible card change.
+  const [bulkBusy, setBulkBusy] = useState<BulkBusy>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // System
-  const [health, setHealth] = useState<Record<string, boolean> | null>(null);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [folderPath, setFolderPath] = useState("");
   const [showIngest, setShowIngest] = useState(false);
@@ -197,6 +219,15 @@ export default function LibraryPage() {
       // the "seen" head, so the New-images banner only fires on later arrivals.
       if (!append) {
         setLightboxIndex(null);
+        // The viewer's image is no longer in this result set — drop it from the
+        // URL too (kept stable via history.replaceState, no router churn).
+        if (typeof window !== "undefined") {
+          const u = new URL(window.location.href);
+          if (u.searchParams.has("view")) {
+            u.searchParams.delete("view");
+            window.history.replaceState(window.history.state, "", u);
+          }
+        }
         setSelected(new Set());
         setConfirmingBulk(false);
         setHasNew(false);
@@ -346,7 +377,10 @@ export default function LibraryPage() {
     setLightboxIndex(index);
   }, []);
 
+  // Toggle one image's selection. Also flips the grid into select mode, so a
+  // Ctrl/Cmd+click on a card starts a selection without first hitting "Select".
   const toggleSelect = useCallback((id: string) => {
+    setSelectMode(true);
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -372,8 +406,9 @@ export default function LibraryPage() {
   const deleteSelected = useCallback(async () => {
     const ids = [...selected];
     if (ids.length === 0) return;
-    setBulkDeleting(true);
+    setBulkBusy("delete");
     setError(null);
+    setNotice(null);
     try {
       const { deleted, failed } = await deleteImages(ids);
       if (deleted.length > 0) {
@@ -394,9 +429,164 @@ export default function LibraryPage() {
         exitSelectMode();
       }
     } finally {
-      setBulkDeleting(false);
+      setBulkBusy(null);
     }
   }, [selected, exitSelectMode]);
+
+  // Fan a metadata edit out over the selected rows. `build` produces the PATCH
+  // body per row (so tag add/remove can compute a per-image final list); `patch`
+  // mirrors that change onto the loaded grid row so the cards update without a
+  // refetch. Partial failures surface inline; the rest still apply.
+  const applyBulk = useCallback(
+    async (
+      kind: Exclude<NonNullable<BulkBusy>, "export" | "delete">,
+      build: (r: CompactResult) => ImagePatchBody,
+      patch: (r: CompactResult) => CompactResult,
+      summary: (ok: number, total: number) => string,
+    ) => {
+      const rows = results.filter((r) => selected.has(r.imageId));
+      if (rows.length === 0) return;
+      setBulkBusy(kind);
+      setError(null);
+      setNotice(null);
+      try {
+        const { updated, failed } = await patchImages(
+          rows.map((r) => ({ id: r.imageId, body: build(r) })),
+        );
+        if (updated.length > 0) {
+          const ok = new Set(updated);
+          setResults((prev) => prev.map((r) => (ok.has(r.imageId) ? patch(r) : r)));
+        }
+        if (failed.length > 0) {
+          setError(`${summary(updated.length, rows.length)} ${failed.length} failed: ${failed[0].error}`);
+        } else {
+          setNotice(summary(updated.length, rows.length));
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Bulk action failed");
+      } finally {
+        setBulkBusy(null);
+      }
+    },
+    [results, selected],
+  );
+
+  const bulkFavorite = useCallback(
+    (fav: boolean) =>
+      applyBulk(
+        "favorite",
+        () => ({ favorite: fav }),
+        (r) => r, // favorite isn't shown on the card; no local mirror needed
+        (ok, total) => `${fav ? "Favorited" : "Unfavorited"} ${ok}/${total}.`,
+      ),
+    [applyBulk],
+  );
+
+  const bulkRating = useCallback(
+    (rating: number) => {
+      const value = rating === 0 ? null : rating;
+      return applyBulk(
+        "rating",
+        () => ({ rating: value }),
+        (r) => ({ ...r, rating: value }),
+        (ok, total) => `${value === null ? "Cleared rating on" : `Set ${rating}★ on`} ${ok}/${total}.`,
+      );
+    },
+    [applyBulk],
+  );
+
+  const bulkSafety = useCallback(
+    (value: SafetyClass) =>
+      applyBulk(
+        "safety",
+        () => ({ safety: value }),
+        (r) => ({ ...r, safety: value }),
+        (ok, total) => `Set ${SAFETY_LABEL[value]} on ${ok}/${total}.`,
+      ),
+    [applyBulk],
+  );
+
+  const bulkAddTags = useCallback(
+    (add: string[]) => {
+      const merge = (r: CompactResult) => Array.from(new Set([...r.tags, ...add]));
+      return applyBulk(
+        "tags",
+        (r) => ({ tags: merge(r) }),
+        (r) => ({ ...r, tags: merge(r) }),
+        (ok, total) => `Added ${add.length} tag${add.length === 1 ? "" : "s"} to ${ok}/${total}.`,
+      );
+    },
+    [applyBulk],
+  );
+
+  const bulkRemoveTags = useCallback(
+    (remove: string[]) => {
+      const rm = new Set(remove);
+      const strip = (r: CompactResult) => r.tags.filter((t) => !rm.has(t));
+      return applyBulk(
+        "tags",
+        (r) => ({ tags: strip(r) }),
+        (r) => ({ ...r, tags: strip(r) }),
+        (ok, total) => `Removed ${remove.length} tag${remove.length === 1 ? "" : "s"} from ${ok}/${total}.`,
+      );
+    },
+    [applyBulk],
+  );
+
+  // Export every selected image's catalog record. The server route fans the
+  // gateway detail reads out and reports partial failures, which surface inline;
+  // whatever resolved still downloads. `complete-*` dump the full canonical
+  // record; `simple-*` project it to the basics (id · sha · path · …) and add a
+  // spreadsheet-friendly CSV.
+  const exportSelected = useCallback(async (kind: ExportKind) => {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBulkBusy("export");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await exportImages(ids);
+      if (result.count > 0) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const base = `deedlit-export-${result.count}-images-${stamp}`;
+        const simple = () => result.images.map(toSimpleRecord);
+        switch (kind) {
+          // Complete JSON keeps the export wrapper (meta + errors); JSONL is the
+          // bare records, one per line.
+          case "complete-json":
+            downloadJson(result, `${base}.json`);
+            break;
+          case "complete-jsonl":
+            downloadJsonl(result.images, `${base}.jsonl`);
+            break;
+          case "simple-json":
+            downloadJson(
+              { exportedAt: result.exportedAt, count: result.count, images: simple() },
+              `${base}-simple.json`,
+            );
+            break;
+          case "simple-jsonl":
+            downloadJsonl(simple(), `${base}-simple.jsonl`);
+            break;
+          case "simple-csv":
+            downloadCsv(simple(), `${base}-simple.csv`);
+            break;
+        }
+      }
+      const label = kind.startsWith("simple") ? "simple" : "complete";
+      if (result.errors.length > 0) {
+        setError(
+          `Exported ${result.count}/${ids.length}. ${result.errors.length} failed: ${result.errors[0].error}`,
+        );
+      } else {
+        setNotice(`Exported ${result.count} image${result.count === 1 ? "" : "s"} (${label}).`);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Export failed");
+    } finally {
+      setBulkBusy(null);
+    }
+  }, [selected]);
 
   const findSimilar = useCallback(
     (id: string, thumbUrl: string, summary: string) => {
@@ -456,13 +646,9 @@ export default function LibraryPage() {
     return () => window.removeEventListener("paste", onPaste);
   }, [showImageSearch, mode, applyExternalImage]);
 
-  // Health + job polling (independent of saved settings).
+  // Ingest-job polling (independent of saved settings). System health lives on
+  // its own page (/admin/health, self-polling ServiceStatusBoard).
   useEffect(() => {
-    fetch("/api/library/health")
-      .then((r) => r.json())
-      .then((j) => setHealth(j.services ?? null))
-      .catch(() => {});
-
     const pollJobs = () =>
       fetch("/api/library/jobs")
         .then((r) => r.json())
@@ -485,6 +671,7 @@ export default function LibraryPage() {
     const qpTags = csv(sp.get("tags") ?? "");
     const qpQuery = sp.get("q") ?? "";
     const qpMode = sp.get("mode");
+    pendingViewRef.current = sp.get("view"); // opened once results land (below)
     const wantImage = qpMode === "image" || (!qpMode && settings.defaultMode === "image");
     const initialMode: BrowseMode = wantImage ? "image" : "browse";
 
@@ -509,16 +696,19 @@ export default function LibraryPage() {
     });
   }, [hydrated, settings, doFetch]);
 
-  // Infinite scroll: auto-load the next page as the sentinel nears the viewport.
+  // Infinite scroll: prefetch the next page well before the sentinel is visible.
+  // The lookahead scales with viewport height (~1.5 screens) so on tall/ultrawide
+  // displays the next page lands before the user ever reaches the end of the grid.
   useEffect(() => {
     if (!settings.infiniteScroll || !hasMore) return;
     const el = sentinelRef.current;
     if (!el) return;
+    const lookahead = Math.round((typeof window !== "undefined" ? window.innerHeight : 800) * 1.5);
     const ob = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && !loading) loadMore();
       },
-      { rootMargin: "600px" },
+      { rootMargin: `${lookahead}px 0px` },
     );
     ob.observe(el);
     return () => ob.disconnect();
@@ -625,9 +815,19 @@ export default function LibraryPage() {
     ? settings.sortMode
     : sortOptions[0];
 
-  // Autocomplete pool for the tag pickers — tags on the loaded results, most
-  // common first (we have no library-wide tag-list endpoint).
-  const tagSuggestions = useMemo(() => rankTags(results), [results]);
+  // Live, library-wide tag autocomplete for the filter pickers: prefix-match
+  // ranked by usage, served by /api/library/tags (-> gateway -> catalog). An
+  // empty prefix returns the most-used tags. Failures go quiet (empty list).
+  const fetchTagSuggestions = useCallback(async (q: string): Promise<string[]> => {
+    try {
+      const r = await fetch(`/api/library/tags?prefix=${encodeURIComponent(q)}&limit=10`);
+      if (!r.ok) return [];
+      const j = await r.json();
+      return Array.isArray(j.tags) ? (j.tags as string[]) : [];
+    } catch {
+      return [];
+    }
+  }, []);
 
   // The vector path can't sort by date/name (its rows lack them), so honour a
   // rating sort by reordering the loaded window client-side. Browse is already
@@ -651,6 +851,17 @@ export default function LibraryPage() {
     if (browsePath) doFetch(false, { sort: next });
   };
 
+  // Consume a `?view=` deep link: once results are in, open the viewer on the
+  // matching image. If it isn't in the loaded window we just drop the request
+  // (one shot) rather than chasing pages.
+  useEffect(() => {
+    const want = pendingViewRef.current;
+    if (!want || displayResults.length === 0) return;
+    pendingViewRef.current = null;
+    const i = displayResults.findIndex((r) => r.imageId === want);
+    if (i !== -1) openLightbox(i);
+  }, [displayResults, openLightbox]);
+
   return (
     <div className="flex w-full min-w-0 flex-col gap-6">
       {/* Header */}
@@ -659,8 +870,8 @@ export default function LibraryPage() {
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Image Library</h1>
           <p className="text-ui-sm text-ui-ink-muted">
             {results.length > 0
-              ? `${results.length}${hasMore ? "+" : ""} images · Postgres · Neo4j · Qdrant`
-              : "Postgres · Neo4j · Qdrant"}
+              ? `${results.length}${hasMore ? "+" : ""} images`
+              : "Browse, search & curate your generated images"}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -673,7 +884,7 @@ export default function LibraryPage() {
                 ? "border-accent-cyan text-accent-cyan"
                 : "border-ui-border/60 text-ui-ink-muted hover:border-accent-cyan hover:text-accent-cyan"
             }`}
-            title="Select multiple images to delete"
+            title="Select multiple images for bulk actions (or Ctrl/Cmd+click a card)"
           >
             <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M9 11l3 3 8-8" />
@@ -727,15 +938,6 @@ export default function LibraryPage() {
               </button>
             ))}
           </div>
-          {health &&
-            Object.entries(health).map(([name, up]) => (
-              <span
-                key={name}
-                className={`rounded-full px-2 py-1 text-ui-2xs ${up ? "bg-emerald-500/15 text-emerald-500" : "bg-rose-500/15 text-rose-500"}`}
-              >
-                {name} {up ? "ok" : "down"}
-              </span>
-            ))}
         </div>
       </header>
 
@@ -822,24 +1024,21 @@ export default function LibraryPage() {
             </div>
           )}
 
-          {/* Filters. Tags / favorites / rating apply instantly (they're cheap
-              server filters); the free-text model field still commits on Enter. */}
+          {/* Primary filter: tags with live, library-wide autocomplete. Adding /
+              removing a chip re-searches instantly (cheap server filter). */}
           <TagSelect
             value={tags}
             onChange={setTags}
             onCommit={(next) => doFetch(false, { tags: next })}
-            suggestions={tagSuggestions}
+            fetchSuggestions={fetchTagSuggestions}
             placeholder="filter by tag — type to add, pick from suggestions…"
             variant="include"
           />
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            <input
-              className={cls.input}
-              placeholder="model family (sdxl…)"
-              value={modelFamily}
-              onChange={(e) => setModelFamily(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && search()}
-            />
+
+          {/* Essentials row: favorites + rating + safety. Everything else (model,
+              checkpoint, LoRA, source-tool, exclude-tags, limits) lives under
+              Advanced so the common case stays uncluttered. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
               <input
                 type="checkbox"
@@ -860,6 +1059,7 @@ export default function LibraryPage() {
                 setMinRating(v);
                 doFetch(false, { minRating: v });
               }}
+              aria-label="Minimum rating"
             >
               <option value={0}>Any rating</option>
               <option value={1}>★+</option>
@@ -868,11 +1068,9 @@ export default function LibraryPage() {
               <option value={4}>★★★★+</option>
               <option value={5}>★★★★★</option>
             </select>
-          </div>
 
-          {/* Content-safety filter — multi-select chips. All on = no filter
-              (everything, incl. unclassified); a subset shows only those classes. */}
-          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Content-safety filter — multi-select chips. All on = no filter
+                (everything, incl. unclassified); a subset shows only those classes. */}
             <span className="text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted">
               Safety
             </span>
@@ -938,9 +1136,19 @@ export default function LibraryPage() {
                   value={excludeTags}
                   onChange={setExcludeTags}
                   onCommit={(next) => doFetch(false, { excludeTags: next })}
-                  suggestions={tagSuggestions}
+                  fetchSuggestions={fetchTagSuggestions}
                   placeholder="tags to hide…"
                   variant="exclude"
+                />
+              </label>
+              <label className={cls.label}>
+                Model family
+                <input
+                  className={cls.input}
+                  placeholder="sdxl, pony, flux…"
+                  value={modelFamily}
+                  onChange={(e) => setModelFamily(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && search()}
                 />
               </label>
               <label className={cls.label}>
@@ -1027,68 +1235,113 @@ export default function LibraryPage() {
         </p>
       )}
 
-      {/* Bulk-selection toolbar */}
+      {/* Bulk-selection action bar */}
       {selectMode && results.length > 0 && (
-        <div className="sticky top-2 z-20 flex flex-wrap items-center gap-2 rounded-xl border border-accent-cyan/40 bg-ui-bg-soft/90 px-3 py-2 backdrop-blur-sm">
-          <span className="text-ui-sm font-medium text-ui-ink">
-            {selected.size} selected
-          </span>
-          <button
-            className={cls.btn}
-            onClick={() => setSelected(new Set(results.map((r) => r.imageId)))}
-            disabled={selected.size === results.length}
-          >
-            Select all
-          </button>
-          <button className={cls.btn} onClick={clearSelection} disabled={selected.size === 0}>
-            Clear
-          </button>
-          <div className="flex-1" />
-          {!confirmingBulk ? (
-            <button
-              onClick={() => setConfirmingBulk(true)}
-              disabled={selected.size === 0}
-              className="rounded-lg border border-rose-500/60 px-3 py-2 text-ui-sm font-medium text-rose-400 transition hover:bg-rose-500/10 disabled:opacity-50"
-            >
-              Delete selected
-            </button>
-          ) : (
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-ui-xs text-ui-ink-muted">
-                Remove {selected.size} image{selected.size === 1 ? "" : "s"} from the
-                library? Originals on disk are kept.
-              </span>
-              <button
-                onClick={deleteSelected}
-                disabled={bulkDeleting}
-                className="rounded-lg bg-rose-500/90 px-3 py-2 text-ui-sm font-medium text-white transition hover:bg-rose-500 disabled:opacity-60"
-              >
-                {bulkDeleting ? "Removing…" : "Remove"}
-              </button>
-              <button
-                onClick={() => setConfirmingBulk(false)}
-                disabled={bulkDeleting}
-                className={cls.btn}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
+        <div className="flex flex-col gap-1">
+          <BulkActionBar
+            selectedCount={selected.size}
+            totalCount={results.length}
+            busy={bulkBusy}
+            confirmingDelete={confirmingBulk}
+            onSelectAll={() => setSelected(new Set(results.map((r) => r.imageId)))}
+            onClear={clearSelection}
+            onFavorite={bulkFavorite}
+            onRating={bulkRating}
+            onSafety={bulkSafety}
+            onAddTags={bulkAddTags}
+            onRemoveTags={bulkRemoveTags}
+            onExport={exportSelected}
+            onRequestDelete={() => setConfirmingBulk(true)}
+            onConfirmDelete={deleteSelected}
+            onCancelDelete={() => setConfirmingBulk(false)}
+            fetchTagSuggestions={fetchTagSuggestions}
+          />
+          {notice && <p className="px-1 text-ui-xs text-emerald-500">{notice}</p>}
         </div>
       )}
 
       {results.length > 0 && (
-        <ResultsView
-          results={displayResults}
+        <Gallery
+          items={displayResults}
+          getKey={(r) => r.imageId}
           viewMode={settings.viewMode}
-          density={settings.gridDensity}
-          showScores={settings.showScores}
-          showCardMeta={settings.showCardMeta}
+          gridClassName={`grid ${gridColumnsClass(settings.gridDensity)} gap-3`}
+          masonryClassName={`${masonryColumnsClass(settings.gridDensity)} gap-3`}
+          cardClassName={
+            settings.viewMode === "list"
+              ? "rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-2 transition hover:border-accent-cyan"
+              : "overflow-hidden rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 transition hover:border-accent-cyan"
+          }
+          mediaClassName={selectMode ? "cursor-pointer" : "cursor-zoom-in"}
+          getHref={(r) => `/library/${r.imageId}`}
+          onOpen={(i) => openLightbox(i)}
           selectMode={selectMode}
-          selected={selected}
-          onToggleSelect={toggleSelect}
-          onSimilar={findSimilar}
-          onOpen={openLightbox}
+          isSelected={(r) => selected.has(r.imageId)}
+          onToggleSelect={(r) => toggleSelect(r.imageId)}
+          selectOnCtrlClick
+          renderMedia={(r, ctx) => (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={r.thumbnailUrl}
+              alt={r.summary}
+              loading="lazy"
+              className={
+                ctx.viewMode === "list"
+                  ? "h-16 w-16 rounded-lg object-cover sm:h-20 sm:w-20"
+                  : ctx.viewMode === "masonry"
+                    ? "w-full object-cover"
+                    : "aspect-square w-full object-cover"
+              }
+            />
+          )}
+          renderMeta={(r, ctx) => {
+            if (ctx.viewMode === "list") {
+              return (
+                <>
+                  <a
+                    href={`/library/${r.imageId}`}
+                    onClick={(e) => {
+                      if (ctx.selectMode) {
+                        e.preventDefault();
+                        ctx.open();
+                        return;
+                      }
+                      // Ctrl/Cmd+click selects (mirrors the media click); other
+                      // modified / middle clicks open the detail page normally.
+                      if (e.ctrlKey || e.metaKey) {
+                        e.preventDefault();
+                        ctx.toggleSelect();
+                        return;
+                      }
+                      if (e.shiftKey || e.altKey || e.button !== 0) return;
+                      e.preventDefault();
+                      ctx.open();
+                    }}
+                    className={`block ${ctx.selectMode ? "cursor-pointer" : "cursor-zoom-in"}`}
+                  >
+                    <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
+                  </a>
+                  {settings.showCardMeta && <CardMeta r={r} showScores={settings.showScores} />}
+                </>
+              );
+            }
+            if (!settings.showCardMeta) return null;
+            return (
+              <div className="p-2">
+                <p className="line-clamp-2 text-ui-xs text-ui-ink">{r.summary}</p>
+                <CardMeta r={r} showScores={settings.showScores} />
+              </div>
+            );
+          }}
+          renderOverlay={(r) => (
+            <button
+              onClick={() => findSimilar(r.imageId, r.thumbnailUrl, r.summary)}
+              className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
+              title="Find similar images"
+            >
+              Similar
+            </button>
+          )}
         />
       )}
 
@@ -1184,9 +1437,14 @@ export default function LibraryPage() {
           hasMore={hasMore}
           loadingMore={loading}
           onLoadMore={loadMore}
-          onClose={() => setLightboxIndex(null)}
+          onCurrentChange={syncViewUrl}
+          onClose={() => {
+            setLightboxIndex(null);
+            syncViewUrl(null);
+          }}
           onSimilar={(it) => {
             setLightboxIndex(null);
+            syncViewUrl(null);
             findSimilar(it.imageId, it.thumbnailUrl, it.summary);
           }}
           onToggleFullResolution={() =>
@@ -1195,98 +1453,6 @@ export default function LibraryPage() {
         />
       )}
     </div>
-  );
-}
-
-type SimilarHandler = (id: string, thumbUrl: string, summary: string) => void;
-type OpenHandler = (index: number) => void;
-type ToggleSelectHandler = (id: string) => void;
-
-interface SelectionProps {
-  selectMode: boolean;
-  selected: Set<string>;
-  onToggleSelect: ToggleSelectHandler;
-}
-
-/** Renders the result set in the layout chosen in settings (grid / masonry / list). */
-function ResultsView({
-  results,
-  viewMode,
-  density,
-  showScores,
-  showCardMeta,
-  selectMode,
-  selected,
-  onToggleSelect,
-  onSimilar,
-  onOpen,
-}: {
-  results: CompactResult[];
-  viewMode: ViewMode;
-  density: "compact" | "comfortable" | "spacious";
-  showScores: boolean;
-  showCardMeta: boolean;
-  onSimilar: SimilarHandler;
-  onOpen: OpenHandler;
-} & SelectionProps) {
-  if (viewMode === "list") {
-    return (
-      <div className="flex flex-col gap-2">
-        {results.map((r, i) => (
-          <ResultRow
-            key={r.imageId}
-            r={r}
-            index={i}
-            showScores={showScores}
-            showCardMeta={showCardMeta}
-            selectMode={selectMode}
-            isSelected={selected.has(r.imageId)}
-            onToggleSelect={onToggleSelect}
-            onSimilar={onSimilar}
-            onOpen={onOpen}
-          />
-        ))}
-      </div>
-    );
-  }
-
-  const masonry = viewMode === "masonry";
-  return (
-    <div className={masonry ? `${masonryColumnsClass(density)} gap-3` : `grid ${gridColumnsClass(density)} gap-3`}>
-      {results.map((r, i) => (
-        <ResultCard
-          key={r.imageId}
-          r={r}
-          index={i}
-          masonry={masonry}
-          showScores={showScores}
-          showCardMeta={showCardMeta}
-          selectMode={selectMode}
-          isSelected={selected.has(r.imageId)}
-          onToggleSelect={onToggleSelect}
-          onSimilar={onSimilar}
-          onOpen={onOpen}
-        />
-      ))}
-    </div>
-  );
-}
-
-/** Checkbox overlay shown on each card/row while in select mode. */
-function SelectCheck({ checked }: { checked: boolean }) {
-  return (
-    <span
-      className={`flex h-5 w-5 items-center justify-center rounded border transition ${
-        checked
-          ? "border-accent-cyan bg-accent-cyan text-ui-bg-deep"
-          : "border-ui-border/80 bg-ui-bg/80 text-transparent backdrop-blur-sm"
-      }`}
-      aria-hidden="true"
-    >
-      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M5 12l5 5 9-11" />
-      </svg>
-    </span>
   );
 }
 
@@ -1312,173 +1478,6 @@ function CardMeta({ r, showScores }: { r: CompactResult; showScores: boolean }) 
       )}
       {r.model && (
         <span className="rounded bg-ui-bg px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">{r.model}</span>
-      )}
-    </div>
-  );
-}
-
-/**
- * Left-click opens the fullscreen viewer; modified clicks (Ctrl/Cmd/middle)
- * fall through to the native link so the detail page can still open in a new tab.
- */
-function shouldOpenViewer(e: React.MouseEvent): boolean {
-  return !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0);
-}
-
-function ResultCard({
-  r,
-  index,
-  masonry,
-  showScores,
-  showCardMeta,
-  selectMode,
-  isSelected,
-  onToggleSelect,
-  onSimilar,
-  onOpen,
-}: {
-  r: CompactResult;
-  index: number;
-  masonry: boolean;
-  showScores: boolean;
-  showCardMeta: boolean;
-  onSimilar: SimilarHandler;
-  onOpen: OpenHandler;
-  isSelected: boolean;
-} & Omit<SelectionProps, "selected">) {
-  return (
-    <div
-      className={`group relative overflow-hidden rounded-xl border bg-ui-bg-soft/40 transition ${
-        isSelected ? "border-accent-cyan ring-2 ring-accent-cyan" : "border-ui-border/60 hover:border-accent-cyan"
-      } ${masonry ? "mb-3 break-inside-avoid" : ""}`}
-    >
-      <a
-        href={`/library/${r.imageId}`}
-        onClick={(e) => {
-          if (selectMode) {
-            e.preventDefault();
-            onToggleSelect(r.imageId);
-            return;
-          }
-          if (!shouldOpenViewer(e)) return;
-          e.preventDefault();
-          onOpen(index);
-        }}
-        className={selectMode ? "block cursor-pointer" : "block cursor-zoom-in"}
-      >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={r.thumbnailUrl}
-          alt={r.summary}
-          loading="lazy"
-          className={masonry ? "w-full object-cover" : "aspect-square w-full object-cover"}
-        />
-      </a>
-
-      {/* Selection checkbox (select mode only) */}
-      {selectMode && (
-        <button
-          onClick={() => onToggleSelect(r.imageId)}
-          className="absolute left-1.5 top-1.5"
-          aria-pressed={isSelected}
-          aria-label={isSelected ? "Deselect image" : "Select image"}
-        >
-          <SelectCheck checked={isSelected} />
-        </button>
-      )}
-
-      {/* Hover action: find similar (hidden while selecting) */}
-      {!selectMode && (
-        <div className="pointer-events-none absolute right-1.5 top-1.5 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
-          <button
-            onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-            className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
-            title="Find similar images"
-          >
-            Similar
-          </button>
-        </div>
-      )}
-
-      {showCardMeta && (
-        <div className="p-2">
-          <p className="line-clamp-2 text-ui-xs text-ui-ink">{r.summary}</p>
-          <CardMeta r={r} showScores={showScores} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ResultRow({
-  r,
-  index,
-  showScores,
-  showCardMeta,
-  selectMode,
-  isSelected,
-  onToggleSelect,
-  onSimilar,
-  onOpen,
-}: {
-  r: CompactResult;
-  index: number;
-  showScores: boolean;
-  showCardMeta: boolean;
-  onSimilar: SimilarHandler;
-  onOpen: OpenHandler;
-  isSelected: boolean;
-} & Omit<SelectionProps, "selected">) {
-  const open = (e: React.MouseEvent) => {
-    if (selectMode) {
-      e.preventDefault();
-      onToggleSelect(r.imageId);
-      return;
-    }
-    if (!shouldOpenViewer(e)) return;
-    e.preventDefault();
-    onOpen(index);
-  };
-  const linkClass = selectMode ? "cursor-pointer" : "cursor-zoom-in";
-  return (
-    <div
-      className={`group flex items-center gap-3 rounded-xl border bg-ui-bg-soft/40 p-2 transition ${
-        isSelected ? "border-accent-cyan ring-2 ring-accent-cyan" : "border-ui-border/60 hover:border-accent-cyan"
-      }`}
-    >
-      {selectMode && (
-        <button
-          onClick={() => onToggleSelect(r.imageId)}
-          className="shrink-0"
-          aria-pressed={isSelected}
-          aria-label={isSelected ? "Deselect image" : "Select image"}
-        >
-          <SelectCheck checked={isSelected} />
-        </button>
-      )}
-      <a href={`/library/${r.imageId}`} onClick={open} className={`shrink-0 ${linkClass}`}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={r.thumbnailUrl}
-          alt={r.summary}
-          loading="lazy"
-          className="h-16 w-16 rounded-lg object-cover sm:h-20 sm:w-20"
-        />
-      </a>
-      <div className="min-w-0 flex-1">
-        <a href={`/library/${r.imageId}`} onClick={open} className={`block ${linkClass}`}>
-          <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
-        </a>
-        {showCardMeta && <CardMeta r={r} showScores={showScores} />}
-      </div>
-      {!selectMode && (
-        <button
-          onClick={() => onSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-          className="shrink-0 rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
-          title="Find similar images"
-        >
-          Similar
-        </button>
       )}
     </div>
   );

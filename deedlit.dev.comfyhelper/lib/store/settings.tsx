@@ -26,6 +26,8 @@ export type SortMode =
   | "relevance"
   | "newest"
   | "oldest"
+  | "created_desc"
+  | "created_asc"
   | "rating_desc"
   | "rating_asc"
   | "name_asc"
@@ -35,6 +37,8 @@ export const SORT_MODES: readonly SortMode[] = [
   "relevance",
   "newest",
   "oldest",
+  "created_desc",
+  "created_asc",
   "rating_desc",
   "rating_asc",
   "name_asc",

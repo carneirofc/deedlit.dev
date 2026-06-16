@@ -157,8 +157,10 @@ export type MetadataSearchRequest = z.infer<typeof MetadataSearchRequestSchema>;
 /** Server-side browse ordering for the catalog grid (no relevance — that's the
  * vector search path). Mirrors the catalog `sort` enum. */
 export const CatalogSortSchema = z.enum([
-  "newest",
-  "oldest",
+  "newest", // ingestion date, newest first
+  "oldest", // ingestion date, oldest first
+  "created_desc", // source-file creation date, newest first
+  "created_asc", // source-file creation date, oldest first
   "rating_desc",
   "rating_asc",
   "name_asc",
@@ -183,6 +185,12 @@ export const CatalogBrowseRequestSchema = z.object({
   offset: z.number().int().min(0).default(0),
 });
 export type CatalogBrowseRequest = z.infer<typeof CatalogBrowseRequestSchema>;
+
+/** Bulk export — the selected images, by sha256. Capped to bound the server-side fan-out. */
+export const ExportRequestSchema = z.object({
+  ids: z.array(z.string().min(1)).min(1).max(500),
+});
+export type ExportRequest = z.infer<typeof ExportRequestSchema>;
 
 export const SemanticSearchRequestSchema = z.object({
   query: z.string().min(1),

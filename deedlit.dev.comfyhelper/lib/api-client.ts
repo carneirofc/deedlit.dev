@@ -554,6 +554,8 @@ export async function updateIngestConfig(
 export type CatalogSort =
   | "newest"
   | "oldest"
+  | "created_desc"
+  | "created_asc"
   | "rating_desc"
   | "rating_asc"
   | "name_asc"
@@ -593,6 +595,20 @@ export async function listCatalogImages(
     signal,
   });
   return Array.isArray(res) ? (res as CatalogImage[]) : [];
+}
+
+/**
+ * Tag-name autocomplete (gateway GET /tags) — names matching `prefix`, ranked
+ * most-used first. Backs the live type-ahead in the library tag filter. An empty
+ * prefix returns the globally most-used tags; the gateway degrades to [].
+ */
+export async function suggestTags(
+  prefix: string,
+  limit = 10,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const res = await request<unknown>("/tags", { query: { prefix, limit }, signal });
+  return Array.isArray(res) ? (res as string[]) : [];
 }
 
 /** Curated, editable catalog fields (gateway PATCH /images/{sha}). */
@@ -851,7 +867,7 @@ export function hitsToCompactResults(hits: SearchHit[]): CompactResult[] {
 export function catalogImageToCompactResult(image: CatalogImage): CompactResult {
   const tags = stringArray(image.tags);
   const prompt = str(image.prompt);
-  const filePath = str(image.filePath) ?? str(image.file_path);
+  const filePath = str(image.filepath) ?? str(image.filePath) ?? str(image.file_path);
   const filename = filePath ? filePath.replace(/^.*[/\\]/, "") : null;
   const summary =
     (prompt ? prompt.replace(/\s+/g, " ").trim().slice(0, 140) : null) ??
@@ -955,10 +971,15 @@ export interface UiImageDetail {
 /** Map the catalog Image record -> the detail-page shape. */
 export function imageToUiDetail(image: CatalogImage): UiImageDetail {
   const checkpoint = refName(image, "checkpoint");
+  // The catalog serialises the originating on-disk path as `filepath` (one word);
+  // keep the camel/snake fallbacks for any other producer. This is captured at
+  // ingest and must never be dropped — it's how an image is traced back to source.
+  const filePath = str(image.filepath) ?? str(image.filePath) ?? str(image.file_path) ?? "";
+  const basename = filePath ? filePath.replace(/^.*[/\\]/, "") : null;
   return {
     id: image.sha256,
-    filename: str(image.filename) ?? `${image.sha256.slice(0, 12)}…`,
-    filePath: str(image.filePath) ?? str(image.file_path) ?? "",
+    filename: str(image.filename) ?? basename ?? `${image.sha256.slice(0, 12)}…`,
+    filePath,
     prompt: image.prompt ?? null,
     negativePrompt: image.negative ?? null,
     rating: image.rating ?? null,
