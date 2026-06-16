@@ -1,18 +1,30 @@
 "use client";
 
-import { useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
-interface TagSelectProps {
+import { cn } from "./utils";
+
+export interface TagSelectProps {
   /** Currently selected tags (controlled). */
   value: string[];
   onChange: (next: string[]) => void;
   /** Candidate tags to autocomplete against (e.g. tags on loaded results). */
   suggestions?: string[];
+  /**
+   * Live, server-backed autocomplete. When provided, the dropdown is sourced by
+   * calling this with the current draft (debounced) instead of `suggestions`, so
+   * the type-ahead spans the whole tag catalog, not just loaded results. The
+   * server is expected to prefix-match, so results are shown as-is (only
+   * already-selected tags are removed).
+   */
+  fetchSuggestions?: (query: string) => Promise<string[]>;
   placeholder?: string;
   /** Accent: include filters glow cyan, exclude filters glow rose. */
   variant?: "include" | "exclude";
   /** Fired after the selection changes via the UI (add/remove) — e.g. to re-search. */
   onCommit?: (next: string[]) => void;
+  /** Override the wrapper class. */
+  className?: string;
 }
 
 const VARIANT = {
@@ -30,20 +42,24 @@ const VARIANT = {
  * Chip multi-select with free-typing + autocomplete. Type and press Enter or
  * comma to add a tag; click a suggestion to add it; Backspace on an empty input
  * removes the last chip. Selection is deduped case-insensitively. Suggestions
- * are sourced by the caller (we have no tag-list endpoint), already-selected
- * tags are filtered out, and the list is ranked in the order given.
+ * are sourced by the caller (either a static `suggestions` list or a live
+ * `fetchSuggestions`), already-selected tags are filtered out, and the list is
+ * ranked in the order given.
  */
-export function TagSelect({
+function TagSelect({
   value,
   onChange,
   suggestions = [],
+  fetchSuggestions,
   placeholder = "add tag…",
   variant = "include",
   onCommit,
+  className,
 }: TagSelectProps) {
   const [draft, setDraft] = useState("");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
+  const [remote, setRemote] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const listId = useId();
   const styles = VARIANT[variant];
@@ -51,20 +67,37 @@ export function TagSelect({
   const has = (tag: string) =>
     value.some((v) => v.toLowerCase() === tag.toLowerCase());
 
+  // Live server-backed suggestions: debounce the draft and fetch while the
+  // dropdown is open. The latest result wins; a stale in-flight one is dropped.
+  useEffect(() => {
+    if (!fetchSuggestions || !open) return;
+    let alive = true;
+    const handle = setTimeout(() => {
+      fetchSuggestions(draft.trim())
+        .then((r) => { if (alive) setRemote(r); })
+        .catch(() => { /* keep the previous list on a transient failure */ });
+    }, 150);
+    return () => { alive = false; clearTimeout(handle); };
+  }, [draft, open, fetchSuggestions]);
+
   const filtered = useMemo(() => {
+    const pool = fetchSuggestions ? remote : suggestions;
     const q = draft.trim().toLowerCase();
     const seen = new Set(value.map((v) => v.toLowerCase()));
     const out: string[] = [];
-    for (const s of suggestions) {
+    for (const s of pool) {
       const key = s.toLowerCase();
       if (seen.has(key)) continue;
-      if (q && !key.includes(q)) continue;
+      // Local suggestions are substring-filtered here; remote ones are already
+      // prefix-matched server-side, so they pass through (avoids mid-type flicker
+      // while a debounced fetch catches up to the draft).
+      if (!fetchSuggestions && q && !key.includes(q)) continue;
       seen.add(key);
       out.push(s);
       if (out.length >= 8) break;
     }
     return out;
-  }, [suggestions, value, draft]);
+  }, [suggestions, remote, fetchSuggestions, value, draft]);
 
   const commit = (next: string[]) => {
     onChange(next);
@@ -104,15 +137,21 @@ export function TagSelect({
   };
 
   return (
-    <div className="relative">
+    <div className={cn("relative", className)}>
       <div
-        className={`flex min-h-[2.5rem] flex-wrap items-center gap-1.5 rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-1.5 text-ui-sm outline-none transition ${styles.ring}`}
+        className={cn(
+          "flex min-h-[2.5rem] flex-wrap items-center gap-1.5 rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-1.5 text-ui-sm outline-none transition",
+          styles.ring,
+        )}
         onClick={() => inputRef.current?.focus()}
       >
         {value.map((tag) => (
           <span
             key={tag}
-            className={`flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-ui-2xs font-medium ${styles.chip}`}
+            className={cn(
+              "flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-ui-2xs font-medium",
+              styles.chip,
+            )}
           >
             {tag}
             <button
@@ -163,9 +202,10 @@ export function TagSelect({
                   add(s);
                 }}
                 onMouseEnter={() => setActive(i)}
-                className={`w-full truncate rounded-md px-2 py-1 text-left text-ui-xs transition ${
-                  i === active ? "bg-accent-cyan/15 text-accent-cyan" : "text-ui-ink hover:bg-ui-bg"
-                }`}
+                className={cn(
+                  "w-full truncate rounded-md px-2 py-1 text-left text-ui-xs transition",
+                  i === active ? "bg-accent-cyan/15 text-accent-cyan" : "text-ui-ink hover:bg-ui-bg",
+                )}
               >
                 {s}
               </button>
@@ -176,3 +216,5 @@ export function TagSelect({
     </div>
   );
 }
+
+export default TagSelect;
