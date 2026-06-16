@@ -3,12 +3,39 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+interface ImageDetail {
+  id: string;
+  filename: string;
+  filePath: string;
+  prompt: string | null;
+  negativePrompt: string | null;
+  rating: number | null;
+  favorite: boolean;
+  model: string | null;
+  checkpoint: string | null;
+  modelFamily: string | null;
+  width: number | null;
+  height: number | null;
+  sourceTool: string | null;
+  tags: { name: string; normalizedName: string; source?: string | null }[];
+  loras: { name: string; weight: number | null }[];
+  generationParams: Record<string, unknown> | null;
+  descriptions: { id: string; description: string; provider: string | null }[];
+}
+
 /** Minimal shape the lightbox needs from a search result. */
 export interface LightboxItem {
   imageId: string;
   thumbnailUrl: string;
   summary: string;
   score?: number | null;
+  rating?: number | null;
+}
+
+interface LightboxNote {
+  id: string;
+  title?: string | null;
+  created_at?: string;
 }
 
 export interface SlideshowSettings {
@@ -35,6 +62,12 @@ interface LightboxProps {
   onToggleFullResolution?: () => void;
   /** Fires whenever the displayed image changes — drives URL sync. */
   onCurrentChange?: (item: LightboxItem) => void;
+  /** Called when user rates the current image (null clears the rating). */
+  onRating?: (imageId: string, rating: number | null) => void;
+  /** Fetch notes for a given imageId. */
+  fetchNotes?: (imageId: string) => Promise<LightboxNote[]>;
+  /** Create a plain-text note attached to an image. */
+  onCreateNote?: (imageId: string, text: string) => Promise<void>;
 }
 
 const ctrlBtn =
@@ -69,6 +102,9 @@ export function Lightbox({
   onSimilar,
   onToggleFullResolution,
   onCurrentChange,
+  onRating,
+  fetchNotes,
+  onCreateNote,
 }: LightboxProps) {
   // Track the displayed image by *id*, not by position. The result list can
   // reorder, grow (load-more) or have rows spliced under the viewer; an index
@@ -80,6 +116,18 @@ export function Lightbox({
   const [playing, setPlaying] = useState(autoPlay);
   const [imgLoaded, setImgLoaded] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
+
+  // Notes panel state
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [notes, setNotes] = useState<LightboxNote[]>([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+
+  // Inline details panel state
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [detail, setDetail] = useState<ImageDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   // Resolve the live position of the tracked image each render. If it vanished
   // (the list changed under us) land on the original open slot, clamped — a rare
@@ -163,6 +211,38 @@ export function Lightbox({
   useEffect(() => {
     setImgLoaded(false);
   }, [current?.imageId, fullResolution]);
+
+  // Fetch notes for the current image when the notes panel is open.
+  useEffect(() => {
+    if (!notesOpen || !fetchNotes || !current) return;
+    let alive = true;
+    setNotesLoading(true);
+    fetchNotes(current.imageId)
+      .then((n) => { if (alive) setNotes(n); })
+      .catch(() => {})
+      .finally(() => { if (alive) setNotesLoading(false); });
+    return () => { alive = false; };
+  }, [notesOpen, current?.imageId, fetchNotes]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Reset notes when navigating to a new image (stale data from the old one).
+  useEffect(() => {
+    setNotes([]);
+    setNoteDraft("");
+  }, [current?.imageId]);
+
+  // Fetch image detail when the details panel is open or the image changes.
+  useEffect(() => {
+    if (!detailsOpen || !current) return;
+    let alive = true;
+    setDetailLoading(true);
+    setDetail(null);
+    fetch(`/api/library/images/${current.imageId}`)
+      .then((r) => r.json())
+      .then((j) => { if (alive) setDetail(j); })
+      .catch(() => {})
+      .finally(() => { if (alive) setDetailLoading(false); });
+    return () => { alive = false; };
+  }, [detailsOpen, current?.imageId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Preload the neighbours for smooth stepping / slideshow.
   useEffect(() => {
@@ -295,18 +375,70 @@ export function Lightbox({
             </button>
           )}
 
-          <Link
-            href={`/library/${current.imageId}`}
-            prefetch={false}
-            className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium`}
-            title="Open full details"
+          <button
+            type="button"
+            onClick={() => setDetailsOpen((v) => !v)}
+            className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${detailsOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
+            aria-pressed={detailsOpen}
+            title="Toggle details panel"
           >
             <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
               <circle cx="12" cy="12" r="9" />
               <path d="M12 16v-4M12 8h.01" />
             </svg>
             Details
+          </button>
+          <Link
+            href={`/library/${current.imageId}`}
+            prefetch={false}
+            className={`${ctrlBtn} text-ui-2xs`}
+            title="Open full details page"
+          >
+            <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+              <polyline points="15 3 21 3 21 9" />
+              <line x1="10" y1="14" x2="21" y2="3" />
+            </svg>
           </Link>
+
+          {/* Star rating */}
+          {onRating && (
+            <div className="flex h-9 items-center gap-0.5" role="group" aria-label="Rating">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => onRating(current.imageId, current.rating === n ? null : n)}
+                  className={`text-base leading-none transition ${
+                    n <= (current.rating ?? 0)
+                      ? "text-amber-400 hover:text-amber-300"
+                      : "text-ui-ink-muted/30 hover:text-amber-400/70"
+                  }`}
+                  title={`${n}★${current.rating === n ? " — click to clear" : ""}`}
+                  aria-label={`Rate ${n} star${n === 1 ? "" : "s"}`}
+                >
+                  ★
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Notes toggle */}
+          {fetchNotes && (
+            <button
+              type="button"
+              onClick={() => setNotesOpen((v) => !v)}
+              className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${notesOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
+              aria-pressed={notesOpen}
+              title="Toggle notes panel"
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" />
+              </svg>
+              Notes{notes.length > 0 ? ` (${notes.length})` : ""}
+            </button>
+          )}
 
           <button type="button" onClick={onClose} className={ctrlBtn} title="Close (Esc)">
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
@@ -316,7 +448,84 @@ export function Lightbox({
         </div>
       </header>
 
-      {/* Stage — click the empty area to close */}
+      {/* Notes panel */}
+      {notesOpen && fetchNotes && (
+        <div className="flex max-h-48 flex-col gap-2 overflow-y-auto border-b border-ui-border/40 bg-ui-bg/70 px-4 py-3 backdrop-blur-sm">
+          {notesLoading ? (
+            <p className="text-ui-xs text-ui-ink-muted">Loading notes…</p>
+          ) : notes.length === 0 ? (
+            <p className="text-ui-xs text-ui-ink-muted">No notes yet.</p>
+          ) : (
+            <ul className="flex flex-col gap-1.5">
+              {notes.map((n) => (
+                <li key={n.id} className="rounded-lg border border-ui-border/40 bg-ui-bg/60 px-3 py-2">
+                  <p className="text-ui-xs text-ui-ink">{n.title ?? "(empty note)"}</p>
+                  {n.created_at && (
+                    <p className="mt-0.5 text-ui-2xs text-ui-ink-muted/60">
+                      {new Date(n.created_at).toLocaleString()}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {onCreateNote && (
+            <div className="flex gap-2 pt-1">
+              <input
+                className="flex-1 rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-1.5 text-ui-xs outline-none focus:border-accent-cyan"
+                placeholder="Add a note…"
+                value={noteDraft}
+                onChange={(e) => setNoteDraft(e.target.value)}
+                onKeyDown={async (e) => {
+                  if (e.key === "Enter" && noteDraft.trim() && !noteSaving) {
+                    setNoteSaving(true);
+                    try {
+                      await onCreateNote(current.imageId, noteDraft.trim());
+                      setNoteDraft("");
+                      const refreshed = await fetchNotes(current.imageId);
+                      setNotes(refreshed);
+                    } finally {
+                      setNoteSaving(false);
+                    }
+                  }
+                }}
+                disabled={noteSaving}
+              />
+              <button
+                className="rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-1.5 text-ui-xs font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50"
+                disabled={!noteDraft.trim() || noteSaving}
+                onClick={async () => {
+                  if (!noteDraft.trim() || noteSaving) return;
+                  setNoteSaving(true);
+                  try {
+                    await onCreateNote(current.imageId, noteDraft.trim());
+                    setNoteDraft("");
+                    const refreshed = await fetchNotes(current.imageId);
+                    setNotes(refreshed);
+                  } finally {
+                    setNoteSaving(false);
+                  }
+                }}
+              >
+                {noteSaving ? "…" : "Add"}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Stage — details panel + image area */}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+
+      {/* Inline details panel */}
+      {detailsOpen && (
+        <aside className="flex w-96 shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-r border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm">
+          {detailLoading && <p className="text-ui-xs text-ui-ink-muted">Loading…</p>}
+          {detail && <LightboxDetailPanel detail={detail} imageId={current.imageId} />}
+        </aside>
+      )}
+
+      {/* Click the empty area to close */}
       <div
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2"
         onClick={(e) => {
@@ -376,6 +585,7 @@ export function Lightbox({
           </svg>
         </button>
       </div>
+      </div>
 
       {/* Filmstrip — horizontally scrollable, never wraps */}
       <div
@@ -410,6 +620,100 @@ export function Lightbox({
             {loadingMore ? "…" : "More"}
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+function LightboxDetailPanel({ detail, imageId }: { detail: ImageDetail; imageId: string }) {
+  const sec = "border-t border-ui-border/40 pt-3 mt-3";
+  const label = "text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted mb-1";
+  return (
+    <div className="flex flex-col text-ui-xs text-ui-ink">
+      <p className="break-all font-medium text-ui-ink-title">{detail.filename}</p>
+
+      <dl className={`${sec} grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-ui-ink-muted`}>
+        {detail.model && <><dt>Model</dt><dd className="break-words text-ui-ink">{detail.model}</dd></>}
+        {detail.modelFamily && <><dt>Family</dt><dd className="break-words text-ui-ink">{detail.modelFamily}</dd></>}
+        {detail.checkpoint && <><dt>Checkpoint</dt><dd className="break-words text-ui-ink">{detail.checkpoint}</dd></>}
+        {detail.sourceTool && <><dt>Source</dt><dd className="break-words text-ui-ink">{detail.sourceTool}</dd></>}
+        {(detail.width || detail.height) && <><dt>Size</dt><dd className="text-ui-ink">{detail.width}×{detail.height}</dd></>}
+      </dl>
+
+      {detail.filePath && (
+        <div className={sec}>
+          <p className={label}>File path</p>
+          <p className="break-all font-mono text-ui-2xs text-ui-ink-muted">{detail.filePath}</p>
+        </div>
+      )}
+
+      {detail.tags.length > 0 && (
+        <div className={sec}>
+          <p className={label}>Tags</p>
+          <div className="flex flex-wrap gap-1">
+            {detail.tags.map((t) => (
+              <Link
+                key={`${t.normalizedName}-${t.source}`}
+                href={`/library?tags=${encodeURIComponent(t.normalizedName || t.name)}`}
+                prefetch={false}
+                className="rounded-full bg-ui-bg px-2 py-0.5 text-ui-2xs text-ui-ink-muted transition hover:text-accent-cyan"
+              >
+                {t.name}
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {detail.prompt && (
+        <div className={sec}>
+          <p className={label}>Prompt</p>
+          <p className="line-clamp-6 whitespace-pre-wrap text-ui-2xs text-ui-ink">{detail.prompt}</p>
+        </div>
+      )}
+
+      {detail.negativePrompt && (
+        <div className={sec}>
+          <p className={label}>Negative prompt</p>
+          <p className="line-clamp-4 whitespace-pre-wrap text-ui-2xs text-ui-ink-muted">{detail.negativePrompt}</p>
+        </div>
+      )}
+
+      {detail.loras.length > 0 && (
+        <div className={sec}>
+          <p className={label}>LoRAs</p>
+          <ul className="flex flex-col gap-0.5">
+            {detail.loras.map((l) => (
+              <li key={l.name} className="text-ui-2xs text-ui-ink-muted">
+                {l.name}{l.weight != null ? ` (${l.weight})` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {detail.descriptions.length > 0 && (
+        <div className={sec}>
+          <p className={label}>AI description</p>
+          {detail.descriptions.map((d) => (
+            <p key={d.id} className="line-clamp-4 text-ui-2xs text-ui-ink">{d.description}</p>
+          ))}
+        </div>
+      )}
+
+      <div className={sec}>
+        <Link
+          href={`/library/${imageId}`}
+          prefetch={false}
+          className="inline-flex items-center gap-1 text-ui-2xs text-accent-cyan hover:underline"
+        >
+          Open full details
+          <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+            <polyline points="15 3 21 3 21 9" />
+            <line x1="10" y1="14" x2="21" y2="3" />
+          </svg>
+        </Link>
       </div>
     </div>
   );

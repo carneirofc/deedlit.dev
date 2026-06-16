@@ -103,12 +103,39 @@ export default function ImageDetailPage() {
   const [suggestRequested, setSuggestRequested] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
 
+  // Inline rating edit state.
+  const [ratingBusy, setRatingBusy] = useState(false);
+
+  // Notes state.
+  const [notes, setNotes] = useState<{ id: string; title?: string | null; created_at?: string }[]>([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+
   // Two-step "remove from library" confirmation.
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   // Transient "Copied" state for the source-path copy button.
   const [pathCopied, setPathCopied] = useState(false);
+
+  const rateImage = useCallback(async (rating: number | null) => {
+    if (!detail || ratingBusy) return;
+    setRatingBusy(true);
+    try {
+      const res = await fetch(`/api/library/images/${imageId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rating }),
+      });
+      if (res.ok) {
+        const updated = await res.json();
+        setDetail(updated);
+      }
+    } finally {
+      setRatingBusy(false);
+    }
+  }, [detail, imageId, ratingBusy]);
 
   // Detail load — independent of settings so the page renders immediately.
   const load = useCallback(async () => {
@@ -212,6 +239,41 @@ export default function ImageDetailPage() {
       cancelled = true;
     };
   }, [hydrated, detail, settings.showRelatedTags, settings.relatedTagsCount]);
+
+  // Load notes for this image.
+  useEffect(() => {
+    let alive = true;
+    setNotesLoading(true);
+    fetch(`/api/library/notes/by-image/${encodeURIComponent(imageId)}`)
+      .then((r) => r.ok ? r.json() : [])
+      .then((j) => { if (alive) setNotes(Array.isArray(j) ? j : []); })
+      .catch(() => {})
+      .finally(() => { if (alive) setNotesLoading(false); });
+    return () => { alive = false; };
+  }, [imageId]);
+
+  const addNote = useCallback(async () => {
+    const text = noteDraft.trim();
+    if (!text || noteSaving) return;
+    setNoteSaving(true);
+    try {
+      const res = await fetch("/api/library/notes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: text, blocks: {}, imageRefs: [imageId] }),
+      });
+      if (res.ok) {
+        setNoteDraft("");
+        const r2 = await fetch(`/api/library/notes/by-image/${encodeURIComponent(imageId)}`);
+        if (r2.ok) {
+          const j = await r2.json();
+          setNotes(Array.isArray(j) ? j : []);
+        }
+      }
+    } finally {
+      setNoteSaving(false);
+    }
+  }, [imageId, noteDraft, noteSaving]);
 
   const toggleFavorite = useCallback(async () => {
     if (!detail) return;
@@ -335,6 +397,39 @@ export default function ImageDetailPage() {
                 {detail.favorite ? "★" : "☆"}
               </button>
             </div>
+
+            {/* Star rating */}
+            <div className="mt-2 flex items-center gap-0.5" role="group" aria-label="Rating">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => rateImage(detail.rating === n ? null : n)}
+                  disabled={ratingBusy}
+                  className={`text-xl leading-none transition disabled:opacity-50 ${
+                    n <= (detail.rating ?? 0)
+                      ? "text-amber-400 hover:text-amber-300"
+                      : "text-ui-ink-muted/30 hover:text-amber-400/70"
+                  }`}
+                  title={`${n}★${detail.rating === n ? " — click to clear" : ""}`}
+                  aria-label={`Rate ${n} star${n === 1 ? "" : "s"}`}
+                >
+                  ★
+                </button>
+              ))}
+              {detail.rating != null && (
+                <button
+                  type="button"
+                  onClick={() => rateImage(null)}
+                  disabled={ratingBusy}
+                  className="ml-1 text-ui-2xs text-ui-ink-muted/60 transition hover:text-rose-400 disabled:opacity-50"
+                  title="Clear rating"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
             <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-ui-xs text-ui-ink-muted">
               <dt>Model</dt><dd className="break-words text-ui-ink">{detail.model ?? "—"}</dd>
               <dt>Family</dt><dd className="break-words text-ui-ink">{detail.modelFamily ?? "—"}</dd>
@@ -547,6 +642,46 @@ export default function ImageDetailPage() {
           )}
         </section>
       )}
+
+      {/* Notes / comments section */}
+      <section className={panel}>
+        <h2 className="mb-3 text-ui-lg font-semibold text-ui-ink-title">Notes</h2>
+        {notesLoading ? (
+          <p className="text-ui-xs text-ui-ink-muted">Loading notes…</p>
+        ) : notes.length === 0 ? (
+          <p className="mb-3 text-ui-xs text-ui-ink-muted">No notes yet.</p>
+        ) : (
+          <ul className="mb-3 flex flex-col gap-2">
+            {notes.map((n) => (
+              <li key={n.id} className="rounded-lg border border-ui-border/40 bg-ui-bg/60 px-3 py-2">
+                <p className="text-ui-xs text-ui-ink">{n.title ?? "(empty)"}</p>
+                {n.created_at && (
+                  <p className="mt-0.5 text-ui-2xs text-ui-ink-muted/60">
+                    {new Date(n.created_at).toLocaleString()}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex gap-2">
+          <input
+            className="flex-1 rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-2 text-ui-xs outline-none focus:border-accent-cyan"
+            placeholder="Add a note…"
+            value={noteDraft}
+            onChange={(e) => setNoteDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") addNote(); }}
+            disabled={noteSaving}
+          />
+          <button
+            className="rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-2 text-ui-xs font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50"
+            onClick={addNote}
+            disabled={!noteDraft.trim() || noteSaving}
+          >
+            {noteSaving ? "…" : "Add"}
+          </button>
+        </div>
+      </section>
 
       {debugOpen && (
         <section className={panel}>

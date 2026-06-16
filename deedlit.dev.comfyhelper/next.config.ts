@@ -14,6 +14,7 @@ const nextConfig: NextConfig = {
     "@aws-sdk/client-s3",
     "@opentelemetry/instrumentation-pg",
     "@opentelemetry/instrumentation-aws-sdk",
+    "ioredis",
   ],
   turbopack: {
     resolveAlias: {

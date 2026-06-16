@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "build:ui": "npm run build --prefix ../deedlit.dev.ui",
-    "dev": "next dev",
+    "dev": "docker compose up -d redis && next dev",
     "build": "npm run build:ui && next build",
     "start": "node ./scripts/start-production.mjs",
     "lint": "eslint",
@@ -27,6 +27,7 @@
     "@vercel/otel": "^1.13.0",
     "clsx": "^2.1.1",
     "cytoscape": "^3.34.0",
+    "ioredis": "^5.11.1",
     "neo4j-driver": "^5.27.0",
     "next": "16.1.6",
     "pg": "^8.13.1",

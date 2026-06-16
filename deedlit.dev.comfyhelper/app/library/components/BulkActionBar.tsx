@@ -15,7 +15,7 @@ const SAFETY_LABEL: Record<SafetyClass, string> = {
 };
 
 /** Which bulk action is mid-flight (drives the busy/disabled state). */
-export type BulkBusy = "favorite" | "rating" | "safety" | "tags" | "export" | "delete" | null;
+export type BulkBusy = "favorite" | "rating" | "safety" | "tags" | "export" | "move" | "delete" | null;
 
 const btn =
   "rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-2 text-ui-sm font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50";
@@ -34,13 +34,14 @@ interface BulkActionBarProps {
   onAddTags: (tags: string[]) => void;
   onRemoveTags: (tags: string[]) => void;
   onExport: (kind: ExportKind) => void;
+  onMove: (targetFolder: string) => void;
   onRequestDelete: () => void;
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
   fetchTagSuggestions: (q: string) => Promise<string[]>;
 }
 
-type MenuKey = "rating" | "safety" | "tags" | "export";
+type MenuKey = "rating" | "safety" | "tags" | "export" | "move";
 
 /**
  * The select-mode action bar: bulk metadata edits (favorite / rating / safety /
@@ -62,11 +63,14 @@ export function BulkActionBar(props: BulkActionBarProps) {
     onAddTags,
     onRemoveTags,
     onExport,
+    onMove,
     onRequestDelete,
     onConfirmDelete,
     onCancelDelete,
     fetchTagSuggestions,
   } = props;
+
+  const [moveDraft, setMoveDraft] = useState("");
 
   const none = selectedCount === 0;
   const anyBusy = busy !== null;
@@ -181,6 +185,38 @@ export function BulkActionBar(props: BulkActionBarProps) {
         <MenuItem onClick={() => { onExport("simple-csv"); setMenu(null); }}>CSV (.csv)</MenuItem>
         <MenuItem onClick={() => { onExport("simple-json"); setMenu(null); }}>JSON (.json)</MenuItem>
         <MenuItem onClick={() => { onExport("simple-jsonl"); setMenu(null); }}>JSON Lines (.jsonl)</MenuItem>
+      </Menu>
+
+      {/* Filesystem move */}
+      <Menu label={busy === "move" ? "Moving…" : "Move"} open={menu === "move"} onToggle={() => toggle("move")} disabled={none || anyBusy} busy={busy === "move"} width="w-72">
+        <div className="flex flex-col gap-2 p-2">
+          <p className="text-ui-2xs text-ui-ink-muted">Target folder (absolute path). Files are moved on disk; re-ingest the folder to update catalog paths.</p>
+          <input
+            className="w-full rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-2 text-ui-sm outline-none focus:border-accent-cyan"
+            placeholder="/path/to/target/folder"
+            value={moveDraft}
+            onChange={(e) => setMoveDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && moveDraft.trim()) {
+                onMove(moveDraft.trim());
+                setMoveDraft("");
+                setMenu(null);
+              }
+            }}
+          />
+          <button
+            className={btn}
+            disabled={!moveDraft.trim()}
+            onClick={() => {
+              if (!moveDraft.trim()) return;
+              onMove(moveDraft.trim());
+              setMoveDraft("");
+              setMenu(null);
+            }}
+          >
+            Move selected
+          </button>
+        </div>
       </Menu>
 
       {/* Un-index (delete from library) */}

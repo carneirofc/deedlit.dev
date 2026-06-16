@@ -255,6 +255,26 @@ export function AppSidebar() {
           />
 
           <NavIconLink
+            href="/admin/cache"
+            label="Image Cache"
+            isActive={pathname.startsWith("/admin/cache")}
+            testId="cache"
+            onNavigate={() => setIsMobileNavExpanded(false)}
+            icon={
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-5 w-5 fill-none stroke-current"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+              </svg>
+            }
+          />
+
+          <NavIconLink
             href="/library/settings"
             label="Settings"
             isActive={pathname.startsWith("/library/settings")}

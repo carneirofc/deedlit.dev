@@ -10,6 +10,7 @@ import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
 import type { ImagePatchBody } from "@/lib/api-client";
 import { deleteImages } from "@/lib/library/bulk-delete";
+import { moveImages } from "@/lib/library/bulk-move";
 import {
   downloadCsv,
   downloadJson,
@@ -161,6 +162,8 @@ export default function LibraryPage() {
   // restart the poll interval each frame). Never auto-prepend under an open
   // viewer: it would shift the indices out from under the current slide.
   const lightboxOpenRef = useRef(false);
+  const fetchGen = useRef(0);
+  const fetchController = useRef<AbortController | null>(null);
   useEffect(() => {
     lightboxOpenRef.current = lightboxIndex !== null;
   }, [lightboxIndex]);
@@ -213,6 +216,14 @@ export default function LibraryPage() {
     async (append: boolean, overrides?: Partial<typeof filtersRef.current>) => {
       const s = { ...filtersRef.current, ...overrides };
 
+      // Cancel any in-flight request and mark this call as the current generation
+      // so stale callbacks can detect they've been superseded.
+      fetchController.current?.abort();
+      const gen = ++fetchGen.current;
+      const controller = new AbortController();
+      fetchController.current = controller;
+      const { signal } = controller;
+
       // A fresh search invalidates the open viewer (its indices no longer map)
       // and any pending bulk selection (those ids may not be in the new set).
       // It also re-baselines the freshness poll: whatever we load now becomes
@@ -238,6 +249,7 @@ export default function LibraryPage() {
       if (s.mode === "image" && !s.imageFile) {
         setResults([]);
         setHasMore(false);
+        setLoading(false);
         return;
       }
 
@@ -249,12 +261,13 @@ export default function LibraryPage() {
       const safetySubset =
         s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length ? s.safety : undefined;
       const ratingGte = s.minRating > 0 ? s.minRating : undefined;
+      const loraList = csv(s.loras);
       const filters = {
         tags: s.tags.length ? s.tags : undefined,
         excludeTags: s.excludeTags.length ? s.excludeTags : undefined,
         modelFamily: s.modelFamily.trim() || undefined,
         checkpoint: s.checkpoint.trim() || undefined,
-        loras: csv(s.loras).length ? csv(s.loras) : undefined,
+        loras: loraList.length ? loraList : undefined,
         sourceTool: s.sourceTool.trim() || undefined,
         favorite: s.favorites || undefined,
         ratingGte,
@@ -272,6 +285,7 @@ export default function LibraryPage() {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ imageId: s.similarRef.id, filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }),
+            signal,
           });
           const j = await r.json();
           if (!r.ok) throw new Error(j.error ?? "Similarity search failed");
@@ -280,7 +294,7 @@ export default function LibraryPage() {
           const fd = new FormData();
           fd.append("file", s.imageFile);
           fd.append("options", JSON.stringify({ filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }));
-          const r = await fetch("/api/library/search/by-image", { method: "POST", body: fd });
+          const r = await fetch("/api/library/search/by-image", { method: "POST", body: fd, signal });
           const j = await r.json();
           if (!r.ok) throw new Error(j.error ?? "Image search failed");
           fresh = j.results ?? [];
@@ -309,6 +323,7 @@ export default function LibraryPage() {
               limit: pageSize,
               offset: pageOffset,
             }),
+            signal,
           });
           const j = await r.json();
           if (!r.ok) throw new Error(j.error ?? "Browse failed");
@@ -327,12 +342,16 @@ export default function LibraryPage() {
               limit: pageSize,
               offset: pageOffset,
             }),
+            signal,
           });
           const j = await r.json();
           if (!r.ok) throw new Error(j.error ?? "Search failed");
           fresh = j.results ?? [];
           more = fresh.length === pageSize;
         }
+
+        // A newer call superseded this one while we were awaiting — discard.
+        if (fetchGen.current !== gen) return;
 
         if (append) {
           pageRef.current += 1;
@@ -346,12 +365,18 @@ export default function LibraryPage() {
         } else {
           pageRef.current = 1;
           setResults(fresh);
+          // Baseline the freshness poll so it only fires for images that arrive
+          // AFTER this load — no redundant probe on the next poll tick.
+          newestIdRef.current = fresh[0]?.imageId ?? null;
         }
         setHasMore(more);
       } catch (e) {
+        if (e instanceof Error && e.name === "AbortError") return;
+        if (fetchGen.current !== gen) return;
         setError(e instanceof Error ? e.message : "Search failed");
       } finally {
-        setLoading(false);
+        // Only the current generation should clear the loading spinner.
+        if (fetchGen.current === gen) setLoading(false);
       }
     },
     [],
@@ -588,6 +613,67 @@ export default function LibraryPage() {
     }
   }, [selected]);
 
+  const bulkMove = useCallback(async (targetFolder: string) => {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBulkBusy("move");
+    setError(null);
+    setNotice(null);
+    try {
+      const { moved, failed } = await moveImages(ids, targetFolder);
+      if (moved.length > 0) {
+        setNotice(`Moved ${moved.length}/${ids.length} file${moved.length === 1 ? "" : "s"} to ${targetFolder}.`);
+      }
+      if (failed.length > 0) {
+        setError(
+          `Moved ${moved.length}/${ids.length}. ${failed.length} failed: ${failed[0].error}`,
+        );
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Move failed");
+    } finally {
+      setBulkBusy(null);
+    }
+  }, [selected]);
+
+  // Rate a single image from the lightbox. Updates the grid row immediately so
+  // the card reflects the change without a refetch.
+  const rateImage = useCallback(async (imageId: string, rating: number | null) => {
+    try {
+      const res = await fetch(`/api/library/images/${encodeURIComponent(imageId)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rating }),
+      });
+      if (res.ok) {
+        setResults((prev) =>
+          prev.map((r) => (r.imageId === imageId ? { ...r, rating } : r)),
+        );
+      }
+    } catch {
+      // silent — non-critical
+    }
+  }, []);
+
+  const fetchNotesForImage = useCallback(async (imageId: string) => {
+    try {
+      const r = await fetch(`/api/library/notes/by-image/${encodeURIComponent(imageId)}`);
+      if (!r.ok) return [];
+      const j = await r.json();
+      return Array.isArray(j) ? j : [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const createNoteForImage = useCallback(async (imageId: string, text: string) => {
+    await fetch("/api/library/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: text, blocks: {}, imageRefs: [imageId] }),
+    });
+  }, []);
+
   const findSimilar = useCallback(
     (id: string, thumbUrl: string, summary: string) => {
       const ref: SimilarRef = { id, thumbUrl, summary };
@@ -649,6 +735,7 @@ export default function LibraryPage() {
   // Ingest-job polling (independent of saved settings). System health lives on
   // its own page (/admin/health, self-polling ServiceStatusBoard).
   useEffect(() => {
+    if (!showIngest) return;
     const pollJobs = () =>
       fetch("/api/library/jobs")
         .then((r) => r.json())
@@ -657,7 +744,7 @@ export default function LibraryPage() {
     pollJobs();
     const id = setInterval(pollJobs, 3000);
     return () => clearInterval(id);
-  }, []);
+  }, [showIngest]);
 
   // First search — wait for saved settings so pagination / filter defaults
   // apply, and honour ?tags= / ?q= / ?mode= deep links (e.g. a related-tag
@@ -782,7 +869,6 @@ export default function LibraryPage() {
         // transient — try again next tick
       }
     };
-    check();
     const id = setInterval(check, 4000);
     return () => {
       alive = false;
@@ -1251,6 +1337,7 @@ export default function LibraryPage() {
             onAddTags={bulkAddTags}
             onRemoveTags={bulkRemoveTags}
             onExport={exportSelected}
+            onMove={bulkMove}
             onRequestDelete={() => setConfirmingBulk(true)}
             onConfirmDelete={deleteSelected}
             onCancelDelete={() => setConfirmingBulk(false)}
@@ -1450,6 +1537,9 @@ export default function LibraryPage() {
           onToggleFullResolution={() =>
             setKey("viewerFullResolution", !settings.viewerFullResolution)
           }
+          onRating={rateImage}
+          fetchNotes={fetchNotesForImage}
+          onCreateNote={createNoteForImage}
         />
       )}
     </div>
