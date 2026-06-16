@@ -22,15 +22,20 @@ from catalog.db import get_engine
 from catalog.schemas import (
     AssetRef,
     Collection,
+    FolderReport,
     Image,
     ImagePatch,
     ImageUpsert,
     Note,
     NoteUpsert,
     Params,
+    SafetyBreakdown,
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
+    StatsReport,
+    TagCount,
+    TagReport,
     Task,
     TaskUpsert,
 )
@@ -59,11 +64,12 @@ def upsert_image(payload: ImageUpsert) -> Image:
                 INSERT INTO images (
                     file_path, filename, sha256_hash, perceptual_hash,
                     width, height, source_tool, prompt, negative_prompt,
-                    workflow_json, metadata_json, safety
+                    workflow_json, metadata_json, safety, created_at
                 ) VALUES (
                     :file_path, :filename, :sha256, :phash,
                     :width, :height, :source_tool, :prompt, :negative,
-                    CAST(:workflow_json AS JSONB), CAST(:metadata_json AS JSONB), :safety
+                    CAST(:workflow_json AS JSONB), CAST(:metadata_json AS JSONB), :safety,
+                    :created_at
                 )
                 ON CONFLICT (sha256_hash) DO UPDATE SET
                     perceptual_hash = COALESCE(EXCLUDED.perceptual_hash, images.perceptual_hash),
@@ -103,6 +109,10 @@ def upsert_image(payload: ImageUpsert) -> Image:
                 if payload.api_prompt_json is not None
                 else None,
                 "safety": payload.safety,
+                # INSERT-only (absent from the ON CONFLICT update above) so a
+                # reindex from stored bytes — which carries no mtime — never
+                # clobbers the creation time captured on first ingest.
+                "created_at": payload.createdAt,
             },
         )
 
@@ -139,7 +149,7 @@ def get_image(sha256: str) -> Image | None:
                 """
                 SELECT id, sha256_hash, file_path, perceptual_hash, width, height,
                        source_tool, prompt, negative_prompt, rating, favorite,
-                       safety, workflow_json, metadata_json, imported_at
+                       safety, workflow_json, metadata_json, created_at, imported_at
                 FROM images WHERE sha256_hash = :sha
                 """
             ),
@@ -177,7 +187,10 @@ def get_image(sha256: str) -> Image | None:
             favorite=row["favorite"],
             safety=row["safety"],
             description=description,
-            created_at=row["imported_at"],
+            # created_at = captured file mtime; fall back to the import time for
+            # rows ingested before mtime capture existed (keeps it non-null).
+            created_at=row["created_at"] or row["imported_at"],
+            imported_at=row["imported_at"],
         )
 
 
@@ -192,9 +205,15 @@ def get_image(sha256: str) -> Image | None:
 # and LIMIT/OFFSET paging over an undefined order repeats some rows on the next
 # page and skips others. That surfaced as duplicate React keys in the grid.
 _NAME_EXPR = r"lower(regexp_replace(i.file_path, '^.*[/\\]', ''))"
+# `newest`/`oldest` order by INGESTION time (imported_at); `created_*` order by
+# the source file's CREATION time, coalescing to imported_at for rows whose mtime
+# was never captured so legacy images interleave sensibly instead of sinking last.
+_CREATED_EXPR = "COALESCE(i.created_at, i.imported_at)"
 _ORDER_BY: dict[str, str] = {
     "newest": "i.imported_at DESC, i.sha256_hash DESC",
     "oldest": "i.imported_at ASC, i.sha256_hash ASC",
+    "created_desc": f"{_CREATED_EXPR} DESC, i.sha256_hash DESC",
+    "created_asc": f"{_CREATED_EXPR} ASC, i.sha256_hash ASC",
     "rating_desc": "i.rating DESC NULLS LAST, i.imported_at DESC, i.sha256_hash DESC",
     "rating_asc": "i.rating ASC NULLS LAST, i.imported_at DESC, i.sha256_hash DESC",
     "name_asc": f"{_NAME_EXPR} ASC, i.imported_at DESC, i.sha256_hash DESC",
@@ -202,27 +221,23 @@ _ORDER_BY: dict[str, str] = {
 }
 
 
-def list_images(
+def _image_filters(
     *,
-    tags: list[str] | None = None,
-    exclude_tags: list[str] | None = None,
-    favorite: bool | None = None,
-    rating_gte: int | None = None,
-    limit: int,
-    offset: int,
-    safety: list[str] | None = None,
-    sort: str = "newest",
-) -> list[Image]:
-    """Browse the catalog with AND-combined filters and a whitelisted sort.
+    tags: list[str] | None,
+    exclude_tags: list[str] | None,
+    favorite: bool | None,
+    rating_gte: int | None,
+    safety: list[str] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the shared WHERE clause + bind params for the browse filters.
 
-    `tags` matches images carrying EVERY listed tag; `exclude_tags` drops images
-    carrying ANY of them. Tag membership uses correlated EXISTS subqueries so the
-    row set never multiplies (no JOIN/DISTINCT) and the ORDER BY can reference the
-    image columns directly. Unknown `sort` falls back to newest-first.
+    Used by both ``list_images`` (paged rows) and ``count_images`` (the matching
+    total for the report/export tooling), so the two never drift. Tag membership
+    uses correlated EXISTS subqueries so the row set never multiplies (no
+    JOIN/DISTINCT) and a count is an honest one-row-per-image tally.
     """
-    eng = get_engine()
     clauses = ["i.deleted = false"]
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    params: dict[str, Any] = {}
 
     # Include tags — image must carry EVERY requested tag (AND semantics).
     for idx, tag in enumerate(tags or []):
@@ -257,7 +272,36 @@ def list_images(
         clauses.append("i.safety = ANY(:safety)")
         params["safety"] = list(safety)
 
-    where = " AND ".join(clauses)
+    return " AND ".join(clauses), params
+
+
+def list_images(
+    *,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    favorite: bool | None = None,
+    rating_gte: int | None = None,
+    limit: int,
+    offset: int,
+    safety: list[str] | None = None,
+    sort: str = "newest",
+) -> list[Image]:
+    """Browse the catalog with AND-combined filters and a whitelisted sort.
+
+    `tags` matches images carrying EVERY listed tag; `exclude_tags` drops images
+    carrying ANY of them. Tag membership uses correlated EXISTS subqueries so the
+    row set never multiplies (no JOIN/DISTINCT) and the ORDER BY can reference the
+    image columns directly. Unknown `sort` falls back to newest-first.
+    """
+    eng = get_engine()
+    where, params = _image_filters(
+        tags=tags,
+        exclude_tags=exclude_tags,
+        favorite=favorite,
+        rating_gte=rating_gte,
+        safety=safety,
+    )
+    params.update({"limit": limit, "offset": offset})
     order_by = _ORDER_BY.get(sort, _ORDER_BY["newest"])
     with eng.connect() as conn:
         rows = conn.execute(
@@ -278,6 +322,120 @@ def list_images(
         if img is not None:
             out.append(img)
     return out
+
+
+def count_images(
+    *,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    favorite: bool | None = None,
+    rating_gte: int | None = None,
+    safety: list[str] | None = None,
+) -> int:
+    """Total images matching the same filters as ``list_images``.
+
+    Lets a report/export tool size the work set (how many pages of GET /images to
+    pull) without walking every page. Shares ``_image_filters`` with the browse
+    list so the count can never disagree with what listing returns.
+    """
+    where, params = _image_filters(
+        tags=tags,
+        exclude_tags=exclude_tags,
+        favorite=favorite,
+        rating_gte=rating_gte,
+        safety=safety,
+    )
+    eng = get_engine()
+    with eng.connect() as conn:
+        row = conn.execute(
+            text(f"SELECT count(*) AS n FROM images i WHERE {where}"), params
+        ).first()
+    return int(row[0]) if row else 0
+
+
+def suggest_tags(*, prefix: str, limit: int) -> list[str]:
+    """Tag names matching ``prefix`` (case-insensitive), most-used first.
+
+    Backs the filter autocomplete: matches on ``normalized_name`` (so "red eyes"
+    and "red_eyes" behave the same) and ranks by how many distinct images carry
+    each tag, so common tags surface first. An empty prefix returns the globally
+    most-used tags. The prefix is escaped so a literal ``_``/``%`` in a tag name
+    is not treated as a LIKE wildcard.
+    """
+    eng = get_engine()
+    norm = _normalize_tag(prefix)
+    params: dict[str, Any] = {"limit": limit}
+    where = ""
+    if norm:
+        escaped = norm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = "WHERE t.normalized_name LIKE :pfx ESCAPE '\\'"
+        params["pfx"] = f"{escaped}%"
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT t.name
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                {where}
+                GROUP BY t.id, t.name, t.normalized_name
+                ORDER BY COUNT(DISTINCT it.image_id) DESC, t.normalized_name ASC
+                LIMIT :limit
+                """
+            ),
+            params,
+        ).all()
+    return [r[0] for r in rows]
+
+
+def tag_report(*, prefix: str = "", limit: int, offset: int) -> TagReport:
+    """Full tag inventory with per-tag image counts, paged.
+
+    Unlike ``suggest_tags`` (a capped autocomplete that returns bare names), this
+    is the report surface: every tag, its display + normalized name, and how many
+    distinct non-deleted images carry it, ordered most-used first. ``total`` is
+    the count of tags matching the (optional) prefix so a tool can page the whole
+    inventory. The prefix is escaped so a literal ``_``/``%`` is not a wildcard.
+    """
+    eng = get_engine()
+    norm = _normalize_tag(prefix)
+    where = ""
+    bind: dict[str, Any] = {}
+    if norm:
+        escaped = norm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where = "WHERE t.normalized_name LIKE :pfx ESCAPE '\\'"
+        bind["pfx"] = f"{escaped}%"
+    with eng.connect() as conn:
+        total = conn.execute(
+            text(f"SELECT count(*) FROM tags t {where}"), bind
+        ).scalar_one()
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT t.name, t.normalized_name,
+                       count(DISTINCT it.image_id) FILTER (
+                           WHERE i.id IS NOT NULL AND i.deleted = false
+                       ) AS image_count
+                FROM tags t
+                LEFT JOIN image_tags it ON it.tag_id = t.id
+                LEFT JOIN images i ON i.id = it.image_id
+                {where}
+                GROUP BY t.id, t.name, t.normalized_name
+                ORDER BY image_count DESC, t.normalized_name ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {**bind, "limit": limit, "offset": offset},
+        ).mappings().all()
+    items = [
+        TagCount(
+            name=r["name"],
+            normalized_name=r["normalized_name"],
+            image_count=int(r["image_count"] or 0),
+        )
+        for r in rows
+    ]
+    return TagReport(total=int(total), items=items)
 
 
 def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
@@ -951,6 +1109,27 @@ def list_folders() -> list[SourceFolder]:
         return [_folder_from_row(conn, r) for r in rows]
 
 
+def folder_reports() -> list[FolderReport]:
+    """Per-folder coverage report: path, label, and image/labeled/unlabeled
+    counts for every registered source folder.
+
+    A trimmed projection of ``list_folders`` (drops the scan-config/scan-state
+    noise) so a reporting tool gets just the where-are-my-images-and-are-they-
+    labeled breakdown. Reuses the same derived counts, so it never disagrees with
+    the folders admin view.
+    """
+    return [
+        FolderReport(
+            path=f.path,
+            label=f.label,
+            image_count=f.image_count,
+            labeled_count=f.labeled_count,
+            unlabeled_count=f.unlabeled_count,
+        )
+        for f in list_folders()
+    ]
+
+
 def get_folder(folder_id: str) -> SourceFolder | None:
     eng = get_engine()
     with eng.connect() as conn:
@@ -1011,6 +1190,76 @@ def delete_folder(folder_id: str) -> bool:
             text("DELETE FROM source_folders WHERE id = :id"), {"id": folder_id}
         )
         return res.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# library stats — the aggregate report (backs gateway GET /stats).
+# ---------------------------------------------------------------------------
+def library_stats() -> StatsReport:
+    """One-shot aggregate counts over the catalog (the report summary).
+
+    All counts exclude soft-deleted images. ``safety`` breaks the live images
+    down by content-safety class (``unclassified`` = NULL safety); ``labeled`` /
+    ``unlabeled`` split them by whether a deedlit.labelagent description exists.
+    Computed in a single round-trip of small aggregate queries.
+    """
+    eng = get_engine()
+    with eng.connect() as conn:
+        images = conn.execute(
+            text("SELECT count(*) FROM images WHERE deleted = false")
+        ).scalar_one()
+        favorites = conn.execute(
+            text("SELECT count(*) FROM images WHERE deleted = false AND favorite = true")
+        ).scalar_one()
+        tags = conn.execute(text("SELECT count(*) FROM tags")).scalar_one()
+        collections = conn.execute(text("SELECT count(*) FROM collections")).scalar_one()
+        notes = conn.execute(text("SELECT count(*) FROM notes")).scalar_one()
+        folders = conn.execute(text("SELECT count(*) FROM source_folders")).scalar_one()
+
+        # Content-safety histogram over live images; NULL -> unclassified.
+        safety_rows = conn.execute(
+            text(
+                """
+                SELECT COALESCE(safety, 'unclassified') AS klass, count(*) AS n
+                FROM images WHERE deleted = false
+                GROUP BY COALESCE(safety, 'unclassified')
+                """
+            )
+        ).mappings().all()
+        counts = {r["klass"]: int(r["n"]) for r in safety_rows}
+        safety = SafetyBreakdown(
+            sfw=counts.get("sfw", 0),
+            nsfw=counts.get("nsfw", 0),
+            explicit=counts.get("explicit", 0),
+            unclassified=counts.get("unclassified", 0),
+        )
+
+        # Labeled = has a labelagent description; the rest of the live set is the
+        # backfill work (mirrors list_unlabeled_sha256 / folder coverage).
+        labeled = conn.execute(
+            text(
+                """
+                SELECT count(*) FROM images i
+                WHERE i.deleted = false AND EXISTS (
+                    SELECT 1 FROM image_descriptions d
+                    WHERE d.image_id = i.id AND d.provider = :provider
+                )
+                """
+            ),
+            {"provider": _DESCRIPTION_PROVIDER},
+        ).scalar_one()
+
+    return StatsReport(
+        images=int(images),
+        tags=int(tags),
+        collections=int(collections),
+        notes=int(notes),
+        folders=int(folders),
+        favorites=int(favorites),
+        labeled=int(labeled),
+        unlabeled=max(int(images) - int(labeled), 0),
+        safety=safety,
+    )
 
 
 # ---------------------------------------------------------------------------

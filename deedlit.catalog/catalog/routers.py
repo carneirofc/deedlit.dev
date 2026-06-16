@@ -9,7 +9,9 @@ from catalog.schemas import (
     CollectionImages,
     CollectionRename,
     CollectionUpsert,
+    CountResult,
     FavoriteBody,
+    FolderReport,
     Image,
     ImagePatch,
     ImageUpsert,
@@ -19,6 +21,8 @@ from catalog.schemas import (
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
+    StatsReport,
+    TagReport,
     Task,
     TaskUpsert,
 )
@@ -61,8 +65,55 @@ def list_images(
     )
 
 
-# Registered BEFORE /images/{sha256}: "unlabeled" is not a 64-hex sha, so the
-# parameterized route would 422 it. The literal path must win.
+@router.get("/tags", response_model=list[str])
+def suggest_tags(
+    prefix: str = Query(default=""),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> list[str]:
+    """Tag-name autocomplete: names matching ``prefix``, most-used first."""
+    return repository.suggest_tags(prefix=prefix, limit=limit)
+
+
+@router.get("/tags/report", response_model=TagReport)
+def tags_report(
+    prefix: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> TagReport:
+    """Full tag inventory with per-tag image counts, paged (report surface).
+
+    Unlike /tags (a capped autocomplete of bare names) this returns every tag
+    plus how many distinct live images carry it, most-used first, with a ``total``
+    so a tool can page the whole inventory.
+    """
+    return repository.tag_report(prefix=prefix, limit=limit, offset=offset)
+
+
+# Registered BEFORE /images/{sha256}: a literal segment ("count"/"unlabeled") is
+# not a 64-hex sha, so the parameterized route would 422 it. The literal wins.
+@router.get("/images/count", response_model=CountResult)
+def count_images(
+    tag: list[str] | None = Query(default=None),
+    exclude_tag: list[str] | None = Query(default=None),
+    favorite: bool | None = Query(default=None),
+    rating_gte: int | None = Query(default=None, ge=0, le=5),
+    safety: list[str] | None = Query(default=None),
+) -> CountResult:
+    """Total images matching the same filters as GET /images (no sort/paging).
+
+    Lets a report/export tool size the work set before paging through /images.
+    """
+    return CountResult(
+        count=repository.count_images(
+            tags=tag,
+            exclude_tags=exclude_tag,
+            favorite=favorite,
+            rating_gte=rating_gte,
+            safety=safety,
+        )
+    )
+
+
 @router.get("/images/unlabeled")
 def list_unlabeled(
     limit: int = Query(default=500), offset: int = Query(default=0)
@@ -291,3 +342,22 @@ def read_task(id: str = Path(...)) -> Task:
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+# --- reports ---------------------------------------------------------------
+# Read-only extraction surfaces for building tools on top of the platform. The
+# per-image data (filepath/tags/params/...) already rides GET /images; these add
+# the aggregates: library summary, full tag inventory, per-folder coverage.
+
+
+@router.get("/stats", response_model=StatsReport)
+def stats() -> StatsReport:
+    """Aggregate library counts (images/tags/collections/notes/folders, content-
+    safety breakdown, labeled vs unlabeled). Backs the gateway GET /stats."""
+    return repository.library_stats()
+
+
+@router.get("/reports/folders", response_model=list[FolderReport])
+def reports_folders() -> list[FolderReport]:
+    """Per-folder coverage: path + label + image/labeled/unlabeled counts."""
+    return repository.folder_reports()

@@ -46,6 +46,11 @@ class ImageUpsert(BaseModel):
     workflow_json: dict[str, Any] | None = None
     api_prompt_json: dict[str, Any] | None = None
     safety: Safety | None = None
+    # Original on-disk creation time of the source file (ingest captures the
+    # file mtime). Distinct from ``imported_at`` (when the catalog first saw it):
+    # a bulk import of old images stamps a recent import but an old creation. Set
+    # INSERT-only by the catalog, so a later reindex (which has no mtime) keeps it.
+    createdAt: datetime | None = None
     # AI-generated description (deedlit.labelagent). An expensive vision-LLM
     # computation, so it is PERSISTED here (not just in the search payload) to be
     # retrievable/viewable without re-running the model. Stored in the dedicated
@@ -57,7 +62,11 @@ class ImageUpsert(BaseModel):
 class Image(ImageUpsert):
     rating: int | None = None
     favorite: bool = False
+    # Best-known creation time: the captured file mtime, falling back to the
+    # import time for rows ingested before mtime capture existed.
     created_at: datetime | None = None
+    # When the catalog first recorded the image (ingestion date).
+    imported_at: datetime | None = None
 
 
 class ImagePatch(BaseModel):
@@ -68,6 +77,66 @@ class ImagePatch(BaseModel):
     # Power-user / debug edits (#30): correct a bad extracted prompt in place.
     prompt: str | None = None
     negative: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# report DTOs — read-only extraction surfaces for external tooling (#report).
+# Image rows already carry filepath/tags/params/etc via the Image schema; these
+# add the aggregates a reporting tool needs: a sized total, the full tag
+# inventory with counts, the library summary, and per-folder coverage.
+# ---------------------------------------------------------------------------
+class CountResult(BaseModel):
+    """The total number of images matching a filter set (GET /images/count)."""
+
+    count: int
+
+
+class TagCount(BaseModel):
+    name: str
+    normalized_name: str
+    image_count: int
+
+
+class TagReport(BaseModel):
+    """Full tag inventory with per-tag image counts, paged. ``total`` is every
+    tag matching the prefix so a tool can page the whole set."""
+
+    total: int
+    items: list[TagCount] = Field(default_factory=list)
+
+
+class SafetyBreakdown(BaseModel):
+    """Live images per content-safety class; ``unclassified`` = NULL safety."""
+
+    sfw: int = 0
+    nsfw: int = 0
+    explicit: int = 0
+    unclassified: int = 0
+
+
+class StatsReport(BaseModel):
+    """Aggregate library counts (GET /stats). All counts exclude soft-deleted
+    images; ``labeled``/``unlabeled`` split by AI-description coverage."""
+
+    images: int = 0
+    tags: int = 0
+    collections: int = 0
+    notes: int = 0
+    folders: int = 0
+    favorites: int = 0
+    labeled: int = 0
+    unlabeled: int = 0
+    safety: SafetyBreakdown = Field(default_factory=SafetyBreakdown)
+
+
+class FolderReport(BaseModel):
+    """Per-folder coverage (path + label + derived image/labeled/unlabeled)."""
+
+    path: str
+    label: str | None = None
+    image_count: int = 0
+    labeled_count: int = 0
+    unlabeled_count: int = 0
 
 
 class RatingBody(BaseModel):

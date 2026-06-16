@@ -294,6 +294,145 @@ def test_list_by_tag(client) -> None:
     assert [i["sha256"] for i in listed] == [sha]
 
 
+def test_created_date_sort_differs_from_ingestion(client) -> None:
+    # Ingestion order a -> b -> c -> d (imported_at increasing). Creation times
+    # are deliberately REVERSED for a/b/c (a is the newest creation), so a sort by
+    # creation date must NOT match the ingestion order. `d` carries no createdAt,
+    # so it falls back to its (latest) import time.
+    a, b, c, d = _sha(), _sha(), _sha(), _sha()
+    client.post("/images", json={"sha256": a, "createdAt": "2024-03-01T00:00:00+00:00"})
+    client.post("/images", json={"sha256": b, "createdAt": "2024-02-01T00:00:00+00:00"})
+    client.post("/images", json={"sha256": c, "createdAt": "2024-01-01T00:00:00+00:00"})
+    client.post("/images", json={"sha256": d})  # no creation time -> uses import time
+
+    def shas(sort):
+        return [i["sha256"] for i in client.get("/images", params={"sort": sort}).json()]
+
+    # Ingestion: newest import first. d imported last, then c, b, a.
+    assert shas("newest") == [d, c, b, a]
+    # Creation: a (Mar) > b (Feb) > c (Jan); d falls back to its import time, the
+    # most recent of all, so it leads. Proves creation != ingestion ordering.
+    assert shas("created_desc") == [d, a, b, c]
+    assert shas("created_asc") == [c, b, a, d]
+
+
+def test_created_at_survives_reindex_without_mtime(client) -> None:
+    # First ingest captures a creation time; a later reindex (no createdAt) must
+    # not wipe it — created_at is INSERT-only.
+    sha = _sha()
+    client.post("/images", json={"sha256": sha, "createdAt": "2022-05-05T12:00:00+00:00"})
+    client.post("/images", json={"sha256": sha, "prompt": "reindexed"})  # no createdAt
+    got = client.get(f"/images/{sha}").json()
+    assert got["created_at"].startswith("2022-05-05T12:00:00")
+
+
+def test_suggest_tags_prefix_and_usage_ranking(client) -> None:
+    # castle x3, cat x2, cathedral x1, dog x1 — usage drives the order.
+    for tags in (
+        ["castle", "cat", "cathedral", "dog"],
+        ["castle", "cat"],
+        ["castle"],
+    ):
+        client.post("/images", json={"sha256": _sha(), "tags": tags})
+
+    # Prefix match, ranked by how many images carry each tag.
+    assert client.get("/tags", params={"prefix": "cat"}).json() == ["cat", "cathedral"]
+    # "cas" only matches castle.
+    assert client.get("/tags", params={"prefix": "cas"}).json() == ["castle"]
+    # Empty prefix returns the globally most-used tags first.
+    assert client.get("/tags", params={"prefix": ""}).json()[0] == "castle"
+    # No match -> empty list.
+    assert client.get("/tags", params={"prefix": "zzz_nope"}).json() == []
+
+
+# --- reports: count / tag inventory / stats / folder coverage --------------
+
+
+def test_images_count_matches_filters(client) -> None:
+    # Fresh DB per test (conftest), so counts are exact.
+    a = _make_image(client, filepath="/c/a.png", tags=["alpha", "shared"], rating=5)
+    _make_image(client, filepath="/c/b.png", tags=["beta", "shared"], rating=1)
+    _make_image(client, filepath="/c/c.png", tags=["shared"])
+
+    def count(params):
+        return client.get("/images/count", params=params).json()["count"]
+
+    assert count({}) == 3
+    assert count({"tag": "shared"}) == 3
+    # AND semantics: only the image carrying both shared AND alpha.
+    assert count([("tag", "shared"), ("tag", "alpha")]) == 1
+    assert count({"rating_gte": 3}) == 1
+    assert count({"exclude_tag": "beta"}) == 2
+    # The count agrees with what listing returns under the same filter.
+    listed = client.get("/images", params={"tag": "alpha"}).json()
+    assert count({"tag": "alpha"}) == len(listed) == 1
+    assert listed[0]["sha256"] == a
+
+
+def test_tags_report_counts_total_and_paging(client) -> None:
+    # castle x3, cat x2, dog x1 — usage drives both the counts and the order.
+    for tags in (["castle", "cat", "dog"], ["castle", "cat"], ["castle"]):
+        client.post("/images", json={"sha256": _sha(), "tags": tags})
+
+    body = client.get("/tags/report").json()
+    assert body["total"] == 3  # castle, cat, dog
+    counts = {t["name"]: t["image_count"] for t in body["items"]}
+    assert counts == {"castle": 3, "cat": 2, "dog": 1}
+    # Most-used first.
+    assert [t["name"] for t in body["items"]] == ["castle", "cat", "dog"]
+    assert body["items"][0]["normalized_name"] == "castle"
+
+    # Prefix narrows the inventory (and its total).
+    ca = client.get("/tags/report", params={"prefix": "ca"}).json()
+    assert ca["total"] == 2
+    assert {t["name"] for t in ca["items"]} == {"castle", "cat"}
+
+    # limit/offset pages the whole inventory; total stays the full count.
+    page = client.get("/tags/report", params={"limit": 1, "offset": 1}).json()
+    assert page["total"] == 3
+    assert [t["name"] for t in page["items"]] == ["cat"]
+
+
+def test_stats_aggregate_counts(client) -> None:
+    s1, s2, s3 = _sha(), _sha(), _sha()
+    client.post("/images", json={"sha256": s1, "safety": "sfw", "tags": ["x"], "description": "d"})
+    client.post("/images", json={"sha256": s2, "safety": "nsfw"})
+    client.post("/images", json={"sha256": s3})  # unclassified, unlabeled
+    client.put(f"/images/{s1}/favorite", json={"favorite": True})
+    client.post("/collections", json={"name": "c1", "images": [s1]})
+    client.post("/notes", json={"blocks": {"time": 1, "blocks": []}, "imageRefs": [s1]})
+    client.post("/folders", json={"path": "/lib/statscov"})
+
+    st = client.get("/stats").json()
+    assert st["images"] == 3
+    assert st["tags"] == 1
+    assert st["collections"] == 1
+    assert st["notes"] == 1
+    assert st["folders"] == 1
+    assert st["favorites"] == 1
+    # Only s1 carries a labelagent description.
+    assert st["labeled"] == 1
+    assert st["unlabeled"] == 2
+    assert st["safety"] == {"sfw": 1, "nsfw": 1, "explicit": 0, "unclassified": 1}
+
+
+def test_reports_folders_coverage(client) -> None:
+    client.post("/folders", json={"path": "/lib/reportcov", "label": "Report"})
+    s1, s2 = _sha(), _sha()
+    client.post("/images", json={"sha256": s1, "filepath": "/lib/reportcov/a.png", "description": "d"})
+    client.post("/images", json={"sha256": s2, "filepath": "/lib/reportcov/b.png"})
+
+    rep = client.get("/reports/folders").json()
+    row = next(r for r in rep if r["path"] == "/lib/reportcov")
+    assert row["label"] == "Report"
+    assert row["image_count"] == 2
+    assert row["labeled_count"] == 1
+    assert row["unlabeled_count"] == 1
+    # Trimmed projection: no scan-config/scan-state noise.
+    assert "scan_interval_seconds" not in row
+    assert "last_scan_at" not in row
+
+
 def test_put_get_thumbnail_blob(client) -> None:
     sha = _sha()
     payload = b"fake-webp-bytes-\x00\x01\x02"
