@@ -34,9 +34,12 @@ def _env_bool(name: str) -> bool:
 def runtime() -> dict[str, Any]:
     """The effective config = env defaults with any live overrides applied."""
     return {
-        # How many files a folder scan fast-paths at once (inline mode).
+        # How many files a folder scan fast-paths at once (inline mode). The fast
+        # path is now natively async (pooled HTTP + threaded pixel work), so the
+        # default is higher than the old thread-bound value — many files overlap
+        # their metadata/catalog round-trips with only a handful of sockets.
         "ingest_concurrency": max(
-            1, int(_overrides.get("ingest_concurrency", _env_int("INGEST_CONCURRENCY", 8)))
+            1, int(_overrides.get("ingest_concurrency", _env_int("INGEST_CONCURRENCY", 32)))
         ),
         # Route the scan through the `ingest` queue (cross-process pool) instead.
         "ingest_via_queue": bool(_overrides.get("ingest_via_queue", _env_bool("INGEST_VIA_QUEUE"))),

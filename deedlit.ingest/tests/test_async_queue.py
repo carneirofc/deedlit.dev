@@ -166,7 +166,7 @@ def test_ingest_fast_writes_catalog_record_and_thumbnail(monkeypatch):
     )
 
     data = _png_bytes((10, 20, 30))
-    sha = pipeline.ingest_fast(data, "x.png", "/lib/x.png")
+    sha = asyncio.run(pipeline.ingest_fast(data, "x.png", "/lib/x.png"))
     assert sha == pipeline.compute_sha256(data)
 
     # catalog record POST first, carrying the source filepath; AI fields are None
@@ -192,7 +192,7 @@ def test_fetch_image_bytes_reads_from_disk_via_filepath(tmp_path, monkeypatch):
     p.write_bytes(data)
     monkeypatch.setattr(pipeline, "fetch_image_filepath", lambda sha256: str(p))
 
-    out, mime = pipeline.fetch_image_bytes("a" * 64)
+    out, mime = asyncio.run(pipeline.fetch_image_bytes("a" * 64))
     assert out == data
     assert mime == "image/png"
 
@@ -200,7 +200,7 @@ def test_fetch_image_bytes_reads_from_disk_via_filepath(tmp_path, monkeypatch):
 def test_fetch_image_bytes_raises_without_filepath(monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_image_filepath", lambda sha256: None)
     with pytest.raises(FileNotFoundError):
-        pipeline.fetch_image_bytes("a" * 64)
+        asyncio.run(pipeline.fetch_image_bytes("a" * 64))
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +278,7 @@ def test_folder_ingest_completes_when_broker_is_down(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 class _Err:
     status_code = 500
+    request = None
 
     def raise_for_status(self):
         raise pipeline.httpx.HTTPStatusError("boom", request=None, response=None)
@@ -286,18 +287,34 @@ class _Err:
         return {}
 
 
+class _FakeClient:
+    """Minimal stand-in for the pooled httpx.AsyncClient (async verbs)."""
+
+    def __init__(self, *, post=None, put=None, get=None):
+        self._post, self._put, self._get = post, put, get
+
+    async def post(self, url, **kw):
+        return self._post(url, **kw)
+
+    async def put(self, url, **kw):
+        return self._put(url, **kw)
+
+    async def get(self, url, **kw):
+        return self._get(url, **kw)
+
+
 def test_describe_image_disabled_returns_empty(monkeypatch):
     monkeypatch.setattr(pipeline, "LABELAGENT_URL", "")
-    assert pipeline.describe_image(b"x", "x.png", "image/png") == {}
+    assert asyncio.run(pipeline.describe_image(b"x", "x.png", "image/png")) == {}
 
 
 def test_describe_image_raises_on_http_error(monkeypatch):
     # Strict failure mode: a labelagent error PROPAGATES so the broker can
     # retry / dead-letter (no silent degrade now that only the label task calls it).
     monkeypatch.setattr(pipeline, "LABELAGENT_URL", "http://labelagent")
-    monkeypatch.setattr(pipeline.httpx, "post", lambda *a, **k: _Err())
+    monkeypatch.setattr(pipeline, "get_client", lambda: _FakeClient(post=lambda url, **k: _Err()))
     with pytest.raises(pipeline.httpx.HTTPStatusError):
-        pipeline.describe_image(b"x", "x.png", "image/png")
+        asyncio.run(pipeline.describe_image(b"x", "x.png", "image/png"))
 
 
 def test_label_image_patches_catalog_and_merges_tags(monkeypatch):
@@ -322,7 +339,7 @@ def test_label_image_patches_catalog_and_merges_tags(monkeypatch):
         pipeline, "_post_with_retry", lambda url, body, *a, **k: posts.append((url, body))
     )
 
-    changed = pipeline.label_image("a" * 64)
+    changed = asyncio.run(pipeline.label_image("a" * 64))
     assert changed is True
     url, rec = posts[0]
     assert url == f"{pipeline.CATALOG_URL}/images"
@@ -342,7 +359,7 @@ def test_label_image_is_noop_when_describe_empty(monkeypatch):
     monkeypatch.setattr(pipeline, "describe_image", lambda d, f, m, prompt_hint=None: {})
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda *a, **k: posts.append(a))
 
-    assert pipeline.label_image("a" * 64) is False
+    assert asyncio.run(pipeline.label_image("a" * 64)) is False
     assert posts == []  # nothing patched -> no catalog write
 
 

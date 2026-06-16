@@ -8,6 +8,7 @@ All outbound HTTP is monkeypatched so the suite stays offline/deterministic.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 
@@ -71,7 +72,7 @@ def test_process_file_emits_stages_in_order(monkeypatch):
     monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [], "values": []})
 
     stages: list[str] = []
-    pipeline.process_file(_png_bytes(), "img.png", None, stages.append)
+    asyncio.run(pipeline.process_file(_png_bytes(), "img.png", None, stages.append))
     assert stages == ["hash", "metadata", "vision:dense", "vision:sparse"]
 
 
@@ -81,7 +82,7 @@ def test_fan_out_writes_emits_stages_in_order(monkeypatch):
 
     rec = pipeline.IngestRecord(sha256="a" * 64, record={}, point={}, edges={}, thumbnail=b"x")
     stages: list[str] = []
-    pipeline.fan_out_writes(rec, stages.append)
+    asyncio.run(pipeline.fan_out_writes(rec, stages.append))
     assert stages == ["catalog", "search", "graph"]
 
 

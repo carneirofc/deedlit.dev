@@ -297,12 +297,18 @@ async def publish_post_ingest(sha256: str, *, parent_op_id: str | None = None) -
     embed.dense + embed.sparse (both fan into index.search) + index.graph + label.
     Errors PROPAGATE (unlike the producer's best-effort fan-out) so the caller —
     the ``ingest`` queue handler — fails and the broker retries the whole ingest
-    task, which re-runs the idempotent fast path and re-publishes these.
+    task, which re-runs the idempotent fast path and re-publishes these. The four
+    are independent, so they are published CONCURRENTLY (gather propagates the
+    first failure).
     """
-    await publish_embed_dense_task(sha256, parent_op_id=parent_op_id)
-    await publish_embed_sparse_task(sha256, parent_op_id=parent_op_id)
-    await publish_index_graph_task(sha256, parent_op_id=parent_op_id)
-    await publish_label_task(sha256, parent_op_id=parent_op_id)
+    import asyncio
+
+    await asyncio.gather(
+        publish_embed_dense_task(sha256, parent_op_id=parent_op_id),
+        publish_embed_sparse_task(sha256, parent_op_id=parent_op_id),
+        publish_index_graph_task(sha256, parent_op_id=parent_op_id),
+        publish_label_task(sha256, parent_op_id=parent_op_id),
+    )
 
 
 # ---------------------------------------------------------------------------

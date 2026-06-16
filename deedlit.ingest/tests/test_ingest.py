@@ -6,6 +6,7 @@ built with Pillow.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -344,7 +345,7 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     with Image.open(io.BytesIO(big_thumb)) as im:
         assert min(im.size) == 100
 
-    rec = pipeline.process_file(data, "img.png", source_path="/library/sub/img.png")
+    rec = asyncio.run(pipeline.process_file(data, "img.png", source_path="/library/sub/img.png"))
     assert rec.sha256 == pipeline.compute_sha256(data)
     assert rec.record["phash"] == phash
     assert rec.record["width"] == 32 and rec.record["height"] == 32
@@ -384,13 +385,13 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
 # The index task supplies these from the catalog after a label task patches it.
 # ---------------------------------------------------------------------------
 def test_process_file_folds_catalog_truth_into_tags_sparse_and_payload(mock_outbound):
-    rec = pipeline.process_file(
+    rec = asyncio.run(pipeline.process_file(
         _png_bytes((10, 20, 30), size=16),
         "img.png",
         description="A red-armored knight standing in a misty forest.",
         safety="sfw",
         tags=["red", "knight", "armor", "forest"],
-    )
+    ))
 
     # Passed-in (catalog-truth) tags flow everywhere, replacing the extracted set.
     merged = ["red", "knight", "armor", "forest"]
@@ -428,6 +429,19 @@ class _FakeResp:
             raise pipeline.httpx.HTTPStatusError("err", request=None, response=None)
 
 
+class _FakeClient:
+    """Async stand-in for the pooled httpx.AsyncClient used by the fan-out."""
+
+    def __init__(self, *, post=None, put=None):
+        self._post, self._put = post, put
+
+    async def post(self, url, json=None, **kw):
+        return self._post(url, json=json)
+
+    async def put(self, url, content=None, headers=None, **kw):
+        return self._put(url, content=content, headers=headers)
+
+
 def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
     """The fan-out hits the OWNING services directly (#17), not the TS app:
 
@@ -441,7 +455,7 @@ def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
     calls: list[tuple[str, str]] = []  # (method, url)
     attempts = {"images": 0}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(url, json=None):
         calls.append(("POST", url))
         if url == f"{pipeline.CATALOG_URL}/images":
             attempts["images"] += 1
@@ -449,12 +463,11 @@ def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
                 return _FakeResp(500)  # transient failure, then retry succeeds
         return _FakeResp(200)
 
-    def fake_put(url, content=None, headers=None, timeout=None):
+    def fake_put(url, content=None, headers=None):
         calls.append(("PUT", url))
         return _FakeResp(200)
 
-    monkeypatch.setattr(pipeline.httpx, "post", fake_post)
-    monkeypatch.setattr(pipeline.httpx, "put", fake_put)
+    monkeypatch.setattr(pipeline, "get_client", lambda: _FakeClient(post=fake_post, put=fake_put))
 
     rec = pipeline.IngestRecord(
         sha256=sha,
@@ -463,7 +476,7 @@ def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
         edges={"sha256": sha},
         thumbnail=b"webp-bytes",
     )
-    pipeline.fan_out_writes(rec)
+    asyncio.run(pipeline.fan_out_writes(rec))
 
     urls = [u for _m, u in calls]
     images_idx = [i for i, u in enumerate(urls) if u == f"{pipeline.CATALOG_URL}/images"]
@@ -486,14 +499,12 @@ def test_fanout_skips_thumbnail_blob_when_absent(monkeypatch):
     sha = "c" * 64
     calls: list[str] = []
     monkeypatch.setattr(
-        pipeline.httpx,
-        "post",
-        lambda url, json=None, timeout=None: (calls.append(url) or _FakeResp(200)),
-    )
-    monkeypatch.setattr(
-        pipeline.httpx,
-        "put",
-        lambda url, content=None, headers=None, timeout=None: (calls.append(url) or _FakeResp(200)),
+        pipeline,
+        "get_client",
+        lambda: _FakeClient(
+            post=lambda url, json=None: (calls.append(url) or _FakeResp(200)),
+            put=lambda url, content=None, headers=None: (calls.append(url) or _FakeResp(200)),
+        ),
     )
 
     rec = pipeline.IngestRecord(
@@ -503,7 +514,7 @@ def test_fanout_skips_thumbnail_blob_when_absent(monkeypatch):
         edges={"sha256": sha},
         thumbnail=None,
     )
-    pipeline.fan_out_writes(rec)
+    asyncio.run(pipeline.fan_out_writes(rec))
 
     assert f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail" not in calls
     assert calls == [
@@ -515,10 +526,11 @@ def test_fanout_skips_thumbnail_blob_when_absent(monkeypatch):
 
 def test_fanout_raises_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(
-        pipeline.httpx, "post", lambda url, json=None, timeout=None: _FakeResp(503)
+        pipeline, "get_client",
+        lambda: _FakeClient(post=lambda url, json=None: _FakeResp(503)),
     )
     rec = pipeline.IngestRecord(
         sha256="b" * 64, record={}, point={}, edges={}, thumbnail=None
     )
     with pytest.raises(pipeline.httpx.HTTPStatusError):
-        pipeline.fan_out_writes(rec)
+        asyncio.run(pipeline.fan_out_writes(rec))

@@ -44,8 +44,8 @@ async def _publish_stage_best_effort(
             "%s publish failed for %s (%s); a sweep will re-enqueue", queue, sha256[:12], exc
         )
         return False
-    await asyncio.to_thread(
-        ledger.record_task, sha256, queue, "queued", None, None, parent_op_id
+    await pipeline.maybe_await(
+        ledger.record_task(sha256, queue, "queued", None, None, parent_op_id)
     )
     return True
 
@@ -114,11 +114,11 @@ async def _publish_reproject_best_effort(sha256: str, parent_op_id: str | None =
     set. Returns True only when all three enqueue, so the bulk job's ``failed``
     count reflects a broker hiccup. Does NOT re-label (that is label-backfill).
     """
-    results = [
-        await _publish_embed_dense_best_effort(sha256, parent_op_id),
-        await _publish_embed_sparse_best_effort(sha256, parent_op_id),
-        await _publish_index_graph_best_effort(sha256, parent_op_id),
-    ]
+    results = await asyncio.gather(
+        _publish_embed_dense_best_effort(sha256, parent_op_id),
+        _publish_embed_sparse_best_effort(sha256, parent_op_id),
+        _publish_index_graph_best_effort(sha256, parent_op_id),
+    )
     return all(results)
 
 
@@ -128,12 +128,15 @@ async def _publish_post_ingest_best_effort(sha256: str, parent_op_id: str | None
     Fans out the four downstream stages — embed.dense + embed.sparse (which both
     fan in to index.search), index.graph, and label. Each is best-effort: a broker
     hiccup leaves the image cataloged-but-unprojected, and reconcile (embed/index)
-    + label-backfill re-enqueue once the broker returns.
+    + label-backfill re-enqueue once the broker returns. The four are independent,
+    so they are published CONCURRENTLY.
     """
-    await _publish_embed_dense_best_effort(sha256, parent_op_id)
-    await _publish_embed_sparse_best_effort(sha256, parent_op_id)
-    await _publish_index_graph_best_effort(sha256, parent_op_id)
-    await _publish_label_best_effort(sha256, parent_op_id)
+    await asyncio.gather(
+        _publish_embed_dense_best_effort(sha256, parent_op_id),
+        _publish_embed_sparse_best_effort(sha256, parent_op_id),
+        _publish_index_graph_best_effort(sha256, parent_op_id),
+        _publish_label_best_effort(sha256, parent_op_id),
+    )
 
 
 def _now_iso() -> str:
@@ -507,19 +510,19 @@ class JobStore:
             job.status = CANCELLED
             return
         sha256 = job.sha256 or ""
-        data, mime = await asyncio.to_thread(pipeline.fetch_image_bytes, sha256)
+        data, mime = await pipeline.maybe_await(pipeline.fetch_image_bytes(sha256))
         filename = f"{sha256}{_ext_for_mime(mime)}"
         # Backfill the source path from catalog so the re-projected search
         # payload keeps the image's file identity (see pipeline.reindex_image).
-        source_path = await asyncio.to_thread(pipeline.fetch_image_filepath, sha256)
+        source_path = await pipeline.maybe_await(pipeline.fetch_image_filepath(sha256))
         if job.cancel_requested:
             job.status = CANCELLED
             return
         on_stage = job.stage_callback()
-        rec = await asyncio.to_thread(
-            pipeline.process_file, data, filename, source_path, on_stage
+        rec = await pipeline.maybe_await(
+            pipeline.process_file(data, filename, source_path, on_stage)
         )
-        await asyncio.to_thread(pipeline.fan_out_writes, rec, on_stage)
+        await pipeline.maybe_await(pipeline.fan_out_writes(rec, on_stage))
         self._seen_sha256.add(rec.sha256)
         job.progress.done += 1
         job.status = COMPLETED
@@ -550,21 +553,26 @@ class JobStore:
     async def _run_bulk_index(self, job: Job) -> None:
         """Re-publish the projection stages for every cataloged image (ADR 0002).
 
-        Progress counts images enqueued; cancellation is honoured between
-        publishes. Best-effort publish: a broker hiccup increments ``failed`` but
-        does not abort the sweep.
+        Progress counts images enqueued; cancellation is honoured cooperatively.
+        Best-effort publish: a broker hiccup increments ``failed`` but does not
+        abort the sweep. Images are reprojected with bounded concurrency so a large
+        catalog fans out fast instead of one publish at a time.
         """
         shas = await asyncio.to_thread(pipeline.list_catalog_sha256)
         job.progress.total = len(shas)
-        for sha in shas:
-            if job.cancel_requested:
-                job.status = CANCELLED
-                return
-            if await _publish_reproject_best_effort(sha, parent_op_id=job.id):
-                job.progress.done += 1
-            else:
-                job.progress.failed += 1
-        job.status = COMPLETED
+        sem = asyncio.Semaphore(ingest_concurrency())
+
+        async def _one(sha: str) -> None:
+            async with sem:
+                if job.cancel_requested:
+                    return
+                if await _publish_reproject_best_effort(sha, parent_op_id=job.id):
+                    job.progress.done += 1
+                else:
+                    job.progress.failed += 1
+
+        await asyncio.gather(*(_one(sha) for sha in shas))
+        job.status = CANCELLED if job.cancel_requested else COMPLETED
 
     async def _run_reconcile(self, job: Job) -> None:
         """Reconcile sweep: catalog truth vs the per-stage DAG outputs (#21,
@@ -597,40 +605,56 @@ class JobStore:
         images: dict[str, dict[str, Any]] = {}
         drift: dict[str, list[str]] = {s: [] for s in STAGES}
 
-        # -- per-stage coverage probe (per catalog image) --
-        for sha in catalog:
-            if job.cancel_requested:
-                job.status = CANCELLED
-                return
-            dense_ok = await asyncio.to_thread(pipeline.load_dense_blob, sha) is not None
-            sparse_ok = await asyncio.to_thread(pipeline.load_sparse_blob, sha) is not None
-            in_search = await asyncio.to_thread(pipeline.search_has, sha)
-            in_graph = await asyncio.to_thread(pipeline.graph_has, sha)
+        # -- per-stage coverage probe (per catalog image), CONCURRENT --
+        # The four probes for one image are independent reads, and images are
+        # independent of each other, so they all run concurrently (bounded by the
+        # producer concurrency knob). Results are collected into a dict and the
+        # drift lists are then assembled in CATALOG order so the report stays
+        # deterministic regardless of probe completion order.
+        sem = asyncio.Semaphore(ingest_concurrency())
+        probed: dict[str, dict[str, bool]] = {}
 
-            need: list[str] = []
-            if not dense_ok:
-                need.append(broker.EMBED_DENSE_QUEUE)
-            if not sparse_ok:
-                need.append(broker.EMBED_SPARSE_QUEUE)
-            # Only re-publish index.search directly when both vectors already exist
-            # (otherwise it would no-op); a missing vector's embed stage fans in.
-            if dense_ok and sparse_ok and not in_search:
-                need.append(broker.INDEX_SEARCH_QUEUE)
-            if not in_graph:
-                need.append(broker.INDEX_GRAPH_QUEUE)
+        async def _probe(sha: str) -> None:
+            async with sem:
+                if job.cancel_requested:
+                    return
+                dense, sparse, in_search, in_graph = await asyncio.gather(
+                    pipeline.maybe_await(pipeline.load_dense_blob(sha)),
+                    pipeline.maybe_await(pipeline.load_sparse_blob(sha)),
+                    pipeline.maybe_await(pipeline.search_has(sha)),
+                    pipeline.maybe_await(pipeline.graph_has(sha)),
+                )
+                probed[sha] = {
+                    "dense": dense is not None, "sparse": sparse is not None,
+                    "in_search": bool(in_search), "in_graph": bool(in_graph),
+                }
+                job.progress.done += 1
 
-            images[sha] = {
-                "dense": dense_ok, "sparse": sparse_ok,
-                "in_search": in_search, "in_graph": in_graph,
-                "enqueued": [],
-            }
-            for stage in need:
-                drift[stage].append(sha)
-            job.progress.done += 1
+        await asyncio.gather(*(_probe(sha) for sha in catalog))
 
         if job.cancel_requested:
             job.status = CANCELLED
             return
+
+        for sha in catalog:
+            r = probed.get(sha)
+            if r is None:
+                continue
+            need: list[str] = []
+            if not r["dense"]:
+                need.append(broker.EMBED_DENSE_QUEUE)
+            if not r["sparse"]:
+                need.append(broker.EMBED_SPARSE_QUEUE)
+            # Only re-publish index.search directly when both vectors already exist
+            # (otherwise it would no-op); a missing vector's embed stage fans in.
+            if r["dense"] and r["sparse"] and not r["in_search"]:
+                need.append(broker.INDEX_SEARCH_QUEUE)
+            if not r["in_graph"]:
+                need.append(broker.INDEX_GRAPH_QUEUE)
+
+            images[sha] = {**r, "enqueued": []}
+            for stage in need:
+                drift[stage].append(sha)
 
         # -- re-enqueue exactly the drifted stage(s) per image --
         publishers = {
@@ -702,7 +726,7 @@ class JobStore:
                 # broker down -> fall through to the inline fast path below
 
             data = await asyncio.to_thread(path.read_bytes)
-            sha256 = pipeline.compute_sha256(data)
+            sha256 = await asyncio.to_thread(pipeline.compute_sha256, data)
             if sha256 in self._seen_sha256:
                 job.progress.skipped += 1
                 log.debug("skip (already seen) %s -> %s", path.name, sha256[:12])
@@ -714,8 +738,8 @@ class JobStore:
             # Synchronous fast path: catalog record + thumbnail only (ADR 0001).
             # Dense/sparse/search/graph projection happens asynchronously in the
             # index task published below.
-            await asyncio.to_thread(
-                pipeline.ingest_fast, data, path.name, str(path), on_stage
+            await pipeline.maybe_await(
+                pipeline.ingest_fast(data, path.name, str(path), on_stage)
             )
             # Enqueue the per-stage DAG (ADR 0002): embed.dense + embed.sparse
             # (-> index.search fan-in), index.graph, and label. Best-effort: a

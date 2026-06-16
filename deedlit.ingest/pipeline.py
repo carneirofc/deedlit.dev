@@ -28,12 +28,15 @@ so tests can monkeypatch them and stay offline/deterministic.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import io
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,6 +91,14 @@ CATALOG_DENSE_BLOB_KIND = os.getenv("CATALOG_DENSE_BLOB_KIND", "embedding")
 HTTP_TIMEOUT = float(os.getenv("INGEST_HTTP_TIMEOUT", "30.0"))
 FANOUT_RETRIES = int(os.getenv("INGEST_FANOUT_RETRIES", "3"))
 
+# Connection-pool ceilings for the shared async client (ADR 0002 perf). The hot
+# path fires thousands of small HTTP calls (metadata/vision/catalog/search/graph);
+# a pooled client reuses keep-alive connections instead of a TCP+TLS handshake per
+# call, which is the dominant cost at high fan-out. Sized generously so the broker
+# prefetch / folder-scan concurrency is the limit, not the connection pool.
+HTTP_MAX_CONNECTIONS = int(os.getenv("INGEST_HTTP_MAX_CONNECTIONS", "200"))
+HTTP_MAX_KEEPALIVE = int(os.getenv("INGEST_HTTP_MAX_KEEPALIVE", "100"))
+
 # Catalog list page size for the reconcile sweep (GET /images is paginated).
 CATALOG_PAGE_SIZE = int(os.getenv("RECONCILE_CATALOG_PAGE_SIZE", "500"))
 
@@ -110,6 +121,57 @@ def _mime_for_extension(ext: str) -> str:
     if ext in (".jpg", ".jpeg"):
         return "image/jpeg"
     return "application/octet-stream"
+
+
+# ---------------------------------------------------------------------------
+# Shared async HTTP client (pooled, lazily created, loop-bound)
+#
+# One AsyncClient per running event loop, cached for the process. The hot path is
+# I/O-bound (awaiting metadata/vision/catalog/search/graph), so native async +
+# connection reuse lets thousands of requests overlap on a handful of sockets —
+# far cheaper than a thread-per-request pool. The loop check re-creates the client
+# when the running loop changes (e.g. each ``asyncio.run`` in the test suite, or
+# the API vs worker loops) so a client is never reused across loops.
+# ---------------------------------------------------------------------------
+_client: httpx.AsyncClient | None = None
+_client_loop: Any = None
+
+
+def get_client() -> httpx.AsyncClient:
+    """Return the shared pooled AsyncClient for the running loop, creating it once."""
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
+        _client = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            limits=httpx.Limits(
+                max_connections=HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+            ),
+        )
+        _client_loop = loop
+    return _client
+
+
+async def aclose() -> None:
+    """Close the cached client (worker/API shutdown). Safe to call repeatedly."""
+    global _client, _client_loop
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+    _client_loop = None
+
+
+async def maybe_await(value: Any) -> Any:
+    """Await ``value`` if it is awaitable, else return it unchanged.
+
+    The outbound boundary functions are async, but tests monkeypatch them with
+    plain sync fakes; awaiting through this shim lets the orchestrators accept
+    either, so the offline test seam stays sync while production runs native async.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -159,17 +221,30 @@ def make_webp_thumbnail(data: bytes, min_edge: int = THUMBNAIL_MIN_EDGE) -> byte
         return None
 
 
+def _pixel_work(data: bytes) -> tuple[str, str | None, int | None, int | None, bytes | None]:
+    """Run ALL the CPU-bound pixel work for one image in a single call.
+
+    sha256 + pHash + dims + the (heavy, lossless) WebP thumbnail encode. These are
+    CPU-bound and cannot be made non-blocking with async — Pillow/hashlib release
+    the GIL during the C work, so the orchestrators offload this whole bundle to a
+    worker thread (one hop, real cross-core parallelism) while their HTTP I/O stays
+    natively async on the event loop.
+    """
+    width, height = compute_dims(data)
+    return compute_sha256(data), compute_phash(data), width, height, make_webp_thumbnail(data)
+
+
 # ---------------------------------------------------------------------------
-# Outbound clients (monkeypatched in tests)
+# Outbound clients (async, pooled; monkeypatched in tests)
 # ---------------------------------------------------------------------------
-def extract_metadata(data: bytes, filename: str, mime: str) -> dict[str, Any]:
+async def extract_metadata(data: bytes, filename: str, mime: str) -> dict[str, Any]:
     """POST image bytes to deedlit.metadata /extract; return the ExtractResult.
 
     A 422 (no recognized metadata) degrades to an empty-ish result rather than
     failing the file — the image is still cataloged with sha256/phash/dims.
     """
     files = {"file": (filename, data, mime)}
-    resp = httpx.post(f"{METADATA_URL}/extract", files=files, timeout=HTTP_TIMEOUT)
+    resp = await get_client().post(f"{METADATA_URL}/extract", files=files)
     if resp.status_code == 422:
         return {
             "sourceTool": "unknown",
@@ -185,32 +260,30 @@ def extract_metadata(data: bytes, filename: str, mime: str) -> dict[str, Any]:
     return resp.json()
 
 
-def embed_image(data: bytes, filename: str, mime: str) -> list[float]:
+async def embed_image(data: bytes, filename: str, mime: str) -> list[float]:
     """POST image bytes to deedlit.vision /embed/image; return the dense vector."""
     files = {"file": (filename, data, mime)}
-    resp = httpx.post(f"{VISION_URL}/embed/image", files=files, timeout=HTTP_TIMEOUT)
+    resp = await get_client().post(f"{VISION_URL}/embed/image", files=files)
     resp.raise_for_status()
     body = resp.json()
     # The contract names the field `vector`; the live service returns `embedding`.
     return body.get("vector") or body.get("embedding") or []
 
 
-def embed_sparse_text(text: str) -> dict[str, list]:
+async def embed_sparse_text(text: str) -> dict[str, list]:
     """POST text to deedlit.vision /embed/sparse; return {indices, values}.
 
     The sparse-vector vision client. Named ``_text`` to distinguish it from the
     ``embed_sparse`` DAG stage (ADR 0002), which embeds an image's catalog text
     and persists the result.
     """
-    resp = httpx.post(
-        f"{VISION_URL}/embed/sparse", json={"text": text}, timeout=HTTP_TIMEOUT
-    )
+    resp = await get_client().post(f"{VISION_URL}/embed/sparse", json={"text": text})
     resp.raise_for_status()
     body = resp.json()
     return {"indices": body.get("indices", []), "values": body.get("values", [])}
 
 
-def describe_image(
+async def describe_image(
     data: bytes, filename: str, mime: str, prompt_hint: str | None = None
 ) -> dict[str, Any]:
     """POST the image to deedlit.labelagent /describe; return ``{label,
@@ -227,9 +300,7 @@ def describe_image(
         return {}
     files = {"file": (filename, data, mime)}
     form = {"prompt_hint": prompt_hint} if prompt_hint else None
-    resp = httpx.post(
-        f"{LABELAGENT_URL}/describe", files=files, data=form, timeout=HTTP_TIMEOUT
-    )
+    resp = await get_client().post(f"{LABELAGENT_URL}/describe", files=files, data=form)
     resp.raise_for_status()
     return resp.json()
 
@@ -237,7 +308,7 @@ def describe_image(
 # ---------------------------------------------------------------------------
 # Maintenance boundary (read image bytes / trigger rebuilds) — monkeypatched
 # ---------------------------------------------------------------------------
-def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
+async def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
     """Read the raw original bytes of an image by sha256 (ADR 0001).
 
     Used by the index/label workers and the ``reindex-one-image`` job to re-run
@@ -250,16 +321,18 @@ def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
     Raises if the catalog has no filepath for the sha256 or the file is gone — the
     task then fails and is retried / dead-lettered by the broker.
     """
-    filepath = fetch_image_filepath(sha256)
+    filepath = await maybe_await(fetch_image_filepath(sha256))
     if not filepath:
         raise FileNotFoundError(f"no catalog filepath for sha256={sha256}")
     path = Path(filepath)
-    data = path.read_bytes()  # raises FileNotFoundError if the file moved/was deleted
+    # Disk read is blocking; keep it off the event loop. raises FileNotFoundError
+    # if the file moved/was deleted.
+    data = await asyncio.to_thread(path.read_bytes)
     mime = _mime_for_extension(path.suffix)
     return data, mime
 
 
-def fetch_image_record(sha256: str) -> dict[str, Any] | None:
+async def fetch_image_record(sha256: str) -> dict[str, Any] | None:
     """GET the full catalog record (the source of truth) for ``sha256``, or None.
 
     Used by the index task (to project from catalog truth — description/safety/
@@ -267,7 +340,7 @@ def fetch_image_record(sha256: str) -> dict[str, Any] | None:
     Best-effort: any read failure degrades to None rather than failing the repair.
     """
     try:
-        resp = httpx.get(f"{CATALOG_URL}/images/{sha256}", timeout=HTTP_TIMEOUT)
+        resp = await get_client().get(f"{CATALOG_URL}/images/{sha256}")
         resp.raise_for_status()
         body = resp.json()
         return body if isinstance(body, dict) else None
@@ -275,7 +348,7 @@ def fetch_image_record(sha256: str) -> dict[str, Any] | None:
         return None
 
 
-def fetch_image_filepath(sha256: str) -> str | None:
+async def fetch_image_filepath(sha256: str) -> str | None:
     """GET the catalog record's stored source filepath for ``sha256``, or None.
 
     The reindex paths re-run the pipeline from stored bytes and have no original
@@ -283,7 +356,7 @@ def fetch_image_filepath(sha256: str) -> str | None:
     truth) — otherwise the re-projected search payload would drop the filepath
     that identifies the image. Best-effort: any read failure degrades to None.
     """
-    record = fetch_image_record(sha256)
+    record = await maybe_await(fetch_image_record(sha256))
     return record.get("filepath") if record else None
 
 
@@ -340,7 +413,7 @@ def list_catalog_sha256() -> list[str]:
     return out
 
 
-def search_has(sha256: str) -> bool:
+async def search_has(sha256: str) -> bool:
     """Coverage probe: is ``sha256`` present in the search (Qdrant) projection?
 
     The search contract has no "list covered ids" endpoint, so we use the
@@ -350,17 +423,15 @@ def search_has(sha256: str) -> bool:
     as "not covered" so reconcile repairs it rather than silently skipping.
     """
     try:
-        resp = httpx.post(
-            f"{SEARCH_URL}/by-image",
-            json={"sha256": sha256, "limit": 1},
-            timeout=HTTP_TIMEOUT,
+        resp = await get_client().post(
+            f"{SEARCH_URL}/by-image", json={"sha256": sha256, "limit": 1}
         )
     except httpx.TransportError:
         return False
     return resp.status_code == 200
 
 
-def graph_has(sha256: str) -> bool:
+async def graph_has(sha256: str) -> bool:
     """Coverage probe: is ``sha256`` present in the graph (Neo4j) projection?
 
     The graph contract has no "list covered ids" endpoint either, so we probe
@@ -368,10 +439,8 @@ def graph_has(sha256: str) -> bool:
     with zero neighbors); a 404 / error means it is missing and must be repaired.
     """
     try:
-        resp = httpx.get(
-            f"{GRAPH_URL}/neighbors/{sha256}",
-            params={"limit": 1},
-            timeout=HTTP_TIMEOUT,
+        resp = await get_client().get(
+            f"{GRAPH_URL}/neighbors/{sha256}", params={"limit": 1}
         )
     except httpx.TransportError:
         return False
@@ -470,7 +539,7 @@ def list_unlabeled_sha256() -> list[str]:
     return out
 
 
-def reindex_image(sha256: str) -> None:
+async def reindex_image(sha256: str) -> None:
     """Index task: (re)build the search+graph projection for one sha256 from
     catalog TRUTH (ADR 0001).
 
@@ -480,24 +549,24 @@ def reindex_image(sha256: str) -> None:
     reflect the current catalog truth. Idempotent: running it twice converges, so
     it is safe to re-enqueue after a label patch or from reconcile.
     """
-    data, mime = fetch_image_bytes(sha256)
+    data, mime = await maybe_await(fetch_image_bytes(sha256))
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
     # Project from catalog truth: the AI fields (description/safety/tags) the
     # label task patched flow into the sparse text + payload + graph edges. The
     # source path keeps the file identity on the re-projected payload.
-    record = fetch_image_record(sha256) or {}
-    rec = process_file(
+    record = await maybe_await(fetch_image_record(sha256)) or {}
+    rec = await maybe_await(process_file(
         data,
         filename,
         source_path=record.get("filepath"),
         description=record.get("description"),
         safety=record.get("safety"),
         tags=record.get("tags"),
-    )
-    fan_out_writes(rec)
+    ))
+    await maybe_await(fan_out_writes(rec))
 
 
-def label_image(sha256: str) -> bool:
+async def label_image(sha256: str) -> bool:
     """Label task: describe one image and PATCH the catalog truth (ADR 0001).
 
     Reads the bytes + catalog record, calls the labelagent (grounded with the
@@ -511,29 +580,34 @@ def label_image(sha256: str) -> bool:
     so the broker retries with backoff and eventually dead-letters to
     ``label.dlq``.
     """
-    data, mime = fetch_image_bytes(sha256)
+    data, mime = await maybe_await(fetch_image_bytes(sha256))
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
-    record = fetch_image_record(sha256) or {}
-    extract = extract_metadata(data, filename, mime)
-    describe = describe_image(data, filename, mime, prompt_hint=extract.get("prompt"))
+    record = await maybe_await(fetch_image_record(sha256)) or {}
+    extract = await maybe_await(extract_metadata(data, filename, mime))
+    describe = await maybe_await(
+        describe_image(data, filename, mime, prompt_hint=extract.get("prompt"))
+    )
     if not describe:
         return False  # labelagent disabled (or empty result) -> nothing to patch
     # Merge the AI tags into the existing catalog tags (AI appended, de-duped,
     # order-stable), falling back to the freshly extracted tags.
     base_tags = record.get("tags") or extract.get("tags") or []
     merged = list(dict.fromkeys([*base_tags, *(describe.get("tags") or [])]))
+    phash, (width, height) = await asyncio.to_thread(
+        lambda: (compute_phash(data), compute_dims(data))
+    )
     patched = build_catalog_record(
         sha256=sha256,
-        phash=compute_phash(data),
-        width=compute_dims(data)[0],
-        height=compute_dims(data)[1],
+        phash=phash,
+        width=width,
+        height=height,
         extract=extract,
         source_path=record.get("filepath"),
         tags=merged,
         description=describe.get("description"),
         safety=describe.get("safety"),
     )
-    _post_with_retry(f"{CATALOG_URL}/images", patched)
+    await maybe_await(_post_with_retry(f"{CATALOG_URL}/images", patched))
     return True
 
 
@@ -560,32 +634,32 @@ def _reconcile_ext_for_mime(mime: str) -> str:
 #   sparse -> /blobs/{sha}/sparse      {indices, values}
 # These thin boundary wrappers are monkeypatched in tests to stay offline.
 # ---------------------------------------------------------------------------
-def store_dense_blob(sha256: str, dense: list[float]) -> None:
+async def store_dense_blob(sha256: str, dense: list[float]) -> None:
     """Persist the dense vector to the catalog ``embedding`` blob (JSON floats)."""
-    _put_blob_with_retry(
+    await maybe_await(_put_blob_with_retry(
         f"{CATALOG_URL}/blobs/{sha256}/{CATALOG_DENSE_BLOB_KIND}",
         json.dumps(dense).encode("utf-8"),
         "application/octet-stream",
-    )
+    ))
 
 
-def store_sparse_blob(sha256: str, sparse: dict[str, list]) -> None:
+async def store_sparse_blob(sha256: str, sparse: dict[str, list]) -> None:
     """Persist the sparse vector to the catalog ``sparse`` blob (JSON)."""
-    _put_blob_with_retry(
+    await maybe_await(_put_blob_with_retry(
         f"{CATALOG_URL}/blobs/{sha256}/sparse",
         json.dumps(sparse).encode("utf-8"),
         "application/json",
-    )
+    ))
 
 
-def _load_json_blob(sha256: str, kind: str) -> Any | None:
+async def _load_json_blob(sha256: str, kind: str) -> Any | None:
     """GET a catalog blob and parse it as JSON, or None if absent/unreadable.
 
     A missing blob (404) is the normal "stage hasn't run yet" signal for the
     fan-in, so it degrades to None rather than raising.
     """
     try:
-        resp = httpx.get(f"{CATALOG_URL}/blobs/{sha256}/{kind}", timeout=HTTP_TIMEOUT)
+        resp = await get_client().get(f"{CATALOG_URL}/blobs/{sha256}/{kind}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -594,17 +668,17 @@ def _load_json_blob(sha256: str, kind: str) -> Any | None:
         return None
 
 
-def load_dense_blob(sha256: str) -> list[float] | None:
+async def load_dense_blob(sha256: str) -> list[float] | None:
     """Read the persisted dense vector from catalog, or None if not embedded yet."""
-    return _load_json_blob(sha256, CATALOG_DENSE_BLOB_KIND)
+    return await maybe_await(_load_json_blob(sha256, CATALOG_DENSE_BLOB_KIND))
 
 
-def load_sparse_blob(sha256: str) -> dict[str, list] | None:
+async def load_sparse_blob(sha256: str) -> dict[str, list] | None:
     """Read the persisted sparse vector from catalog, or None if not embedded yet."""
-    return _load_json_blob(sha256, "sparse")
+    return await maybe_await(_load_json_blob(sha256, "sparse"))
 
 
-def embed_dense(sha256: str) -> None:
+async def embed_dense(sha256: str) -> None:
     """``embed.dense`` stage: GPU dense-embed one image, persist to catalog.
 
     Reads the bytes (sha -> catalog filepath -> shared disk), runs the dense
@@ -613,13 +687,13 @@ def embed_dense(sha256: str) -> None:
     by every later reprojection. A vision/transport error propagates so the broker
     retries / dead-letters.
     """
-    data, mime = fetch_image_bytes(sha256)
+    data, mime = await maybe_await(fetch_image_bytes(sha256))
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
-    dense = embed_image(data, filename, mime)
-    store_dense_blob(sha256, dense)
+    dense = await maybe_await(embed_image(data, filename, mime))
+    await maybe_await(store_dense_blob(sha256, dense))
 
 
-def embed_sparse(sha256: str) -> None:
+async def embed_sparse(sha256: str) -> None:
     """``embed.sparse`` stage: sparse-embed one image's text, persist to catalog.
 
     No bytes / no GPU: the sparse vector is over the lexical text held in catalog
@@ -627,15 +701,19 @@ def embed_sparse(sha256: str) -> None:
     folds the new description/tags into the sparse vector. Stores the result as
     the catalog ``sparse`` blob; the worker then publishes ``index.search``.
     """
-    record = fetch_image_record(sha256) or {}
+    record = await maybe_await(fetch_image_record(sha256)) or {}
     tags = record.get("tags") or []
     sparse_text = " ".join(
         s.strip()
         for s in (record.get("prompt"), record.get("description"), " ".join(tags))
         if s and s.strip()
     )
-    sparse = embed_sparse_text(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
-    store_sparse_blob(sha256, sparse)
+    sparse = (
+        await maybe_await(embed_sparse_text(sparse_text))
+        if sparse_text.strip()
+        else {"indices": [], "values": []}
+    )
+    await maybe_await(store_sparse_blob(sha256, sparse))
 
 
 def build_search_point(
@@ -667,7 +745,7 @@ def build_search_point(
     return {"sha256": sha256, "dense": dense, "sparse": sparse, "payload": payload}
 
 
-def index_search(sha256: str) -> bool:
+async def index_search(sha256: str) -> bool:
     """``index.search`` stage: FAN-IN dense+sparse -> upsert the search point.
 
     Reads BOTH vectors back from catalog (the rendezvous). When either is missing
@@ -675,36 +753,41 @@ def index_search(sha256: str) -> bool:
     ``index.search`` again on its own completion, and whichever runs second finds
     both present and upserts. Idempotent: a duplicate upsert is wasted work, never
     incorrect. Returns True when the point was upserted.
+
+    The two reads are independent, so they are fired CONCURRENTLY (the fan-in
+    rendezvous resolves in one round-trip's latency, not two).
     """
-    dense = load_dense_blob(sha256)
-    sparse = load_sparse_blob(sha256)
+    dense, sparse = await asyncio.gather(
+        maybe_await(load_dense_blob(sha256)),
+        maybe_await(load_sparse_blob(sha256)),
+    )
     if dense is None or sparse is None:
         log.debug(
             "index.search %s waiting on vectors (dense=%s sparse=%s)",
             sha256[:12], dense is not None, sparse is not None,
         )
         return False
-    record = fetch_image_record(sha256) or {}
+    record = await maybe_await(fetch_image_record(sha256)) or {}
     point = build_search_point(sha256, dense, sparse, record)
-    _post_with_retry(f"{SEARCH_URL}/points", point)
+    await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", point))
     return True
 
 
-def index_graph(sha256: str) -> None:
+async def index_graph(sha256: str) -> None:
     """``index.graph`` stage: upsert graph edges from catalog truth (no vectors).
 
     References/tags/lineage come straight from the catalog record (the references
     are already the flat AssetRef list), so this stage needs neither bytes nor
     embeddings and runs in parallel with the embed stages.
     """
-    record = fetch_image_record(sha256) or {}
+    record = await maybe_await(fetch_image_record(sha256)) or {}
     edges = {
         "sha256": sha256,
         "references": record.get("references") or [],
         "tags": record.get("tags") or [],
         "lineage": [],
     }
-    _post_with_retry(f"{GRAPH_URL}/edges", edges)
+    await maybe_await(_post_with_retry(f"{GRAPH_URL}/edges", edges))
 
 
 # ---------------------------------------------------------------------------
@@ -759,6 +842,23 @@ class IngestRecord:
     thumbnail: bytes | None = None
 
 
+def file_created_at_iso(source_path: str | None) -> str | None:
+    """Best-effort source-file creation time as a UTC ISO-8601 string, or None.
+
+    Uses the file's mtime (last content write) — for an AI-generated image that
+    is when it was saved, the meaningful "creation" time. (st_ctime is inode
+    change on Linux, not creation, so mtime is the portable choice.) A missing or
+    unreadable path degrades to None: the catalog then falls back to import time.
+    """
+    if not source_path:
+        return None
+    try:
+        mtime = os.stat(source_path).st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+
+
 def build_catalog_record(
     *,
     sha256: str,
@@ -767,6 +867,7 @@ def build_catalog_record(
     height: int | None,
     extract: dict[str, Any],
     source_path: str | None = None,
+    created_at: str | None = None,
     tags: list[str] | None = None,
     description: str | None = None,
     safety: str | None = None,
@@ -786,6 +887,9 @@ def build_catalog_record(
         # None for paths-unknown ingests (e.g. reindex from stored bytes, where
         # the caller backfills it from the catalog record).
         "filepath": source_path,
+        # Source-file creation time (captured on first ingest). None on the
+        # reproject/reindex path — catalog keeps the value from first ingest.
+        "createdAt": created_at,
         "phash": phash,
         "width": width,
         "height": height,
@@ -900,7 +1004,7 @@ def assemble_record(
 # ---------------------------------------------------------------------------
 # Per-file pipeline
 # ---------------------------------------------------------------------------
-def process_file(
+async def process_file(
     data: bytes,
     filename: str,
     source_path: str | None = None,
@@ -933,20 +1037,18 @@ def process_file(
     mime = _mime_for_extension(ext)
 
     stage("hash")
-    sha256 = compute_sha256(data)
-    phash = compute_phash(data)
-    width, height = compute_dims(data)
-    thumbnail = make_webp_thumbnail(data)
+    # All the CPU-bound pixel work in one thread hop (GIL released during it).
+    sha256, phash, width, height, thumbnail = await asyncio.to_thread(_pixel_work, data)
 
     stage("metadata")
-    extract = extract_metadata(data, filename, mime)
+    extract = await maybe_await(extract_metadata(data, filename, mime))
     # Tags: prefer the explicit catalog-truth list (already merged with AI tags by
     # the label task); fall back to the freshly extracted tags on a first pass.
     final_tags = list(tags) if tags is not None else list(extract.get("tags") or [])
 
     log.debug("%s sha=%s tool=%s dims=%sx%s", filename, sha256[:12], extract.get("sourceTool"), width, height)
     stage("vision:dense")
-    dense = embed_image(data, filename, mime)
+    dense = await maybe_await(embed_image(data, filename, mime))
     # Sparse vector is over the lexical text: SD prompt + AI description + tags
     # (term weights for the hybrid sparse leg). The AI description (catalog truth)
     # lets images with thin/absent embedded metadata still index on the sparse side.
@@ -954,7 +1056,11 @@ def process_file(
     sparse_text = " ".join(
         s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
     )
-    sparse = embed_sparse_text(sparse_text) if sparse_text.strip() else {"indices": [], "values": []}
+    sparse = (
+        await maybe_await(embed_sparse_text(sparse_text))
+        if sparse_text.strip()
+        else {"indices": [], "values": []}
+    )
     log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
 
     return assemble_record(
@@ -978,7 +1084,7 @@ def process_file(
 # ---------------------------------------------------------------------------
 # Synchronous fast path (ADR 0001)
 # ---------------------------------------------------------------------------
-def ingest_fast(
+async def ingest_fast(
     data: bytes,
     filename: str,
     source_path: str | None = None,
@@ -1001,13 +1107,10 @@ def ingest_fast(
     mime = _mime_for_extension(ext)
 
     stage("hash")
-    sha256 = compute_sha256(data)
-    phash = compute_phash(data)
-    width, height = compute_dims(data)
-    thumbnail = make_webp_thumbnail(data)
+    sha256, phash, width, height, thumbnail = await asyncio.to_thread(_pixel_work, data)
 
     stage("metadata")
-    extract = extract_metadata(data, filename, mime)
+    extract = await maybe_await(extract_metadata(data, filename, mime))
 
     # Catalog truth only — extracted tags, no AI fields (the label task fills
     # description/safety/AI-tags later, and catalog COALESCEs the None values).
@@ -1018,19 +1121,20 @@ def ingest_fast(
         height=height,
         extract=extract,
         source_path=source_path,
+        created_at=file_created_at_iso(source_path),
     )
 
     stage("catalog")
-    _post_with_retry(f"{CATALOG_URL}/images", record)
+    await maybe_await(_post_with_retry(f"{CATALOG_URL}/images", record))
     if thumbnail is not None:
-        _put_blob_with_retry(
+        await maybe_await(_put_blob_with_retry(
             f"{CATALOG_URL}/blobs/{sha256}/thumbnail", thumbnail, "image/webp"
-        )
+        ))
     return sha256
 
 
-def ingest_path(path: str) -> str:
-    """Read one source file and run the synchronous fast path (ADR 0002).
+async def ingest_path(path: str) -> str:
+    """Read one source file and run the fast path (ADR 0002).
 
     The ``ingest`` queue handler's body: read the bytes from the shared disk path
     and fast-path them (catalog record + thumbnail), returning the sha256 so the
@@ -1038,27 +1142,28 @@ def ingest_path(path: str) -> str:
     broker retries / dead-letters the ingest task.
     """
     p = Path(path)
-    return ingest_fast(p.read_bytes(), p.name, str(p))
+    data = await asyncio.to_thread(p.read_bytes)
+    return await maybe_await(ingest_fast(data, p.name, str(p)))
 
 
 # ---------------------------------------------------------------------------
 # Fan-out (catalog-first, per-store retry)
 # ---------------------------------------------------------------------------
-def _request_with_retry(
-    send,
+async def _request_with_retry(
+    send: Callable[[], Awaitable[Any]],
     label: str,
     retries: int = FANOUT_RETRIES,
 ) -> None:
     """Run ``send`` with per-store retry on transient failure (5xx / network).
 
-    ``send`` is a zero-arg callable returning an ``httpx.Response``; ``label`` is
-    used only for the raised error message. A 5xx (or transport error) is
-    retried; a 4xx fails fast (the request itself is wrong and won't recover).
+    ``send`` is a zero-arg callable returning an awaitable ``httpx.Response``;
+    ``label`` is used only for the raised error message. A 5xx (or transport
+    error) is retried; a 4xx fails fast (the request is wrong and won't recover).
     """
     last_exc: Exception | None = None
     for _attempt in range(retries):
         try:
-            resp = send()
+            resp = await send()
             if resp.status_code >= 500:
                 last_exc = httpx.HTTPStatusError(
                     f"{label} -> {resp.status_code}", request=resp.request, response=resp
@@ -1073,30 +1178,25 @@ def _request_with_retry(
     raise last_exc
 
 
-def _post_with_retry(url: str, json_body: dict[str, Any], retries: int = FANOUT_RETRIES) -> None:
+async def _post_with_retry(url: str, json_body: dict[str, Any], retries: int = FANOUT_RETRIES) -> None:
     """POST JSON with per-store retry on transient failure (5xx / network)."""
-    _request_with_retry(
-        lambda: httpx.post(url, json=json_body, timeout=HTTP_TIMEOUT), url, retries
-    )
+    client = get_client()
+    await _request_with_retry(lambda: client.post(url, json=json_body), url, retries)
 
 
-def _put_blob_with_retry(
+async def _put_blob_with_retry(
     url: str, data: bytes, content_type: str, retries: int = FANOUT_RETRIES
 ) -> None:
     """PUT raw blob bytes with per-store retry on transient failure."""
-    _request_with_retry(
-        lambda: httpx.put(
-            url,
-            content=data,
-            headers={"content-type": content_type},
-            timeout=HTTP_TIMEOUT,
-        ),
+    client = get_client()
+    await _request_with_retry(
+        lambda: client.put(url, content=data, headers={"content-type": content_type}),
         url,
         retries,
     )
 
 
-def fan_out_writes(rec: IngestRecord, on_stage: Callable[[str], None] | None = None) -> None:
+async def fan_out_writes(rec: IngestRecord, on_stage: Callable[[str], None] | None = None) -> None:
     """Persist one record directly to the owning services (catalog/search/graph).
 
     Order is catalog/truth FIRST (the source of truth must land before the
@@ -1120,15 +1220,15 @@ def fan_out_writes(rec: IngestRecord, on_stage: Callable[[str], None] | None = N
     #    must land before the blob (the blob hangs off the cataloged image) and
     #    before the derived projections.
     stage("catalog")
-    _post_with_retry(f"{CATALOG_URL}/images", rec.record)
+    await maybe_await(_post_with_retry(f"{CATALOG_URL}/images", rec.record))
     if rec.thumbnail is not None:
-        _put_blob_with_retry(
+        await maybe_await(_put_blob_with_retry(
             f"{CATALOG_URL}/blobs/{sha}/thumbnail", rec.thumbnail, "image/webp"
-        )
+        ))
     # 2. search: dense + sparse point (keyed by uuid5(sha256) inside search).
     stage("search")
-    _post_with_retry(f"{SEARCH_URL}/points", rec.point)
+    await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", rec.point))
     # 3. graph: reference/tag/lineage edges.
     stage("graph")
-    _post_with_retry(f"{GRAPH_URL}/edges", rec.edges)
+    await maybe_await(_post_with_retry(f"{GRAPH_URL}/edges", rec.edges))
     log.debug("fan-out OK %s -> catalog+search+graph", sha[:12])

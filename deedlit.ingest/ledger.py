@@ -8,6 +8,7 @@ stall a consumer. The ingest publisher records ``queued``; the worker records
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -19,8 +20,32 @@ log = logging.getLogger("deedlit.ingest.ledger")
 CATALOG_URL = os.getenv("CATALOG_URL", "http://localhost:8001").rstrip("/")
 LEDGER_TIMEOUT = float(os.getenv("LEDGER_HTTP_TIMEOUT", "5.0"))
 
+# Own pooled async client (mirrors pipeline.get_client), loop-bound + lazily
+# created, so best-effort ledger writes reuse keep-alive connections instead of a
+# handshake per transition.
+_client: httpx.AsyncClient | None = None
+_client_loop: Any = None
 
-def record_task(
+
+def _get_client() -> httpx.AsyncClient:
+    global _client, _client_loop
+    loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop is not loop:
+        _client = httpx.AsyncClient(timeout=LEDGER_TIMEOUT)
+        _client_loop = loop
+    return _client
+
+
+async def aclose() -> None:
+    """Close the cached client (worker/API shutdown)."""
+    global _client, _client_loop
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+    _client_loop = None
+
+
+async def record_task(
     sha256: str | None,
     task_type: str | None,
     status: str,
@@ -45,7 +70,7 @@ def record_task(
     if parent_op_id is not None:
         body["parent_op_id"] = parent_op_id
     try:
-        resp = httpx.post(f"{CATALOG_URL}/tasks", json=body, timeout=LEDGER_TIMEOUT)
+        resp = await _get_client().post(f"{CATALOG_URL}/tasks", json=body)
         resp.raise_for_status()
         return True
     except Exception as exc:  # noqa: BLE001 — ledger is best-effort observability

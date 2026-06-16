@@ -16,7 +16,7 @@ def test_runtime_defaults(monkeypatch):
     monkeypatch.delenv("INGEST_VIA_QUEUE", raising=False)
     config.reset()
     r = config.runtime()
-    assert r == {"ingest_concurrency": 8, "ingest_via_queue": False}
+    assert r == {"ingest_concurrency": 32, "ingest_via_queue": False}
 
 
 def test_env_default_then_override(monkeypatch):

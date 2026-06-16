@@ -254,9 +254,15 @@ def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
     async def noop_publish(sha256, parent_op_id=None):
         return None
 
+    # Pin to serial so the cancel point is deterministic (this test is about
+    # cancellation, not concurrency).
+    monkeypatch.setenv("INGEST_CONCURRENCY", "1")
     monkeypatch.setattr(pipeline, "ingest_fast", slow_fast)
-    monkeypatch.setattr(broker_module, "publish_index_task", noop_publish)
-    monkeypatch.setattr(broker_module, "publish_label_task", noop_publish)
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_graph_task", "publish_label_task",
+    ):
+        monkeypatch.setattr(broker_module, name, noop_publish)
 
     with TestClient(app_module.app) as client:
         job_id = client.post(

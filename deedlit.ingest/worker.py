@@ -50,7 +50,7 @@ async def index_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("index task missing sha256")
-    await asyncio.to_thread(pipeline.reindex_image, sha256)
+    await pipeline.maybe_await(pipeline.reindex_image(sha256))
 
 
 async def label_handler(payload: dict) -> None:
@@ -68,7 +68,7 @@ async def label_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("label task missing sha256")
-    changed = await asyncio.to_thread(pipeline.label_image, sha256)
+    changed = await pipeline.maybe_await(pipeline.label_image(sha256))
     if changed:
         parent = payload.get("parent_op_id")
         await broker.publish_embed_sparse_task(sha256, parent_op_id=parent)
@@ -88,7 +88,7 @@ async def ingest_handler(payload: dict) -> None:
     path = payload.get("path")
     if not path:
         raise ValueError("ingest task missing path")
-    sha256 = await asyncio.to_thread(pipeline.ingest_path, path)
+    sha256 = await pipeline.maybe_await(pipeline.ingest_path(path))
     await broker.publish_post_ingest(sha256, parent_op_id=payload.get("parent_op_id"))
 
 
@@ -102,7 +102,7 @@ async def embed_dense_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("embed.dense task missing sha256")
-    await asyncio.to_thread(pipeline.embed_dense, sha256)
+    await pipeline.maybe_await(pipeline.embed_dense(sha256))
     await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
 
 
@@ -111,7 +111,7 @@ async def embed_sparse_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("embed.sparse task missing sha256")
-    await asyncio.to_thread(pipeline.embed_sparse, sha256)
+    await pipeline.maybe_await(pipeline.embed_sparse(sha256))
     await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
 
 
@@ -125,7 +125,7 @@ async def index_search_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("index.search task missing sha256")
-    await asyncio.to_thread(pipeline.index_search, sha256)
+    await pipeline.maybe_await(pipeline.index_search(sha256))
 
 
 async def index_graph_handler(payload: dict) -> None:
@@ -133,7 +133,7 @@ async def index_graph_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("index.graph task missing sha256")
-    await asyncio.to_thread(pipeline.index_graph, sha256)
+    await pipeline.maybe_await(pipeline.index_graph(sha256))
 
 
 # Per-queue handlers — a replica drains the subset named in QUEUES (ADR 0002).
@@ -169,8 +169,8 @@ def _ledger_event_factory(queue: str, payload: dict):
         return None
 
     async def on_event(status: str, attempts: int, error: str | None) -> None:
-        await asyncio.to_thread(
-            ledger.record_task, sha256, task_type, status, attempts, error, parent_op_id
+        await pipeline.maybe_await(
+            ledger.record_task(sha256, task_type, status, attempts, error, parent_op_id)
         )
 
     return on_event
@@ -182,21 +182,21 @@ def _queues_from_env() -> list[str]:
 
 
 def _install_thread_pool() -> None:
-    """Size the default executor for high fan-out (ADR 0002 perf).
+    """Size the default executor for the CPU-bound pixel offload (ADR 0002 perf).
 
-    The fast stage handlers offload their sync httpx call via ``asyncio.to_thread``
-    (the shared default executor). Its default cap is ``min(32, cpu+4)``, which
-    would throttle a high broker prefetch — concurrent deliveries would queue on
-    threads instead of overlapping their I/O. Size the pool to comfortably exceed
-    the fast-queue prefetch so the only real limit is the downstream service. No
-    locks: ``to_thread`` blocks on I/O (GIL released), so threads overlap freely.
+    All outbound HTTP is now natively async on the event loop, so the only work
+    offloaded via ``asyncio.to_thread`` is the CPU-bound pixel bundle
+    (sha256/pHash/dims/lossless-WebP encode) and the disk read. Pillow/hashlib
+    release the GIL during that work, so a pool sized to the cores lets the
+    encodes for concurrent deliveries overlap across CPUs. Defaults to the broker
+    prefetch so a fully-saturated fast queue never queues on threads.
     """
     import concurrent.futures
 
-    workers = int(os.getenv("WORKER_THREADS", "64"))
+    workers = int(os.getenv("WORKER_THREADS", str(max(8, broker.PREFETCH))))
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=workers))
-    log.info("worker thread pool sized to %d", workers)
+    log.info("worker pixel-work thread pool sized to %d", workers)
 
 
 async def main() -> None:
@@ -213,6 +213,8 @@ async def main() -> None:
     try:
         await broker.run_worker(queues, HANDLERS, on_event_factory=_ledger_event_factory)
     finally:
+        await pipeline.aclose()
+        await ledger.aclose()
         await broker.close()
 
 

@@ -39,6 +39,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
 import config
+import ledger
+import pipeline
 from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
 from jobs import (
@@ -77,6 +79,9 @@ async def lifespan(app: FastAPI):
     finally:
         for task in schedulers:
             task.cancel()
+        # Close the shared pooled HTTP clients (best-effort).
+        await pipeline.aclose()
+        await ledger.aclose()
 
 
 # Health probes are polled on a tight interval (Docker HEALTHCHECK + the status

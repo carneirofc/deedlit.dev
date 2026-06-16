@@ -30,7 +30,7 @@ def test_ingest_path_reads_file_and_fast_paths(tmp_path, monkeypatch):
         pipeline, "ingest_fast",
         lambda data, name, src, *a, **k: seen.append((data, name, src)) or "deadbeef",
     )
-    sha = pipeline.ingest_path(str(p))
+    sha = asyncio.run(pipeline.ingest_path(str(p)))
     assert sha == "deadbeef"
     assert seen == [(b"rawbytes", "x.png", str(p))]
 
@@ -61,7 +61,7 @@ def test_embed_dense_persists_vector_to_catalog(monkeypatch):
     monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2, 0.3])
     monkeypatch.setattr(pipeline, "store_dense_blob", lambda sha, v: stored.append((sha, v)))
 
-    pipeline.embed_dense(SHA)
+    asyncio.run(pipeline.embed_dense(SHA))
     assert stored == [(SHA, [0.1, 0.2, 0.3])]
 
 
@@ -71,7 +71,7 @@ def test_store_dense_blob_writes_embedding_kind_json(monkeypatch):
         pipeline, "_put_blob_with_retry",
         lambda url, data, content_type=None, *a, **k: puts.append((url, data, content_type)),
     )
-    pipeline.store_dense_blob(SHA, [1.0, 2.0])
+    asyncio.run(pipeline.store_dense_blob(SHA, [1.0, 2.0]))
     url, data, ctype = puts[0]
     assert url == f"{pipeline.CATALOG_URL}/blobs/{SHA}/embedding"
     assert data == b"[1.0, 2.0]"
@@ -110,7 +110,7 @@ def test_embed_sparse_builds_text_from_catalog_truth(monkeypatch):
     )
     monkeypatch.setattr(pipeline, "store_sparse_blob", lambda sha, v: stored.append((sha, v)))
 
-    pipeline.embed_sparse(SHA)
+    asyncio.run(pipeline.embed_sparse(SHA))
     assert seen_text == ["a cat fluffy cute pet"]
     assert stored == [(SHA, {"indices": [1], "values": [0.5]})]
 
@@ -125,7 +125,7 @@ def test_embed_sparse_empty_text_stores_empty_without_calling_vision(monkeypatch
     monkeypatch.setattr(pipeline, "embed_sparse_text", boom)
     monkeypatch.setattr(pipeline, "store_sparse_blob", lambda sha, v: stored.append((sha, v)))
 
-    pipeline.embed_sparse(SHA)
+    asyncio.run(pipeline.embed_sparse(SHA))
     assert stored == [(SHA, {"indices": [], "values": []})]
 
 
@@ -157,7 +157,7 @@ def test_index_search_upserts_when_both_vectors_present(monkeypatch):
     )
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda url, body, *a, **k: posts.append((url, body)))
 
-    assert pipeline.index_search(SHA) is True
+    assert asyncio.run(pipeline.index_search(SHA)) is True
     url, point = posts[0]
     assert url == f"{pipeline.SEARCH_URL}/points"
     assert point["sha256"] == SHA
@@ -176,7 +176,7 @@ def test_index_search_noop_when_dense_missing(monkeypatch):
         raise AssertionError("must not upsert until both vectors land")
 
     monkeypatch.setattr(pipeline, "_post_with_retry", boom)
-    assert pipeline.index_search(SHA) is False
+    assert asyncio.run(pipeline.index_search(SHA)) is False
 
 
 def test_index_search_noop_when_sparse_missing(monkeypatch):
@@ -186,7 +186,7 @@ def test_index_search_noop_when_sparse_missing(monkeypatch):
         pipeline, "_post_with_retry",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not upsert")),
     )
-    assert pipeline.index_search(SHA) is False
+    assert asyncio.run(pipeline.index_search(SHA)) is False
 
 
 def test_index_search_handler_requires_sha():
@@ -208,7 +208,7 @@ def test_index_graph_posts_edges_from_catalog(monkeypatch):
     )
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda url, body, *a, **k: posts.append((url, body)))
 
-    pipeline.index_graph(SHA)
+    asyncio.run(pipeline.index_graph(SHA))
     url, edges = posts[0]
     assert url == f"{pipeline.GRAPH_URL}/edges"
     assert edges["sha256"] == SHA
