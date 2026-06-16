@@ -1,13 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 // ---------------------------------------------------------------------------
-// Queue visualization / debug page (#29, ADR 0001).
+// Queue visualization / admin page (#29, ADR 0001 + 0002).
 //
 // Live queue depth/consumers/rates + DLQ inspection/requeue/purge come from the
 // gateway's RabbitMQ management proxy; per-image task history comes from the
 // catalog tasks ledger. Deep-links to RabbitMQ's own management UI for power use.
+//
+// Built wide for ops use: a KPI summary strip up top, a dense depth table with
+// total/backlog bars + net throughput, detailed dead-letter cards, and a full
+// task ledger table with timestamps.
 // ---------------------------------------------------------------------------
 
 const RABBITMQ_MGMT_URL =
@@ -18,6 +22,7 @@ const cls = {
   input:
     "w-full rounded-lg border border-ui-border/70 bg-ui-bg px-3 py-2 text-ui-sm outline-none focus:border-accent-cyan",
   btn: "rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-2 text-ui-sm font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50",
+  btnSm: "rounded-md border border-ui-border/70 bg-ui-bg-soft px-2 py-1 text-ui-2xs font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50",
   danger:
     "rounded-md border border-rose-500/40 px-2 py-1 text-ui-2xs text-rose-500 transition hover:bg-rose-500/10",
 };
@@ -45,6 +50,8 @@ interface Task {
   status: string;
   attempts: number;
   error: string | null;
+  parent_op_id?: string | null;
+  created_at?: string | null;
   updated_at?: string | null;
 }
 
@@ -65,6 +72,8 @@ function statusColor(status: string): string {
   switch (status) {
     case "running":
       return "bg-sky-500/15 text-sky-500";
+    case "queued":
+      return "bg-ui-bg text-ui-ink-muted";
     case "done":
       return "bg-emerald-500/15 text-emerald-500";
     case "failed":
@@ -76,6 +85,61 @@ function statusColor(status: string): string {
   }
 }
 
+// Short relative timestamp for the ledger ("12s ago" / "3m ago" / "2h ago").
+function ago(iso?: string | null): string {
+  if (!iso) return "—";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "—";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+// Collapse a long hash to head…tail so the table stays scannable.
+function shortSha(sha: string): string {
+  return sha.length > 16 ? `${sha.slice(0, 8)}…${sha.slice(-6)}` : sha;
+}
+
+// DLQ payloads are JSON task envelopes; pull out the sha for a readable label.
+function payloadSha(payload: string | null): string | null {
+  if (!payload) return null;
+  try {
+    const o = JSON.parse(payload) as Record<string, unknown>;
+    return typeof o.sha256 === "string" ? o.sha256 : null;
+  } catch {
+    return null;
+  }
+}
+
+function Kpi({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "good" | "warn" | "bad";
+}) {
+  const toneCls =
+    tone === "bad"
+      ? "text-rose-500"
+      : tone === "warn"
+        ? "text-amber-500"
+        : tone === "good"
+          ? "text-emerald-500"
+          : "text-ui-ink-title";
+  return (
+    <div className="flex min-w-0 flex-col gap-1 rounded-lg border border-ui-border/50 bg-ui-bg px-3 py-2">
+      <span className="truncate text-ui-2xs uppercase tracking-wide text-ui-ink-muted">{label}</span>
+      <span className={`text-ui-xl font-semibold tabular-nums ${toneCls}`}>{value}</span>
+    </div>
+  );
+}
+
 export default function QueuesPage() {
   const [queues, setQueues] = useState<QueueStat[]>([]);
   const [dlqMessages, setDlqMessages] = useState<Record<string, QueueMessage[]>>({});
@@ -83,12 +147,16 @@ export default function QueuesPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
   const refresh = useCallback(() => {
     fetch("/api/library/queues")
       .then((r) => r.json())
       .then((j) => {
-        if (Array.isArray(j.queues)) setQueues(j.queues as QueueStat[]);
+        if (Array.isArray(j.queues)) {
+          setQueues(j.queues as QueueStat[]);
+          setLastUpdated(Date.now());
+        }
       })
       .catch(() => {});
   }, []);
@@ -153,12 +221,43 @@ export default function QueuesPage() {
     }
   };
 
+  // Aggregate KPIs across the live queue set. DLQ depth is summed separately so
+  // a stuck dead-letter is impossible to miss at the top of the page.
+  const kpis = useMemo(() => {
+    let ready = 0;
+    let unacked = 0;
+    let consumers = 0;
+    let inRate = 0;
+    let outRate = 0;
+    let dlqTotal = 0;
+    let unreachable = 0;
+    for (const q of queues) {
+      if (!q.reachable) unreachable += 1;
+      if (q.name.endsWith(".dlq")) {
+        dlqTotal += q.messages;
+        continue;
+      }
+      ready += q.messages_ready;
+      unacked += q.messages_unacknowledged;
+      consumers += q.consumers;
+      inRate += q.publish_rate;
+      outRate += q.deliver_rate;
+    }
+    return { ready, unacked, consumers, inRate, outRate, dlqTotal, unreachable };
+  }, [queues]);
+
+  // Scale the in-row depth bars against the busiest queue.
+  const maxMessages = useMemo(
+    () => Math.max(1, ...queues.map((q) => q.messages)),
+    [queues],
+  );
+
   return (
-    <div className="mx-auto flex w-full min-w-0 max-w-[1200px] flex-col gap-6" data-testid="queues-page">
+    <div className="flex w-full min-w-0 flex-col gap-6" data-testid="queues-page">
       <header className="flex flex-wrap items-start justify-between gap-2">
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Queues</h1>
-          <p className="text-ui-sm text-ui-ink-muted">
+          <p className="max-w-3xl text-ui-sm text-ui-ink-muted">
             Per-stage ingest DAG queues (embed.dense/embed.sparse → index.search,
             index.graph, label) — live depth, dead-letters, and per-image history.
           </p>
@@ -177,49 +276,110 @@ export default function QueuesPage() {
       {error && <p className="text-ui-sm text-rose-500" data-testid="queues-error">{error}</p>}
       {notice && <p className="text-ui-sm text-emerald-500" data-testid="queues-notice">{notice}</p>}
 
+      {/* At-a-glance KPIs */}
+      <section
+        className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6"
+        data-testid="queue-kpis"
+      >
+        <Kpi label="Ready backlog" value={kpis.ready.toLocaleString()} tone={kpis.ready > 0 ? "warn" : "good"} />
+        <Kpi label="In-flight" value={kpis.unacked.toLocaleString()} />
+        <Kpi label="Dead-letters" value={kpis.dlqTotal.toLocaleString()} tone={kpis.dlqTotal > 0 ? "bad" : "good"} />
+        <Kpi label="Consumers" value={kpis.consumers.toLocaleString()} tone={kpis.consumers > 0 ? "default" : "warn"} />
+        <Kpi label="Publish /s" value={kpis.inRate.toFixed(1)} />
+        <Kpi label="Deliver /s" value={kpis.outRate.toFixed(1)} />
+      </section>
+
       {/* Live queue stats */}
       <section className={cls.card} data-testid="queue-stats">
-        <div className="mb-3 flex items-center justify-between">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-ui-sm font-semibold text-ui-ink-title">
-            Queue depth <span className="ml-2 text-ui-2xs text-ui-ink-muted">live · 3s</span>
+            Queue depth{" "}
+            <span className="ml-2 text-ui-2xs text-ui-ink-muted">
+              live · 3s{lastUpdated ? ` · updated ${ago(new Date(lastUpdated).toISOString())}` : ""}
+              {kpis.unreachable > 0 ? ` · ${kpis.unreachable} unreachable` : ""}
+            </span>
           </h2>
           <button className={cls.btn} onClick={refresh} data-testid="queues-refresh">
             Refresh
           </button>
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full text-ui-xs">
+          <table className="w-full min-w-[760px] text-ui-xs">
             <thead className="text-ui-ink-muted">
               <tr className="text-left">
                 <th className="px-2 py-1">queue</th>
                 <th className="px-2 py-1 text-right">ready</th>
                 <th className="px-2 py-1 text-right">unacked</th>
+                <th className="px-2 py-1 text-right">total</th>
+                <th className="w-[28%] px-2 py-1">depth</th>
                 <th className="px-2 py-1 text-right">consumers</th>
                 <th className="px-2 py-1 text-right">in/s</th>
                 <th className="px-2 py-1 text-right">out/s</th>
+                <th className="px-2 py-1 text-right">net/s</th>
               </tr>
             </thead>
             <tbody>
-              {queues.map((q) => (
-                <tr
-                  key={q.name}
-                  className={`border-t border-ui-border/40 ${q.reachable ? "" : "opacity-40"}`}
-                  data-testid={`queue-row-${q.name}`}
-                >
-                  <td className="px-2 py-1 font-medium text-ui-ink">
-                    {q.name}
-                    {!q.reachable && <span className="ml-1 text-ui-2xs text-ui-ink-muted">(down)</span>}
-                  </td>
-                  <td className="px-2 py-1 text-right tabular-nums">{q.messages_ready}</td>
-                  <td className="px-2 py-1 text-right tabular-nums">{q.messages_unacknowledged}</td>
-                  <td className="px-2 py-1 text-right tabular-nums">{q.consumers}</td>
-                  <td className="px-2 py-1 text-right tabular-nums">{q.publish_rate.toFixed(1)}</td>
-                  <td className="px-2 py-1 text-right tabular-nums">{q.deliver_rate.toFixed(1)}</td>
-                </tr>
-              ))}
+              {queues.map((q) => {
+                const net = q.publish_rate - q.deliver_rate;
+                const isDlq = q.name.endsWith(".dlq");
+                const barPct = Math.round((q.messages / maxMessages) * 100);
+                const barColor = isDlq
+                  ? "bg-rose-500/70"
+                  : q.messages_unacknowledged > 0
+                    ? "bg-sky-500/70"
+                    : "bg-accent-cyan/70";
+                return (
+                  <tr
+                    key={q.name}
+                    className={`border-t border-ui-border/40 align-middle hover:bg-ui-bg-soft/40 ${q.reachable ? "" : "opacity-40"}`}
+                    data-testid={`queue-row-${q.name}`}
+                  >
+                    <td className="px-2 py-1.5 font-medium text-ui-ink">
+                      <span className={isDlq ? "text-rose-500" : ""}>{q.name}</span>
+                      {!q.reachable && <span className="ml-1 text-ui-2xs text-ui-ink-muted">(down)</span>}
+                    </td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{q.messages_ready}</td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">
+                      {q.messages_unacknowledged > 0 ? (
+                        <span className="text-sky-500">{q.messages_unacknowledged}</span>
+                      ) : (
+                        q.messages_unacknowledged
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-right font-medium tabular-nums">{q.messages}</td>
+                    <td className="px-2 py-1.5">
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-ui-bg">
+                        <div
+                          className={`h-full rounded-full ${barColor}`}
+                          style={{ width: `${q.messages > 0 ? Math.max(barPct, 4) : 0}%` }}
+                        />
+                      </div>
+                    </td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">
+                      {q.consumers === 0 && q.messages_ready > 0 ? (
+                        <span className="text-amber-500" title="messages ready but no consumers">
+                          {q.consumers}
+                        </span>
+                      ) : (
+                        q.consumers
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{q.publish_rate.toFixed(1)}</td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{q.deliver_rate.toFixed(1)}</td>
+                    <td
+                      className={`px-2 py-1.5 text-right tabular-nums ${
+                        net > 0.05 ? "text-amber-500" : net < -0.05 ? "text-emerald-500" : "text-ui-ink-muted"
+                      }`}
+                    >
+                      {net > 0 ? "+" : ""}
+                      {net.toFixed(1)}
+                    </td>
+                  </tr>
+                );
+              })}
               {queues.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-2 py-3 text-ui-ink-muted">
+                  <td colSpan={9} className="px-2 py-3 text-ui-ink-muted">
                     No queue data (broker unreachable?).
                   </td>
                 </tr>
@@ -231,35 +391,48 @@ export default function QueuesPage() {
 
       {/* Dead-letter queues */}
       <section className={cls.card} data-testid="dlq-panel">
-        <h2 className="mb-3 text-ui-sm font-semibold text-ui-ink-title">Dead-letter queues</h2>
-        <div className="grid gap-3 sm:grid-cols-2">
+        <h2 className="mb-3 text-ui-sm font-semibold text-ui-ink-title">
+          Dead-letter queues
+          {kpis.dlqTotal > 0 && (
+            <span className="ml-2 rounded-full bg-rose-500/15 px-2 py-0.5 text-ui-2xs text-rose-500">
+              {kpis.dlqTotal} stuck
+            </span>
+          )}
+        </h2>
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {DLQ_BASES.map((base) => {
             const name = `${base}.dlq`;
             const stat = queues.find((q) => q.name === name);
+            const count = stat ? stat.messages : 0;
             const msgs = dlqMessages[name];
             return (
               <div
                 key={name}
-                className="flex min-w-0 flex-col gap-2 rounded-lg border border-ui-border/50 bg-ui-bg p-3"
+                className={`flex min-w-0 flex-col gap-2 rounded-lg border bg-ui-bg p-3 ${
+                  count > 0 ? "border-rose-500/40" : "border-ui-border/50"
+                }`}
                 data-testid={`dlq-${base}`}
               >
-                <div className="flex items-center justify-between">
-                  <p className="text-ui-sm font-medium text-ui-ink-title">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="min-w-0 truncate text-ui-sm font-medium text-ui-ink-title">
                     {name}
-                    <span className="ml-2 text-ui-2xs text-ui-ink-muted">
-                      {stat ? stat.messages : 0} msg
+                    <span
+                      className={`ml-2 text-ui-2xs ${count > 0 ? "font-semibold text-rose-500" : "text-ui-ink-muted"}`}
+                    >
+                      {count} msg
                     </span>
                   </p>
-                  <div className="flex gap-1">
-                    <button className={cls.btn} onClick={() => peekDlq(name)} data-testid={`dlq-peek-${base}`}>
+                  <div className="flex shrink-0 gap-1">
+                    <button className={cls.btnSm} onClick={() => peekDlq(name)} data-testid={`dlq-peek-${base}`}>
                       Peek
                     </button>
                     <button
-                      className={cls.btn}
+                      className={cls.btnSm}
                       onClick={() => requeueDlq(base)}
+                      disabled={count === 0}
                       data-testid={`dlq-requeue-${base}`}
                     >
-                      Requeue all
+                      Requeue
                     </button>
                     <button className={cls.danger} onClick={() => purge(name)} data-testid={`dlq-purge-${base}`}>
                       Purge
@@ -267,18 +440,47 @@ export default function QueuesPage() {
                   </div>
                 </div>
                 {msgs && (
-                  <ul className="flex max-h-56 flex-col gap-1 overflow-y-auto text-ui-2xs">
+                  <ul className="flex max-h-72 flex-col gap-1.5 overflow-y-auto text-ui-2xs">
                     {msgs.length === 0 && <li className="text-ui-ink-muted">empty</li>}
-                    {msgs.map((m, i) => (
-                      <li key={i} className="min-w-0 rounded border border-ui-border/40 bg-ui-bg-soft/40 p-1.5">
-                        <div className="truncate text-ui-ink">{m.payload}</div>
-                        {m.headers && (m.headers["x-error"] as string) && (
-                          <div className="mt-0.5 text-rose-500">
-                            attempt {String(m.headers["x-attempt"] ?? "?")}: {String(m.headers["x-error"])}
-                          </div>
-                        )}
-                      </li>
-                    ))}
+                    {msgs.map((m, i) => {
+                      const sha = payloadSha(m.payload);
+                      const attempt = m.headers?.["x-attempt"];
+                      const err = m.headers?.["x-error"];
+                      return (
+                        <li
+                          key={i}
+                          className="min-w-0 rounded border border-ui-border/40 bg-ui-bg-soft/40 p-2"
+                        >
+                          {sha ? (
+                            <div className="truncate font-mono text-ui-ink" title={sha}>
+                              {shortSha(sha)}
+                            </div>
+                          ) : (
+                            <div className="truncate text-ui-ink" title={m.payload ?? ""}>
+                              {m.payload ?? "(no payload)"}
+                            </div>
+                          )}
+                          {(attempt != null || err != null) && (
+                            <div className="mt-1 break-words text-rose-500">
+                              {attempt != null && (
+                                <span className="mr-1 rounded bg-rose-500/10 px-1">attempt {String(attempt)}</span>
+                              )}
+                              {err != null && String(err)}
+                            </div>
+                          )}
+                          {sha && m.payload && (
+                            <details className="mt-1">
+                              <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">
+                                payload
+                              </summary>
+                              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
+                                {m.payload}
+                              </pre>
+                            </details>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>
@@ -303,23 +505,53 @@ export default function QueuesPage() {
             Look up
           </button>
         </div>
-        {tasks.length > 0 && (
-          <div className="mt-3 flex flex-col gap-1">
-            {tasks.map((t) => (
-              <div
-                key={t.id}
-                className="flex items-center gap-3 rounded-lg border border-ui-border/50 bg-ui-bg px-3 py-1.5 text-ui-xs"
-              >
-                <span className={`shrink-0 rounded-full px-2 py-0.5 text-ui-2xs font-medium ${statusColor(t.status)}`}>
-                  {t.status}
-                </span>
-                <span className="w-14 shrink-0 text-ui-ink-muted">{t.type}</span>
-                <span className="min-w-0 flex-1 truncate font-mono text-ui-ink">{t.sha256}</span>
-                <span className="shrink-0 text-ui-2xs text-ui-ink-muted">attempts {t.attempts}</span>
-                {t.error && <span className="shrink-0 truncate text-rose-500" title={t.error}>err</span>}
-              </div>
-            ))}
+        {tasks.length > 0 ? (
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full min-w-[820px] text-ui-xs" data-testid="task-table">
+              <thead className="text-ui-ink-muted">
+                <tr className="text-left">
+                  <th className="px-2 py-1">status</th>
+                  <th className="px-2 py-1">type</th>
+                  <th className="px-2 py-1">sha256</th>
+                  <th className="px-2 py-1 text-right">attempts</th>
+                  <th className="px-2 py-1">created</th>
+                  <th className="px-2 py-1">updated</th>
+                  <th className="px-2 py-1">op</th>
+                  <th className="px-2 py-1">error</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tasks.map((t) => (
+                  <tr key={t.id} className="border-t border-ui-border/40 align-middle hover:bg-ui-bg-soft/40">
+                    <td className="px-2 py-1.5">
+                      <span className={`rounded-full px-2 py-0.5 text-ui-2xs font-medium ${statusColor(t.status)}`}>
+                        {t.status}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1.5 text-ui-ink-muted">{t.type}</td>
+                    <td className="px-2 py-1.5 font-mono text-ui-ink" title={t.sha256}>
+                      {shortSha(t.sha256)}
+                    </td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{t.attempts}</td>
+                    <td className="px-2 py-1.5 text-ui-ink-muted" title={t.created_at ?? ""}>
+                      {ago(t.created_at)}
+                    </td>
+                    <td className="px-2 py-1.5 text-ui-ink-muted" title={t.updated_at ?? ""}>
+                      {ago(t.updated_at)}
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-ui-2xs text-ui-ink-muted" title={t.parent_op_id ?? ""}>
+                      {t.parent_op_id ? t.parent_op_id.slice(0, 8) : "—"}
+                    </td>
+                    <td className="max-w-[24rem] truncate px-2 py-1.5 text-rose-500" title={t.error ?? ""}>
+                      {t.error ?? ""}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+        ) : (
+          <p className="mt-3 text-ui-2xs text-ui-ink-muted">No tasks loaded — look up a sha256 or list recent.</p>
         )}
       </section>
     </div>

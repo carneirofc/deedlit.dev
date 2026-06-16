@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import Link from "next/link";
+
 import { PathInput } from "@/components/PathInput";
-import { ServiceStatusBoard } from "@/components/ServiceStatusBoard";
 import { SourceFoldersPanel } from "@/components/SourceFoldersPanel";
 import { useActivity } from "@/lib/store/activity";
 
@@ -280,7 +281,7 @@ export default function AdminPage() {
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
           <p className="text-ui-sm text-ui-ink-muted">
-            Trigger ingestion &amp; maintenance, monitor service health and jobs.
+            Trigger ingestion &amp; maintenance and monitor jobs.
           </p>
         </div>
         {/* Deep-link to the distributed traces (one ingest = one cross-service
@@ -296,8 +297,32 @@ export default function AdminPage() {
         </a>
       </header>
 
-      {/* System status — every backend component + its dependencies */}
-      <ServiceStatusBoard />
+      {/* System health lives on its own page now — link across to it. */}
+      <Link
+        href="/admin/health"
+        className={`${cls.card} flex items-center justify-between gap-3 transition hover:border-accent-cyan/60`}
+        data-testid="health-link"
+      >
+        <span className="flex items-center gap-3">
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-5 w-5 shrink-0 fill-none stroke-accent-cyan"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+          </svg>
+          <span>
+            <span className="block text-ui-sm font-semibold text-ui-ink-title">System Health</span>
+            <span className="block text-ui-2xs text-ui-ink-muted">
+              Live status, dependency readiness &amp; activity for every backend service.
+            </span>
+          </span>
+        </span>
+        <span className="shrink-0 text-ui-sm text-ui-ink-muted">View ↗</span>
+      </Link>
 
       {error && (
         <p className="text-ui-sm text-rose-500" data-testid="admin-error">
