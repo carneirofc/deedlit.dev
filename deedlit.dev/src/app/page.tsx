@@ -14,6 +14,7 @@ import { GallerySection } from "@/features/gallery/components/GallerySection";
 import { getGalleryData } from "@/features/gallery/server/gallery-data";
 import { LocalServicesSection } from "@/features/services/components/LocalServicesSection";
 import { localServiceApps } from "@/features/services/data/local-services";
+import { UiShowcaseSection } from "@/features/showcase/components/UiShowcaseSection";
 
 export default async function HomePage() {
   const { assets } = await getGalleryData();
@@ -45,6 +46,10 @@ export default async function HomePage() {
 
       <SurfacePanel id="books" tone="soft" padding="none" className="scroll-mt-20 overflow-hidden">
         <BooksSection items={books} />
+      </SurfacePanel>
+
+      <SurfacePanel id="ui" tone="soft" padding="none" className="scroll-mt-20 overflow-hidden">
+        <UiShowcaseSection />
       </SurfacePanel>
 
       <SurfacePanel id="contact" tone="subtle" className="mb-4 scroll-mt-20">

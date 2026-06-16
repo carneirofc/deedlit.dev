@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
-import { GalleryCard } from "@/features/gallery/components/GalleryCard";
+import { Gallery } from "@deedlit.dev/ui";
 import { GalleryFilters } from "@/features/gallery/components/GalleryFilters";
 import { ImageModal } from "@/features/gallery/components/ImageModal";
 import { useGalleryFilters } from "@/features/gallery/hooks/useGalleryFilters";
@@ -178,15 +179,38 @@ export function GallerySection({ assets }: GallerySectionProps) {
           No matches.
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {filteredAssets.map((asset, index) => (
-            <GalleryCard
-              key={asset.id}
-              asset={asset}
-              onView={() => openModal(index)}
-            />
-          ))}
-        </div>
+        <Gallery
+          items={filteredAssets}
+          getKey={(asset) => asset.id}
+          viewMode="grid"
+          gridClassName="grid gap-4 sm:grid-cols-2 lg:grid-cols-3"
+          cardClassName="rounded-xl2 bg-surface/75 p-3 shadow-soft"
+          mediaClassName="focus-ring w-full"
+          onOpen={(index) => openModal(index)}
+          renderMedia={(asset) => (
+            <div className="relative overflow-hidden rounded-lg">
+              <div className="relative aspect-[3/4]">
+                <Image
+                  src={asset.src}
+                  alt={asset.title}
+                  fill
+                  sizes="(max-width: 768px) 100vw, (max-width: 1280px) 50vw, 33vw"
+                  className="object-cover transition-transform duration-500 group-hover:scale-[1.03]"
+                />
+              </div>
+            </div>
+          )}
+          renderMeta={(asset) => (
+            <div className="mt-3">
+              <a
+                href={asset.referenceHref}
+                className="focus-ring text-sm font-medium text-muted transition hover:text-text"
+              >
+                {asset.title}
+              </a>
+            </div>
+          )}
+        />
       )}
 
       <ImageModal

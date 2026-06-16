@@ -6,6 +6,7 @@ import {
   HiOutlineComputerDesktop,
   HiOutlinePhoto,
   HiOutlineBookOpen,
+  HiOutlineSwatch,
   HiOutlineEnvelope,
   HiOutlineBars3,
   HiOutlineXMark,
@@ -31,6 +32,11 @@ const navLinks = [
     href: "#books",
     label: "Books",
     icon: <HiOutlineBookOpen aria-hidden="true" className="h-5 w-5" />,
+  },
+  {
+    href: "#ui",
+    label: "UI Kit",
+    icon: <HiOutlineSwatch aria-hidden="true" className="h-5 w-5" />,
   },
   {
     href: "#contact",
