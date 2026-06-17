@@ -23,6 +23,8 @@ Environment variables (all optional):
 | `CLIP_FP16` | `true` | Use half precision on CUDA. |
 | `SPARSE_MODEL` | `prithivida/Splade_PP_en_v1` | SPLADE model for `/embed/sparse`. |
 | `SPARSE_DEVICE` | same as `CLIP_DEVICE` | Device for SPLADE (onnxruntime). `cuda` runs sparse on the GPU via `CUDAExecutionProvider` (needs the `fastembed-gpu` package); `cpu` forces CPU. Runs on its own worker thread so dense + sparse embed in parallel. |
+| `VISION_DENSE_BATCH_MAX` | `16` | Max images coalesced into one batched dense GPU forward. Concurrent `POST /embed/image` calls (the ingest hot path) fuse into a single `[B,3,224,224]` pass so a large ingest backlog saturates the GPU. Lower if VRAM is tight. |
+| `VISION_DENSE_BATCH_WAIT_MS` | `10` | How long the first queued image waits to accumulate a batch before firing (throughput vs. latency). `0` fires as soon as the GPU worker is free, still grabbing everything already queued. |
 | `QDRANT_URL` | `http://localhost:6333` | Optional Qdrant base URL for the test UI's live-search section. |
 | `QDRANT_COLLECTION` | `images` | Collection the test UI searches against. |
 | `QDRANT_TIMEOUT` | `5.0` | HTTP timeout (seconds) for Qdrant calls. |

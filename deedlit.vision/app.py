@@ -484,6 +484,21 @@ _gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-gpu")
 # (no double model load).
 _sparse_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-sparse")
 
+# Dense micro-batching. The ingest hot path POSTs /embed/image for ONE image per
+# file; with a scaled ingest-worker pool, hundreds of those land here at once. On
+# the single GPU worker they otherwise run one-image-at-a-time (batch=1), which
+# wastes the GPU — a ViT-H forward on one 224x224 image leaves almost all of the
+# device idle. The batcher coalesces concurrent single-image requests that arrive
+# within a short window into ONE [B,3,224,224] forward pass, so a large ingest
+# backlog saturates the GPU. Single-flight is preserved (still one forward at a
+# time on _gpu_pool); batching IS the parallelism — B images embed together.
+#   VISION_DENSE_BATCH_MAX:     max images per GPU forward.
+#   VISION_DENSE_BATCH_WAIT_MS: how long the first request waits to accumulate a
+#                               batch before firing (latency vs. throughput knob;
+#                               0 = fire as soon as the worker is free).
+DENSE_BATCH_MAX = max(1, int(os.getenv("VISION_DENSE_BATCH_MAX", "16")))
+DENSE_BATCH_WAIT_MS = max(0.0, float(os.getenv("VISION_DENSE_BATCH_WAIT_MS", "10")))
+
 
 async def _run_gpu(fn, *args):
     """Run a blocking GPU/CPU torch call on the single torch inference worker thread."""
@@ -565,12 +580,107 @@ def _embed_text_list(text: str, preset: str) -> list[float]:
     return _embed_text_vec(text, preset).float().cpu().tolist()
 
 
+def _embed_images_batch(images: list[Image.Image], preset: str) -> list[list[float]]:
+    """Embed a list of images in ONE batched GPU forward pass.
+
+    Preprocesses every image, stacks them into a single [B,3,224,224] tensor and
+    runs one forward — the GPU embeds the whole batch in parallel instead of B
+    sequential batch-1 passes. ``_normalize`` reduces over the last dim, so it
+    L2-normalizes each row independently. Returns one plain-Python vector per
+    image, in input order.
+    """
+    _load_vision_model(preset)
+
+    started = time.perf_counter()
+    batch = torch.stack([_vision_preprocess[preset](image) for image in images]).to(DEVICE)
+
+    if USE_FP16 and DEVICE.startswith("cuda"):
+        batch = batch.half()
+
+    with torch.no_grad():
+        vecs = _vision_models[preset](pixel_values=batch).image_embeds
+        vecs = _normalize(vecs)
+
+    log.info(
+        "embed image batch (%s) n=%d %.0f ms on %s%s",
+        preset, len(images), (time.perf_counter() - started) * 1000, DEVICE,
+        " fp16" if (USE_FP16 and DEVICE.startswith("cuda")) else "",
+    )
+    return vecs.float().cpu().tolist()
+
+
 def _embed_images_list(items: list[tuple[str, Image.Image]], preset: str) -> list[tuple[str, list[float]]]:
-    return [(label, _embed_image_list(image, preset)) for label, image in items]
+    # One batched forward for the whole upload rather than a per-image loop.
+    vectors = _embed_images_batch([image for _, image in items], preset)
+    return [(label, vector) for (label, _), vector in zip(items, vectors)]
 
 
 def _embed_texts_list(texts: list[str], preset: str) -> list[tuple[str, list[float]]]:
     return [(text, _embed_text_list(text, preset)) for text in texts]
+
+
+# --- Dense micro-batcher -------------------------------------------------
+# One asyncio.Queue + one drain task per preset. /embed/image enqueues its image
+# with a future and awaits it; the drain task coalesces everything that arrives
+# within DENSE_BATCH_WAIT_MS (capped at DENSE_BATCH_MAX) into a single batched GPU
+# forward, then resolves each future. Lazily started on the uvicorn event loop on
+# the first request (single uvicorn worker => one loop, so no cross-loop hazard).
+_dense_queues: dict[str, asyncio.Queue] = {}
+_dense_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _dense_batch_loop(preset: str, queue: asyncio.Queue) -> None:
+    """Drain ``queue`` forever, embedding each coalesced batch in one GPU job."""
+    loop = asyncio.get_running_loop()
+    while True:
+        image, fut = await queue.get()
+        batch: list[tuple[Image.Image, asyncio.Future]] = [(image, fut)]
+
+        # Accumulate more requests that arrive within the wait window, so a burst
+        # of concurrent single-image calls fires as one big forward. A free worker
+        # with WAIT_MS=0 still grabs everything already queued before embedding.
+        deadline = loop.time() + DENSE_BATCH_WAIT_MS / 1000.0
+        while len(batch) < DENSE_BATCH_MAX:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(queue.get(), remaining))
+            except asyncio.TimeoutError:
+                break
+
+        images = [im for im, _ in batch]
+        try:
+            vectors = await _run_gpu(_embed_images_batch, images, preset)
+            for (_, f), vector in zip(batch, vectors):
+                if not f.done():
+                    f.set_result(vector)
+        except Exception as exc:  # propagate the same failure to every waiter
+            for _, f in batch:
+                if not f.done():
+                    f.set_exception(exc)
+
+
+def _dense_queue(preset: str) -> asyncio.Queue:
+    """Return (lazily creating) the per-preset queue + its running drain task."""
+    queue = _dense_queues.get(preset)
+    if queue is None:
+        queue = asyncio.Queue()
+        _dense_queues[preset] = queue
+        # Keep a reference so the long-lived task is never GC'd mid-flight.
+        _dense_tasks[preset] = asyncio.create_task(_dense_batch_loop(preset, queue))
+    return queue
+
+
+async def _embed_image_batched(image: Image.Image, preset: str) -> list[float]:
+    """Submit one image to the dense batcher and await its embedding.
+
+    Concurrent callers coalesce into a shared GPU forward; a single caller still
+    gets a (batch-of-one) embedding after at most DENSE_BATCH_WAIT_MS.
+    """
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    await _dense_queue(preset).put((image, fut))
+    return await fut
 
 
 async def _read_image_upload(file: UploadFile) -> Image.Image:
@@ -946,7 +1056,9 @@ async def embed_image(
 ) -> EmbeddingResponse:
     preset = _resolve_preset(model)
     image = await _read_image_upload(file)
-    embedding = await _run_gpu(_embed_image_list, image, preset)
+    # Go through the micro-batcher: concurrent /embed/image calls (the ingest hot
+    # path) coalesce into one batched GPU forward instead of serializing batch-1.
+    embedding = await _embed_image_batched(image, preset)
 
     return EmbeddingResponse(
         model_preset=preset,

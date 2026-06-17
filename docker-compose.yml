@@ -72,13 +72,34 @@ services:
       retries: 20
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # GPU-accelerated index build by default (this stack runs on the GPU box).
+    # The gpu-nvidia image + QDRANT__GPU__INDEXING speed up HNSW INDEX BUILDING
+    # (bulk ingest + POST /rebuild on large libraries) — query execution is always
+    # CPU in Qdrant, so this does not change search latency, only how fast a large
+    # collection becomes searchable. Needs the device reservation below + the
+    # NVIDIA container runtime on the host.
+    # CPU-only host (no NVIDIA runtime, e.g. CI): override both envs AND drop the
+    # `deploy:` block — a GPU reservation makes `docker compose up` fail with
+    # "could not select device driver" when no GPU is present:
+    #     QDRANT_IMAGE=qdrant/qdrant:latest QDRANT_GPU_INDEXING=false docker compose up -d
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:gpu-nvidia-latest}
     restart: unless-stopped
     ports:
       - "6333:6333"
       - "6334:6334"
+    environment:
+      # Qdrant reads nested config from QDRANT__<SECTION>__<KEY>. gpu.indexing=true
+      # builds HNSW on the GPU; it no-ops (CPU build) on the non-GPU image.
+      QDRANT__GPU__INDEXING: "${QDRANT_GPU_INDEXING:-true}"
     volumes:
       - qdrant_data:/qdrant/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 10s

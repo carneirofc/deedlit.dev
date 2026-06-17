@@ -87,6 +87,14 @@ const SORT_LABEL: Record<SortMode, string> = {
 const BROWSE_SORTS: SortMode[] = ["newest", "oldest", "created_desc", "created_asc", "rating_desc", "rating_asc", "name_asc", "name_desc"];
 const SEARCH_SORTS: SortMode[] = ["relevance", "rating_desc", "rating_asc"];
 
+// How many pages to warm in the background beyond what's rendered, so "load
+// more" / infinite scroll lands instantly. Only the offset-paged browse/search
+// paths prefetch (similar / by-image are single-page).
+const PREFETCH_AHEAD = 2;
+// Upper bound on the cold restore from `?page=N` — it costs up to N sequential
+// page fetches, so cap it however deep the address claims the user had paged.
+const MAX_RESTORE_PAGES = 20;
+
 /** The catalog browse path is used only for filter-only browsing (no query). */
 function isBrowsePath(mode: BrowseMode, query: string): boolean {
   return mode === "browse" && query.trim() === "";
@@ -180,6 +188,18 @@ export default function LibraryPage() {
     window.history.replaceState(window.history.state, "", url);
   }, []);
 
+  // Pagination depth in the address: `?page=N` records how many pages are
+  // currently stacked in the grid, so a copied / refreshed URL re-pages to the
+  // same accumulated window (consumed by the init effect below). Page 1 is the
+  // bare state, so it drops the param. replaceState — no router churn.
+  const syncPageUrl = useCallback((page: number) => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (page > 1) url.searchParams.set("page", String(page));
+    else url.searchParams.delete("page");
+    window.history.replaceState(window.history.state, "", url);
+  }, []);
+
   // Bulk selection + actions. In select mode a card click toggles selection
   // instead of opening the viewer. "Export details" downloads each picked
   // image's canonical catalog record as JSON; "Delete selected" un-indexes each
@@ -212,6 +232,195 @@ export default function LibraryPage() {
     };
   });
 
+  // One page fetch for a filter snapshot at a given offset. Builds the right
+  // request for the active path (similar / by-image / browse / search) and
+  // returns the rows plus whether more pages exist. Both the rendered fetch
+  // (doFetch) and the background prefetcher go through here, so the request shape
+  // lives in exactly one place. `note` is only produced by the by-image path.
+  const fetchPage = useCallback(
+    async (
+      s: typeof filtersRef.current,
+      pageOffset: number,
+      signal: AbortSignal,
+    ): Promise<{ fresh: CompactResult[]; more: boolean; note?: string }> => {
+      const pageSize = s.limit;
+      const safetySubset =
+        s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length ? s.safety : undefined;
+      const ratingGte = s.minRating > 0 ? s.minRating : undefined;
+      const loraList = csv(s.loras);
+      const filters = {
+        tags: s.tags.length ? s.tags : undefined,
+        excludeTags: s.excludeTags.length ? s.excludeTags : undefined,
+        modelFamily: s.modelFamily.trim() || undefined,
+        checkpoint: s.checkpoint.trim() || undefined,
+        loras: loraList.length ? loraList : undefined,
+        sourceTool: s.sourceTool.trim() || undefined,
+        favorite: s.favorites || undefined,
+        ratingGte,
+        // Only send a safety filter when a strict subset is selected; all (or
+        // none) selected means "no filter" so unclassified images stay visible.
+        safety: safetySubset,
+      };
+
+      if (s.mode === "similar" && s.similarRef) {
+        const r = await fetch("/api/library/search/similar", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ imageId: s.similarRef.id, filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }),
+          signal,
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? "Similarity search failed");
+        return { fresh: j.results ?? [], more: false };
+      }
+      if (s.mode === "image" && s.imageFile) {
+        const fd = new FormData();
+        fd.append("file", s.imageFile);
+        fd.append("options", JSON.stringify({ filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }));
+        const r = await fetch("/api/library/search/by-image", { method: "POST", body: fd, signal });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? "Image search failed");
+        const note = j.semantic
+          ? `Visual similarity · ${j.provider}`
+          : "Visual similarity · local color/layout features (CLIP not configured)";
+        return { fresh: j.results ?? [], more: false, note };
+      }
+      if (isBrowsePath(s.mode, s.query)) {
+        // Filter-only browse over the catalog truth: real server-side sort +
+        // offset pagination (the vector /search needs a query and can't sort by
+        // date/name). `relevance` has no meaning without a query, so it maps to
+        // newest here. Only catalog-backed filters apply (model/lora/source-tool
+        // are vector-only and silently skipped on this path).
+        const browseSort: CatalogSort = s.sort === "relevance" ? "newest" : s.sort;
+        const r = await fetch("/api/library/browse", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            tags: filters.tags,
+            excludeTags: filters.excludeTags,
+            favorite: filters.favorite,
+            ratingGte: filters.ratingGte,
+            safety: filters.safety,
+            sort: browseSort,
+            limit: pageSize,
+            offset: pageOffset,
+          }),
+          signal,
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? "Browse failed");
+        const fresh: CompactResult[] = j.results ?? [];
+        return { fresh, more: j.hasMore ?? fresh.length === pageSize };
+      }
+      // Unified text / filter search. The gateway encodes the text query into
+      // dense+sparse vectors, so this is the hybrid "browse + semantic" path.
+      const r = await fetch("/api/library/search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          query: s.query || undefined,
+          ...filters,
+          graphScope: s.graphScope ?? undefined,
+          limit: pageSize,
+          offset: pageOffset,
+        }),
+        signal,
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? "Search failed");
+      const fresh: CompactResult[] = j.results ?? [];
+      return { fresh, more: fresh.length === pageSize };
+    },
+    [],
+  );
+
+  // --- Background page prefetch -------------------------------------------
+  // Warm the next PREFETCH_AHEAD pages so the next "load more" / scroll renders
+  // with no spinner. Keyed by a signature of the active filters: a filter change
+  // discards stale pages. Only the offset-paged paths use it (see `paginates`).
+  const prefetchRef = useRef<{
+    sig: string;
+    pages: Map<number, { fresh: CompactResult[]; more: boolean }>;
+    inFlight: Set<number>;
+    controllers: AbortController[];
+    exhausted: boolean; // a fetched page came back short — no pages beyond it
+  }>({ sig: "", pages: new Map(), inFlight: new Set(), controllers: [], exhausted: false });
+
+  const prefetchSig = (s: typeof filtersRef.current): string =>
+    JSON.stringify({
+      mode: s.mode, query: s.query, tags: s.tags, excludeTags: s.excludeTags,
+      modelFamily: s.modelFamily, checkpoint: s.checkpoint, loras: s.loras, sourceTool: s.sourceTool,
+      favorites: s.favorites, minRating: s.minRating, safety: s.safety, limit: s.limit,
+      minScore: s.minScore, similar: s.similarRef?.id ?? null, image: !!s.imageFile,
+      graphScope: s.graphScope, sort: s.sort,
+    });
+
+  // similar / by-image return a single relevance-ranked window (no offset), so
+  // there are no further pages to warm.
+  const paginates = (s: typeof filtersRef.current): boolean =>
+    s.mode !== "similar" && !(s.mode === "image" && s.imageFile);
+
+  // Abort outstanding prefetches and rebind the buffer to a new filter signature.
+  const resetPrefetch = useCallback((s: typeof filtersRef.current) => {
+    prefetchRef.current.controllers.forEach((c) => c.abort());
+    prefetchRef.current = {
+      sig: prefetchSig(s), pages: new Map(), inFlight: new Set(), controllers: [], exhausted: false,
+    };
+  }, []);
+
+  // Drop buffered pages but keep the signature — used when the freshness poll
+  // splices new rows at the head and shifts every offset out from under them.
+  const invalidatePrefetchPages = useCallback(() => {
+    const pf = prefetchRef.current;
+    pf.controllers.forEach((c) => c.abort());
+    pf.pages.clear();
+    pf.inFlight.clear();
+    pf.controllers = [];
+    pf.exhausted = false;
+  }, []);
+
+  // Pull a warmed page if it matches the current filters; consuming removes it
+  // so a shifted offset can't re-serve it.
+  const takePrefetched = useCallback((s: typeof filtersRef.current, pageIndex: number) => {
+    const pf = prefetchRef.current;
+    if (pf.sig !== prefetchSig(s)) return null;
+    const hit = pf.pages.get(pageIndex);
+    if (hit) pf.pages.delete(pageIndex);
+    return hit ?? null;
+  }, []);
+
+  // Warm up to PREFETCH_AHEAD pages beyond what's loaded. Sequential so we stop
+  // the moment a short page reveals the end. Fire-and-forget.
+  const schedulePrefetch = useCallback(
+    (s: typeof filtersRef.current) => {
+      if (!paginates(s)) return;
+      const pf = prefetchRef.current;
+      if (pf.sig !== prefetchSig(s) || pf.exhausted) return;
+      const pageSize = s.limit;
+      const start = pageRef.current; // index of the next not-yet-loaded page
+      void (async () => {
+        for (let i = 0; i < PREFETCH_AHEAD; i++) {
+          const idx = start + i;
+          if (pf.exhausted || pf.pages.has(idx) || pf.inFlight.has(idx)) continue;
+          pf.inFlight.add(idx);
+          const controller = new AbortController();
+          pf.controllers.push(controller);
+          try {
+            const res = await fetchPage(s, idx * pageSize, controller.signal);
+            if (prefetchRef.current.sig !== pf.sig) return; // filters changed mid-flight
+            pf.pages.set(idx, { fresh: res.fresh, more: res.more });
+            if (!res.more) pf.exhausted = true;
+          } catch {
+            // ignore — the page will just be fetched on demand
+          } finally {
+            pf.inFlight.delete(idx);
+          }
+        }
+      })();
+    },
+    [fetchPage],
+  );
+
   const doFetch = useCallback(
     async (append: boolean, overrides?: Partial<typeof filtersRef.current>) => {
       const s = { ...filtersRef.current, ...overrides };
@@ -243,6 +452,7 @@ export default function LibraryPage() {
         setConfirmingBulk(false);
         setHasNew(false);
         newestIdRef.current = null;
+        resetPrefetch(s); // new filter set — discard warmed pages
       }
 
       // Image mode with no image yet: nothing to search.
@@ -250,6 +460,7 @@ export default function LibraryPage() {
         setResults([]);
         setHasMore(false);
         setLoading(false);
+        syncPageUrl(1);
         return;
       }
 
@@ -258,97 +469,15 @@ export default function LibraryPage() {
 
       const pageSize = s.limit;
       const pageOffset = append ? pageRef.current * pageSize : 0;
-      const safetySubset =
-        s.safety.length > 0 && s.safety.length < SAFETY_CLASSES.length ? s.safety : undefined;
-      const ratingGte = s.minRating > 0 ? s.minRating : undefined;
-      const loraList = csv(s.loras);
-      const filters = {
-        tags: s.tags.length ? s.tags : undefined,
-        excludeTags: s.excludeTags.length ? s.excludeTags : undefined,
-        modelFamily: s.modelFamily.trim() || undefined,
-        checkpoint: s.checkpoint.trim() || undefined,
-        loras: loraList.length ? loraList : undefined,
-        sourceTool: s.sourceTool.trim() || undefined,
-        favorite: s.favorites || undefined,
-        ratingGte,
-        // Only send a safety filter when a strict subset is selected; all (or
-        // none) selected means "no filter" so unclassified images stay visible.
-        safety: safetySubset,
-      };
 
       try {
-        let fresh: CompactResult[] = [];
-        let more = false;
-
-        if (s.mode === "similar" && s.similarRef) {
-          const r = await fetch("/api/library/search/similar", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ imageId: s.similarRef.id, filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }),
-            signal,
-          });
-          const j = await r.json();
-          if (!r.ok) throw new Error(j.error ?? "Similarity search failed");
-          fresh = j.results ?? [];
-        } else if (s.mode === "image" && s.imageFile) {
-          const fd = new FormData();
-          fd.append("file", s.imageFile);
-          fd.append("options", JSON.stringify({ filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }));
-          const r = await fetch("/api/library/search/by-image", { method: "POST", body: fd, signal });
-          const j = await r.json();
-          if (!r.ok) throw new Error(j.error ?? "Image search failed");
-          fresh = j.results ?? [];
-          setImageNote(
-            j.semantic
-              ? `Visual similarity · ${j.provider}`
-              : "Visual similarity · local color/layout features (CLIP not configured)",
-          );
-        } else if (isBrowsePath(s.mode, s.query)) {
-          // Filter-only browse over the catalog truth: real server-side sort +
-          // offset pagination (the vector /search needs a query and can't sort by
-          // date/name). `relevance` has no meaning without a query, so it maps to
-          // newest here. Only catalog-backed filters apply (model/lora/source-tool
-          // are vector-only and silently skipped on this path).
-          const browseSort: CatalogSort = s.sort === "relevance" ? "newest" : s.sort;
-          const r = await fetch("/api/library/browse", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              tags: filters.tags,
-              excludeTags: filters.excludeTags,
-              favorite: filters.favorite,
-              ratingGte: filters.ratingGte,
-              safety: filters.safety,
-              sort: browseSort,
-              limit: pageSize,
-              offset: pageOffset,
-            }),
-            signal,
-          });
-          const j = await r.json();
-          if (!r.ok) throw new Error(j.error ?? "Browse failed");
-          fresh = j.results ?? [];
-          more = j.hasMore ?? fresh.length === pageSize;
-        } else {
-          // Unified text / filter search. The gateway encodes the text query into
-          // dense+sparse vectors, so this is the hybrid "browse + semantic" path.
-          const r = await fetch("/api/library/search", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              query: s.query || undefined,
-              ...filters,
-              graphScope: s.graphScope ?? undefined,
-              limit: pageSize,
-              offset: pageOffset,
-            }),
-            signal,
-          });
-          const j = await r.json();
-          if (!r.ok) throw new Error(j.error ?? "Search failed");
-          fresh = j.results ?? [];
-          more = fresh.length === pageSize;
-        }
+        // On append, consume a warmed page if we have one (instant); otherwise
+        // fetch it. The next page's index equals the current loaded-page count.
+        const buffered = append ? takePrefetched(s, pageRef.current) : null;
+        const { fresh, more, note } = buffered
+          ? { note: undefined as string | undefined, ...buffered }
+          : await fetchPage(s, pageOffset, signal);
+        if (note !== undefined) setImageNote(note);
 
         // A newer call superseded this one while we were awaiting — discard.
         if (fetchGen.current !== gen) return;
@@ -370,6 +499,9 @@ export default function LibraryPage() {
           newestIdRef.current = fresh[0]?.imageId ?? null;
         }
         setHasMore(more);
+        // Record the new depth in the address and warm the pages beyond it.
+        syncPageUrl(pageRef.current);
+        schedulePrefetch(s);
       } catch (e) {
         if (e instanceof Error && e.name === "AbortError") return;
         if (fetchGen.current !== gen) return;
@@ -379,7 +511,7 @@ export default function LibraryPage() {
         if (fetchGen.current === gen) setLoading(false);
       }
     },
-    [],
+    [fetchPage, resetPrefetch, takePrefetched, schedulePrefetch, syncPageUrl],
   );
 
   // Run a plain text / filter search, dropping any active image / similar query.
@@ -761,6 +893,12 @@ export default function LibraryPage() {
     pendingViewRef.current = sp.get("view"); // opened once results land (below)
     const wantImage = qpMode === "image" || (!qpMode && settings.defaultMode === "image");
     const initialMode: BrowseMode = wantImage ? "image" : "browse";
+    // Restore how deep the user had paged (`?page=N`) so the address returns to
+    // the same accumulated window. Capped — a cold restore costs N sequential
+    // page fetches. By-image can't be restored (its file isn't in the URL).
+    const wantPages = wantImage
+      ? 1
+      : Math.min(Math.max(1, Math.floor(Number(sp.get("page")) || 1)), MAX_RESTORE_PAGES);
 
     if (qpTags.length) setTags(qpTags);
     if (qpQuery) setQuery(qpQuery);
@@ -770,7 +908,9 @@ export default function LibraryPage() {
     setMinRating(settings.defaultMinRating);
     setMinScore(settings.defaultMinScore);
     setLimit(settings.pageSize);
-    doFetch(false, {
+    // State setters above don't reach filtersRef before this runs, so pass the
+    // full snapshot as overrides — to the initial load AND every restore page.
+    const overrides = {
       mode: initialMode,
       tags: qpTags,
       query: qpQuery,
@@ -780,7 +920,15 @@ export default function LibraryPage() {
       limit: settings.pageSize,
       similarRef: null,
       imageFile: null,
-    });
+    } as const;
+    void (async () => {
+      await doFetch(false, overrides);
+      // Re-page up to the saved depth. Each step consumes a prefetched page when
+      // one is warm, so the restore mostly skips the network after the first.
+      for (let i = 1; i < wantPages; i++) {
+        await doFetch(true, overrides);
+      }
+    })();
   }, [hydrated, settings, doFetch]);
 
   // Infinite scroll: prefetch the next page well before the sentinel is visible.
@@ -862,6 +1010,9 @@ export default function LibraryPage() {
           });
           newestIdRef.current = topId;
           setHasNew(false);
+          // Head rows shifted every deeper offset — drop warmed pages; the next
+          // load-more re-fetches and re-warms from the new boundary.
+          invalidatePrefetchPages();
         } else {
           setHasNew(true); // surface the banner; refresh re-pages from the top
         }
@@ -874,7 +1025,7 @@ export default function LibraryPage() {
       alive = false;
       clearInterval(id);
     };
-  }, [mode, query, tags, excludeTags, favorites, minRating, safety, settings.sortMode]);
+  }, [mode, query, tags, excludeTags, favorites, minRating, safety, settings.sortMode, invalidatePrefetchPages]);
 
   const startIngest = async () => {
     if (!folderPath.trim()) return;
@@ -938,15 +1089,20 @@ export default function LibraryPage() {
   };
 
   // Consume a `?view=` deep link: once results are in, open the viewer on the
-  // matching image. If it isn't in the loaded window we just drop the request
-  // (one shot) rather than chasing pages.
+  // matching image. The window grows page-by-page during a `?page=N` restore, so
+  // keep looking as it fills; only give up (one shot) once everything is loaded
+  // and it still isn't here — we don't chase pages beyond the restored depth.
   useEffect(() => {
     const want = pendingViewRef.current;
     if (!want || displayResults.length === 0) return;
-    pendingViewRef.current = null;
     const i = displayResults.findIndex((r) => r.imageId === want);
-    if (i !== -1) openLightbox(i);
-  }, [displayResults, openLightbox]);
+    if (i !== -1) {
+      pendingViewRef.current = null;
+      openLightbox(i);
+    } else if (!loading && !hasMore) {
+      pendingViewRef.current = null; // fully loaded and absent — abandon
+    }
+  }, [displayResults, openLightbox, loading, hasMore]);
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-6">
