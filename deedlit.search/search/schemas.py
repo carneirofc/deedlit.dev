@@ -15,13 +15,21 @@ class SparseVector(BaseModel):
 
 class UpsertPoint(BaseModel):
     sha256: str = Field(pattern=SHA256_PATTERN)
-    dense: list[float] = Field(description="1024-dim CLIP vector")
+    dense: list[float] = Field(description="1024-dim CLIP image vector")
+    description: list[float] | None = Field(
+        default=None,
+        description="1024-dim CLIP text vector of the AI description (optional).",
+    )
     sparse: SparseVector | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class HybridQuery(BaseModel):
     dense: list[float] | None = None
+    description: list[float] | None = Field(
+        default=None,
+        description="CLIP text vector to match against description vectors (optional).",
+    )
     sparse: SparseVector | None = None
     limit: int = 24
     filter: dict[str, Any] | None = None
@@ -39,7 +47,7 @@ class Hit(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    fusion: Literal["rrf", "dense", "sparse"]
+    fusion: Literal["rrf", "dense", "description", "sparse"]
     hits: list[Hit] = Field(default_factory=list)
 
 

@@ -18,6 +18,7 @@ from qdrant_client import QdrantClient, models
 from id_scheme import point_id_for_sha256
 from search.config import (
     DENSE_VECTOR_NAME,
+    DESCRIPTION_VECTOR_NAME,
     SPARSE_VECTOR_NAME,
     SearchConfig,
 )
@@ -51,6 +52,13 @@ class SearchStore:
                     size=self.config.dense_dim,
                     distance=models.Distance.COSINE,
                 ),
+                # CLIP text embedding of the AI description — same space/dim as the
+                # image vector, indexed under its own name so it can be queried
+                # independently. Stored per-point only when a description exists.
+                DESCRIPTION_VECTOR_NAME: models.VectorParams(
+                    size=self.config.dense_dim,
+                    distance=models.Distance.COSINE,
+                ),
             },
             sparse_vectors_config={
                 SPARSE_VECTOR_NAME: models.SparseVectorParams(
@@ -74,11 +82,19 @@ class SearchStore:
         dense: list[float],
         sparse: SparseVector | None,
         payload: dict[str, Any] | None,
+        description: list[float] | None = None,
     ) -> str:
-        """Upsert one point keyed by uuid5(sha256). Returns the point id."""
+        """Upsert one point keyed by uuid5(sha256). Returns the point id.
+
+        ``description`` is the optional CLIP-text vector of the AI description; it
+        is stored under its own named vector only when present, so images without
+        a description still index on ``dense`` (+ ``sparse``).
+        """
         point_id = point_id_for_sha256(sha256)
 
         vector: dict[str, Any] = {DENSE_VECTOR_NAME: dense}
+        if description is not None:
+            vector[DESCRIPTION_VECTOR_NAME] = description
         if sparse is not None:
             vector[SPARSE_VECTOR_NAME] = models.SparseVector(
                 indices=sparse.indices, values=sparse.values
@@ -138,66 +154,56 @@ class SearchStore:
         sparse: SparseVector | None,
         limit: int,
         query_filter: dict[str, Any] | None = None,
+        description: list[float] | None = None,
     ) -> tuple[str, list[Hit]]:
         """Run a query and return (fusion, hits).
 
-        - both dense+sparse  -> RRF fusion over two prefetches
-        - dense only         -> nearest on the dense named vector
-        - sparse only        -> nearest on the sparse named vector
+        Accepts any subset of the three modalities (image ``dense``, ``description``
+        text, and lexical ``sparse``). Two or more are RRF-fused over one prefetch
+        each; a single modality is a plain nearest-neighbour query named after it.
         """
         qfilter = self._filter(query_filter)
 
-        if dense is not None and sparse is not None:
-            prefetch = [
-                models.Prefetch(
-                    query=dense,
-                    using=DENSE_VECTOR_NAME,
-                    limit=limit,
-                    filter=qfilter,
-                ),
-                models.Prefetch(
-                    query=models.SparseVector(
-                        indices=sparse.indices, values=sparse.values
-                    ),
-                    using=SPARSE_VECTOR_NAME,
-                    limit=limit,
-                    filter=qfilter,
-                ),
-            ]
-            result = self.client.query_points(
-                collection_name=self.collection,
-                prefetch=prefetch,
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
-                limit=limit,
-                with_payload=True,
-            )
-            return "rrf", self._to_hits(result.points)
-
+        # (fusion-name, named-vector, query) per supplied modality, in fusion order.
+        modalities: list[tuple[str, str, Any]] = []
         if dense is not None:
-            result = self.client.query_points(
-                collection_name=self.collection,
-                query=dense,
-                using=DENSE_VECTOR_NAME,
-                limit=limit,
-                query_filter=qfilter,
-                with_payload=True,
-            )
-            return "dense", self._to_hits(result.points)
-
+            modalities.append(("dense", DENSE_VECTOR_NAME, dense))
+        if description is not None:
+            modalities.append(("description", DESCRIPTION_VECTOR_NAME, description))
         if sparse is not None:
+            modalities.append((
+                "sparse",
+                SPARSE_VECTOR_NAME,
+                models.SparseVector(indices=sparse.indices, values=sparse.values),
+            ))
+
+        if not modalities:
+            raise ValueError("query requires at least one of dense/description/sparse")
+
+        if len(modalities) == 1:
+            name, using, qvec = modalities[0]
             result = self.client.query_points(
                 collection_name=self.collection,
-                query=models.SparseVector(
-                    indices=sparse.indices, values=sparse.values
-                ),
-                using=SPARSE_VECTOR_NAME,
+                query=qvec,
+                using=using,
                 limit=limit,
                 query_filter=qfilter,
                 with_payload=True,
             )
-            return "sparse", self._to_hits(result.points)
+            return name, self._to_hits(result.points)
 
-        raise ValueError("query requires at least one of dense/sparse")
+        prefetch = [
+            models.Prefetch(query=qvec, using=using, limit=limit, filter=qfilter)
+            for _, using, qvec in modalities
+        ]
+        result = self.client.query_points(
+            collection_name=self.collection,
+            prefetch=prefetch,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=limit,
+            with_payload=True,
+        )
+        return "rrf", self._to_hits(result.points)
 
     def query_similar(self, sha256: str, limit: int) -> list[Hit]:
         """Nearest neighbors to a stored point's dense vector (excludes self)."""

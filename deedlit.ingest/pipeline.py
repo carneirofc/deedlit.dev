@@ -89,6 +89,13 @@ CATALOG_ORIGINAL_BLOB_KIND = os.getenv("CATALOG_ORIGINAL_BLOB_KIND", "original")
 # catalog ``embedding`` blob kind so the GPU result is durable and reused.
 CATALOG_DENSE_BLOB_KIND = os.getenv("CATALOG_DENSE_BLOB_KIND", "embedding")
 
+# Catalog blob kind holding the persisted CLIP-TEXT vector of the AI description —
+# the SECOND dense vector (search ``description`` named vector). Written by the
+# embed.sparse (text) stage alongside the sparse vector and read back by
+# index.search. Optional: absent until the labelagent produces a description, so
+# images without one simply carry no description vector.
+CATALOG_DESCRIPTION_BLOB_KIND = os.getenv("CATALOG_DESCRIPTION_BLOB_KIND", "embedding_description")
+
 HTTP_TIMEOUT = float(os.getenv("INGEST_HTTP_TIMEOUT", "30.0"))
 FANOUT_RETRIES = int(os.getenv("INGEST_FANOUT_RETRIES", "3"))
 
@@ -293,6 +300,26 @@ async def embed_sparse_text(text: str) -> dict[str, list]:
     resp.raise_for_status()
     body = resp.json()
     return {"indices": body.get("indices", []), "values": body.get("values", [])}
+
+
+async def embed_text(text: str) -> list[float]:
+    """POST text to deedlit.vision /embed/text; return the CLIP *text* dense vector.
+
+    CLIP maps image and text into one space, so this 1024-dim vector is directly
+    comparable to the image embedding — it indexes the *meaning of the description*
+    as its own (``description``) named vector. Runs on the vision GPU like the
+    image embedding.
+    """
+    started = time.perf_counter()
+    resp = await get_client().post(f"{VISION_URL}/embed/text", json={"text": text})
+    resp.raise_for_status()
+    body = resp.json()
+    vector = body.get("vector") or body.get("embedding") or []
+    log.info(
+        "vision /embed/text -> dim=%d in %.0f ms",
+        len(vector), (time.perf_counter() - started) * 1000,
+    )
+    return vector
 
 
 async def describe_image(
@@ -637,6 +664,15 @@ async def store_sparse_blob(sha256: str, sparse: dict[str, list]) -> None:
     ))
 
 
+async def store_description_blob(sha256: str, dense: list[float]) -> None:
+    """Persist the CLIP-text description vector to its catalog blob (JSON floats)."""
+    await maybe_await(_put_blob_with_retry(
+        f"{CATALOG_URL}/blobs/{sha256}/{CATALOG_DESCRIPTION_BLOB_KIND}",
+        json.dumps(dense).encode("utf-8"),
+        "application/octet-stream",
+    ))
+
+
 async def _load_json_blob(sha256: str, kind: str) -> Any | None:
     """GET a catalog blob and parse it as JSON, or None if absent/unreadable.
 
@@ -663,6 +699,15 @@ async def load_sparse_blob(sha256: str) -> dict[str, list] | None:
     return await maybe_await(_load_json_blob(sha256, "sparse"))
 
 
+async def load_description_blob(sha256: str) -> list[float] | None:
+    """Read the persisted description vector from catalog, or None if absent.
+
+    Absent is the NORMAL case for an image with no AI description, so index.search
+    treats it as optional (unlike dense/sparse, which gate the fan-in).
+    """
+    return await maybe_await(_load_json_blob(sha256, CATALOG_DESCRIPTION_BLOB_KIND))
+
+
 async def embed_dense(sha256: str) -> None:
     """``embed.dense`` stage: GPU dense-embed one image, persist to catalog.
 
@@ -681,12 +726,17 @@ async def embed_dense(sha256: str) -> None:
 
 
 async def embed_sparse(sha256: str) -> None:
-    """``embed.sparse`` stage: sparse-embed one image's text, persist to catalog.
+    """``embed.sparse`` stage: TEXT embeddings for one image, persisted to catalog.
 
-    No bytes / no GPU: the sparse vector is over the lexical text held in catalog
-    truth — SD prompt + AI description + tags. Re-running after a label patch
-    folds the new description/tags into the sparse vector. Stores the result as
-    the catalog ``sparse`` blob; the worker then publishes ``index.search``.
+    Produces the two text-derived vectors from catalog truth (re-run after a label
+    patch so a new description/tags fold in):
+
+      - sparse SPLADE over SD prompt + AI description + tags  -> ``sparse`` blob
+      - dense CLIP-text of the AI description (GPU)           -> ``embedding_description`` blob
+
+    The description vector is written ONLY when a description exists — an image
+    with no AI description carries no description vector, and index.search treats
+    it as optional. The worker then publishes ``index.search``.
     """
     record = await maybe_await(fetch_image_record(sha256)) or {}
     tags = record.get("tags") or []
@@ -702,15 +752,30 @@ async def embed_sparse(sha256: str) -> None:
     )
     await maybe_await(store_sparse_blob(sha256, sparse))
 
+    # Second dense vector: CLIP-text embedding of the AI description, on the GPU.
+    # Embed the description alone (not prompt/tags) so the vector captures the
+    # description's meaning; skip the empty string so the vector stays meaningful.
+    description = (record.get("description") or "").strip()
+    if description:
+        description_vec = await maybe_await(embed_text(description))
+        await maybe_await(store_description_blob(sha256, description_vec))
+
 
 def build_search_point(
-    sha256: str, dense: list[float], sparse: dict[str, list], record: dict[str, Any]
+    sha256: str,
+    dense: list[float],
+    sparse: dict[str, list],
+    record: dict[str, Any],
+    description: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Assemble the search UpsertPoint from the two vectors + catalog truth.
+    """Assemble the search UpsertPoint from the vectors + catalog truth.
 
     Mirrors :func:`assemble_record`'s point/payload shape, but sources the payload
     fields (tags/filepath/description/safety) from the catalog record instead of a
     fresh extract — the index.search stage projects from truth, not from bytes.
+
+    ``description`` is the optional CLIP-text vector; it is added to the point only
+    when present so an image without an AI description indexes on dense + sparse.
     """
     filepath = record.get("filepath")
     ext = os.path.splitext(filepath)[1].lower() if filepath else ""
@@ -729,7 +794,10 @@ def build_search_point(
         payload["description"] = record["description"]
     if record.get("safety"):
         payload["safety"] = record["safety"]
-    return {"sha256": sha256, "dense": dense, "sparse": sparse, "payload": payload}
+    point: dict[str, Any] = {"sha256": sha256, "dense": dense, "sparse": sparse, "payload": payload}
+    if description:
+        point["description"] = description
+    return point
 
 
 async def index_search(sha256: str) -> bool:
@@ -741,12 +809,14 @@ async def index_search(sha256: str) -> bool:
     both present and upserts. Idempotent: a duplicate upsert is wasted work, never
     incorrect. Returns True when the point was upserted.
 
-    The two reads are independent, so they are fired CONCURRENTLY (the fan-in
-    rendezvous resolves in one round-trip's latency, not two).
+    The reads are independent, so they are fired CONCURRENTLY (the fan-in
+    rendezvous resolves in one round-trip's latency, not three). The description
+    vector is OPTIONAL — its absence never blocks the fan-in.
     """
-    dense, sparse = await asyncio.gather(
+    dense, sparse, description = await asyncio.gather(
         maybe_await(load_dense_blob(sha256)),
         maybe_await(load_sparse_blob(sha256)),
+        maybe_await(load_description_blob(sha256)),
     )
     if dense is None or sparse is None:
         # Not an error: the sibling embed stage re-publishes index.search on its
@@ -758,11 +828,11 @@ async def index_search(sha256: str) -> bool:
         )
         return False
     record = await maybe_await(fetch_image_record(sha256)) or {}
-    point = build_search_point(sha256, dense, sparse, record)
+    point = build_search_point(sha256, dense, sparse, record, description=description)
     await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", point))
     log.info(
-        "index.search %s: upserted point (dense dim=%d, sparse terms=%d)",
-        sha256[:12], len(dense), len(sparse.get("indices", [])),
+        "index.search %s: upserted point (dense dim=%d, sparse terms=%d, description=%s)",
+        sha256[:12], len(dense), len(sparse.get("indices", [])), description is not None,
     )
     return True
 
@@ -922,6 +992,7 @@ def assemble_record(
     source_path: str | None = None,
     tags: list[str] | None = None,
     description: str | None = None,
+    description_dense: list[float] | None = None,
     label: str | None = None,
     safety: str | None = None,
 ) -> IngestRecord:
@@ -978,6 +1049,10 @@ def assemble_record(
         "sparse": sparse,
         "payload": payload,
     }
+    # Optional second dense vector (CLIP-text of the AI description); only added
+    # when present so a point without a description still indexes on dense+sparse.
+    if description_dense:
+        point["description"] = description_dense
 
     edges = {
         "sha256": sha256,
@@ -1054,6 +1129,11 @@ async def process_file(
         s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
     )
 
+    # The AI description (catalog truth) also gets its own CLIP-text dense vector
+    # (the ``description`` named vector) — embedded only when present, so a
+    # first-pass/undescribed image just carries dense+sparse.
+    desc_text = (description or "").strip()
+
     async def _dense() -> list[float]:
         return await maybe_await(embed_image(data, filename, mime))
 
@@ -1062,8 +1142,16 @@ async def process_file(
             return {"indices": [], "values": []}
         return await maybe_await(embed_sparse_text(sparse_text))
 
-    dense, sparse = await asyncio.gather(_dense(), _sparse())
-    log.debug("%s dense_dim=%d sparse_terms=%d", sha256[:12], len(dense), len(sparse.get("indices", [])))
+    async def _description() -> list[float] | None:
+        if not desc_text:
+            return None
+        return await maybe_await(embed_text(desc_text))
+
+    dense, sparse, description_dense = await asyncio.gather(_dense(), _sparse(), _description())
+    log.debug(
+        "%s dense_dim=%d sparse_terms=%d description=%s",
+        sha256[:12], len(dense), len(sparse.get("indices", [])), description_dense is not None,
+    )
 
     return assemble_record(
         sha256=sha256,
@@ -1078,6 +1166,7 @@ async def process_file(
         source_path=source_path,
         tags=final_tags,
         description=description,
+        description_dense=description_dense,
         label=None,
         safety=safety,
     )

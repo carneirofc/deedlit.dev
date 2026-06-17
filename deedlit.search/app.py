@@ -90,6 +90,7 @@ def upsert_point(point: UpsertPoint) -> dict:
         dense=point.dense,
         sparse=point.sparse,
         payload=point.payload,
+        description=point.description,
     )
     return {"status": "ok", "id": point_id, "sha256": point.sha256.lower()}
 
@@ -110,15 +111,17 @@ def delete_point(sha256: str) -> dict:
 
 @app.post("/query", response_model=QueryResponse)
 def query(body: HybridQuery) -> QueryResponse:
-    if body.dense is None and body.sparse is None:
+    if body.dense is None and body.sparse is None and body.description is None:
         raise HTTPException(
-            status_code=422, detail="at least one of dense/sparse is required"
+            status_code=422,
+            detail="at least one of dense/description/sparse is required",
         )
     fusion, hits = get_store().query_hybrid(
         dense=body.dense,
         sparse=body.sparse,
         limit=body.limit,
         query_filter=body.filter,
+        description=body.description,
     )
     return QueryResponse(fusion=fusion, hits=hits)
 

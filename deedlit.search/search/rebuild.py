@@ -4,9 +4,10 @@ This is the ONLY cross-service read the search service performs. It pulls image
 records from deedlit.catalog (``GET /images``) and upserts a point per image.
 
 Each catalog item is expected to carry the vectors to index:
-  - ``dense``  : list[float] (1024-dim CLIP embedding)
-  - ``sparse`` : {indices, values} (optional SPLADE sparse vector)
-  - ``payload``: optional extra payload to store alongside the point
+  - ``dense``       : list[float] (1024-dim CLIP image embedding)
+  - ``description`` : list[float] (optional CLIP-text vector of the description)
+  - ``sparse``      : {indices, values} (optional SPLADE sparse vector)
+  - ``payload``     : optional extra payload to store alongside the point
 Items without a ``dense`` vector are skipped (nothing to index on).
 
 The catalog HTTP call is isolated in ``fetch_catalog_images`` so tests can mock
@@ -76,6 +77,7 @@ def rebuild_from_catalog(store: SearchStore, config: SearchConfig) -> int:
             dense=dense,
             sparse=_sparse_from(item),
             payload=item.get("payload") or {},
+            description=item.get("description") or None,
         )
         upserted += 1
     return upserted

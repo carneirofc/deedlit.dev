@@ -90,7 +90,13 @@ components:
       type: object
       properties:
         sha256: { $ref: "#/components/schemas/Sha256" }
-        dense: { type: array, items: { type: number }, description: "1024-dim CLIP vector" }
+        dense: { type: array, items: { type: number }, description: "1024-dim CLIP image vector" }
+        description:
+          type: [array, "null"]
+          items: { type: number }
+          description: >-
+            Optional 1024-dim CLIP *text* vector of the AI description, stored as
+            its own named vector. Absent when the image has no AI description.
         sparse: { $ref: "#/components/schemas/SparseVector" }
         payload:
           type: object
@@ -108,11 +114,17 @@ components:
       type: object
       properties:
         dense: { type: array, items: { type: number } }
+        description:
+          type: [array, "null"]
+          items: { type: number }
+          description: CLIP text vector matched against points' description vectors.
         sparse: { $ref: "#/components/schemas/SparseVector" }
         limit: { type: integer, default: 24 }
         filter: { type: [object, "null"], additionalProperties: true }
       required: []
-      description: At least one of dense/sparse must be supplied; both → RRF fusion.
+      description: >-
+        At least one of dense/description/sparse must be supplied; two or more →
+        RRF fusion.
     Hit:
       type: object
       properties:
@@ -123,6 +135,6 @@ components:
     QueryResponse:
       type: object
       properties:
-        fusion: { type: string, enum: [rrf, dense, sparse] }
+        fusion: { type: string, enum: [rrf, dense, description, sparse] }
         hits: { type: array, items: { $ref: "#/components/schemas/Hit" } }
       required: [hits]

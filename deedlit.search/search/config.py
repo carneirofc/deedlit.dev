@@ -18,6 +18,12 @@ from dataclasses import dataclass
 DENSE_DIM = 1024
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
+# Second dense vector: the CLIP *text* embedding of the AI description. CLIP maps
+# image and text into the SAME space, so this lives in the same 1024-dim cosine
+# space as ``dense`` but indexes the *meaning of the description* independently of
+# the image pixels. Optional per point — only present when the labelagent produced
+# a description — so a point may carry ``dense`` (always) ± ``description``.
+DESCRIPTION_VECTOR_NAME = "description"
 
 
 def _env(key: str, fallback: str) -> str:
