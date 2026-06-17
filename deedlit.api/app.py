@@ -568,8 +568,14 @@ async def list_queues() -> dict[str, Any]:
 
 @app.get("/queues/{name}/messages")
 async def peek_queue(name: str, limit: int = 20) -> dict[str, Any]:
-    """Non-destructively peek messages in a queue (ack_requeue_true), for
-    inspecting the DLQ contents. Each item is {payload, headers}."""
+    """Non-destructively peek messages in a queue (ack_requeue_true).
+
+    Works for ANY task queue — the live stages, their ``.retry``, and ``.dlq`` —
+    so the UI can inspect what is actually queued, not just dead-letters. Each
+    item carries the payload plus the AMQP routing/delivery detail and full
+    properties (incl. headers) so the message can be shown in full: stage/type,
+    sha256, op id, attempt count, redelivered flag, and size. ``remaining`` is the
+    queue depth left after the peek (the messages are requeued, not consumed)."""
     if name not in QUEUE_NAMES:
         raise HTTPException(status_code=404, detail="unknown queue")
     body = {
@@ -582,15 +588,27 @@ async def peek_queue(name: str, limit: int = 20) -> dict[str, Any]:
         )
     except DownstreamError as exc:
         raise HTTPException(status_code=502, detail=f"rabbitmq unavailable: {exc.detail}")
-    out = [
-        {
+    out: list[dict[str, Any]] = []
+    remaining = 0
+    for m in (msgs or []):
+        if not isinstance(m, dict):
+            continue
+        props = m.get("properties") or {}
+        # message_count is the queue depth remaining AFTER this message was read;
+        # the last (lowest) one is the true count left once the peek requeues all.
+        remaining = int(m.get("message_count", remaining) or 0)
+        out.append({
             "payload": m.get("payload"),
-            "headers": (m.get("properties") or {}).get("headers", {}),
-        }
-        for m in (msgs or [])
-        if isinstance(m, dict)
-    ]
-    return {"queue": name, "messages": out}
+            "payload_bytes": m.get("payload_bytes"),
+            "payload_encoding": m.get("payload_encoding"),
+            "redelivered": bool(m.get("redelivered", False)),
+            "routing_key": m.get("routing_key"),
+            "exchange": m.get("exchange"),
+            "properties": props,
+            # Top-level headers kept for back-compat with existing DLQ rendering.
+            "headers": props.get("headers", {}),
+        })
+    return {"queue": name, "messages": out, "remaining": remaining}
 
 
 @app.post("/queues/{name}/purge")

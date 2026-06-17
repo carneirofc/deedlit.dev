@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // Queue visualization / admin page (#29, ADR 0001 + 0002).
@@ -41,6 +41,19 @@ interface QueueStat {
 interface QueueMessage {
   payload: string | null;
   headers: Record<string, unknown>;
+  payload_bytes?: number;
+  payload_encoding?: string;
+  redelivered?: boolean;
+  routing_key?: string;
+  exchange?: string;
+  properties?: Record<string, unknown>;
+}
+
+// A non-destructive peek result for one queue: the sampled messages + how many
+// are still queued after the peek (the sample is requeued, not consumed).
+interface QueuePeek {
+  messages: QueueMessage[];
+  remaining: number;
 }
 
 interface Task {
@@ -115,6 +128,108 @@ function payloadSha(payload: string | null): string | null {
   }
 }
 
+// Parse a task envelope into its known fields. Most stages carry
+// {sha256, type, parent_op_id}; the ingest stage carries {path, source_folder_id}.
+function taskEnvelope(payload: string | null): {
+  sha256?: string;
+  type?: string;
+  path?: string;
+  parent_op_id?: string;
+  source_folder_id?: string;
+} | null {
+  if (!payload) return null;
+  try {
+    const o = JSON.parse(payload) as Record<string, unknown>;
+    const str = (k: string) => (typeof o[k] === "string" ? (o[k] as string) : undefined);
+    return {
+      sha256: str("sha256"),
+      type: str("type"),
+      path: str("path"),
+      parent_op_id: str("parent_op_id"),
+      source_folder_id: str("source_folder_id"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Pretty-print a JSON payload for the raw view; leave non-JSON untouched.
+function prettyJson(s: string): string {
+  try {
+    return JSON.stringify(JSON.parse(s), null, 2);
+  } catch {
+    return s;
+  }
+}
+
+const pillCls = "rounded px-1 py-0.5 text-ui-2xs";
+
+// One message in a queue, rendered with its decoded task fields up top (stage,
+// sha/path, op, attempt, redelivered, size) and the raw payload + headers behind
+// disclosure toggles. Shared by the live-queue inspector and the DLQ cards.
+function MessageCard({ m, index }: { m: QueueMessage; index: number }) {
+  const env = taskEnvelope(m.payload);
+  const sha = env?.sha256 ?? payloadSha(m.payload);
+  const attempt = m.headers?.["x-attempt"];
+  const err = m.headers?.["x-error"];
+  const hasHeaders = m.headers && Object.keys(m.headers).length > 0;
+  return (
+    <li className="min-w-0 rounded border border-ui-border/40 bg-ui-bg-soft/40 p-2 text-ui-2xs">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-ui-ink-muted">#{index + 1}</span>
+        {env?.type && (
+          <span className={`${pillCls} bg-accent-cyan/10 font-medium text-accent-cyan`}>{env.type}</span>
+        )}
+        {sha ? (
+          <span className="font-mono text-ui-ink" title={sha}>
+            {shortSha(sha)}
+          </span>
+        ) : env?.path ? (
+          <span className="min-w-0 truncate font-mono text-ui-ink" title={env.path}>
+            {env.path}
+          </span>
+        ) : null}
+        {m.redelivered && <span className={`${pillCls} bg-amber-500/10 text-amber-500`}>redelivered</span>}
+        {attempt != null && (
+          <span className={`${pillCls} bg-rose-500/10 text-rose-500`}>attempt {String(attempt)}</span>
+        )}
+        {typeof m.payload_bytes === "number" && (
+          <span className="text-ui-ink-muted" title="payload size">
+            {m.payload_bytes} B
+          </span>
+        )}
+        {m.routing_key && (
+          <span className="text-ui-ink-muted" title="routing key">
+            rk:{m.routing_key}
+          </span>
+        )}
+      </div>
+      {env?.parent_op_id && (
+        <div className="mt-1 font-mono text-ui-ink-muted" title={env.parent_op_id}>
+          op {env.parent_op_id.slice(0, 8)}
+        </div>
+      )}
+      {err != null && <div className="mt-1 break-words text-rose-500">{String(err)}</div>}
+      {m.payload && (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">payload</summary>
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
+            {prettyJson(m.payload)}
+          </pre>
+        </details>
+      )}
+      {hasHeaders && (
+        <details className="mt-1">
+          <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">headers</summary>
+          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
+            {JSON.stringify(m.headers, null, 2)}
+          </pre>
+        </details>
+      )}
+    </li>
+  );
+}
+
 function Kpi({
   label,
   value,
@@ -142,7 +257,10 @@ function Kpi({
 
 export default function QueuesPage() {
   const [queues, setQueues] = useState<QueueStat[]>([]);
-  const [dlqMessages, setDlqMessages] = useState<Record<string, QueueMessage[]>>({});
+  // Peeked contents keyed by queue name — shared by the live-queue inspector and
+  // the DLQ cards. `expanded` is the live queue row whose inspector is open.
+  const [peeked, setPeeked] = useState<Record<string, QueuePeek>>({});
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [taskSha, setTaskSha] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -167,16 +285,32 @@ export default function QueuesPage() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  const peekDlq = async (name: string) => {
+  // Non-destructively peek a queue's contents (works for any queue — live stage,
+  // .retry, or .dlq). The sample is requeued, so the depth is unchanged.
+  const peek = useCallback(async (name: string, limit = 25) => {
     setError(null);
     try {
-      const j = await fetch(`/api/library/queues/${encodeURIComponent(name)}/messages?limit=20`).then(
-        (r) => r.json(),
-      );
-      setDlqMessages((prev) => ({ ...prev, [name]: (j.messages ?? []) as QueueMessage[] }));
+      const j = (await fetch(
+        `/api/library/queues/${encodeURIComponent(name)}/messages?limit=${limit}`,
+      ).then((r) => r.json())) as { messages?: QueueMessage[]; remaining?: number };
+      setPeeked((prev) => ({
+        ...prev,
+        [name]: { messages: j.messages ?? [], remaining: j.remaining ?? 0 },
+      }));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Peek failed");
     }
+  }, []);
+
+  // Toggle the inline inspector on a live-queue row, fetching its contents the
+  // first time it opens.
+  const toggleInspect = (name: string) => {
+    if (expanded === name) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(name);
+    if (!peeked[name]) void peek(name);
   };
 
   const requeueDlq = async (base: string) => {
@@ -187,7 +321,7 @@ export default function QueuesPage() {
         method: "POST",
       }).then((r) => r.json());
       setNotice(`Requeued ${j.count ?? 0} message(s) to ${base}.`);
-      setDlqMessages((prev) => ({ ...prev, [`${base}.dlq`]: [] }));
+      setPeeked((prev) => ({ ...prev, [`${base}.dlq`]: { messages: [], remaining: 0 } }));
       refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Requeue failed");
@@ -202,7 +336,7 @@ export default function QueuesPage() {
     try {
       await fetch(`/api/library/queues/${encodeURIComponent(name)}/purge`, { method: "POST" });
       setNotice(`Purged ${name}.`);
-      setDlqMessages((prev) => ({ ...prev, [name]: [] }));
+      setPeeked((prev) => ({ ...prev, [name]: { messages: [], remaining: 0 } }));
       refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Purge failed");
@@ -259,7 +393,8 @@ export default function QueuesPage() {
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Queues</h1>
           <p className="max-w-3xl text-ui-sm text-ui-ink-muted">
             Per-stage ingest DAG queues (embed.dense/embed.sparse → index.search,
-            index.graph, label) — live depth, dead-letters, and per-image history.
+            index.graph, label) — live depth, peek any queue&apos;s contents,
+            dead-letters, and per-image history.
           </p>
         </div>
         <a
@@ -316,6 +451,7 @@ export default function QueuesPage() {
                 <th className="px-2 py-1 text-right">in/s</th>
                 <th className="px-2 py-1 text-right">out/s</th>
                 <th className="px-2 py-1 text-right">net/s</th>
+                <th className="px-2 py-1 text-right">inspect</th>
               </tr>
             </thead>
             <tbody>
@@ -328,9 +464,11 @@ export default function QueuesPage() {
                   : q.messages_unacknowledged > 0
                     ? "bg-sky-500/70"
                     : "bg-accent-cyan/70";
+                const isOpen = expanded === q.name;
+                const peek_ = peeked[q.name];
                 return (
+                  <Fragment key={q.name}>
                   <tr
-                    key={q.name}
                     className={`border-t border-ui-border/40 align-middle hover:bg-ui-bg-soft/40 ${q.reachable ? "" : "opacity-40"}`}
                     data-testid={`queue-row-${q.name}`}
                   >
@@ -374,12 +512,57 @@ export default function QueuesPage() {
                       {net > 0 ? "+" : ""}
                       {net.toFixed(1)}
                     </td>
+                    <td className="px-2 py-1.5 text-right">
+                      {/* DLQs are inspected in the dead-letter panel below. */}
+                      {!isDlq && (
+                        <button
+                          className={cls.btnSm}
+                          onClick={() => toggleInspect(q.name)}
+                          disabled={!q.reachable}
+                          data-testid={`queue-peek-${q.name}`}
+                        >
+                          {isOpen ? "Hide" : "Peek"}
+                        </button>
+                      )}
+                    </td>
                   </tr>
+                  {isOpen && (
+                    <tr
+                      className="border-t border-ui-border/40 bg-ui-bg-soft/20"
+                      data-testid={`queue-inspect-${q.name}`}
+                    >
+                      <td colSpan={10} className="px-2 py-2">
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-ui-2xs text-ui-ink-muted">
+                            {peek_
+                              ? `${peek_.messages.length} ready message(s) sampled · ${peek_.remaining} remaining · non-destructive (requeued)`
+                              : "loading…"}
+                          </span>
+                          <button className={cls.btnSm} onClick={() => peek(q.name)} data-testid={`queue-repeek-${q.name}`}>
+                            Re-peek
+                          </button>
+                        </div>
+                        {peek_ && (
+                          <ul className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+                            {peek_.messages.length === 0 && (
+                              <li className="text-ui-2xs text-ui-ink-muted">
+                                no ready messages (queue empty, or all in-flight on a consumer)
+                              </li>
+                            )}
+                            {peek_.messages.map((m, i) => (
+                              <MessageCard key={i} m={m} index={i} />
+                            ))}
+                          </ul>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
               {queues.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="px-2 py-3 text-ui-ink-muted">
+                  <td colSpan={10} className="px-2 py-3 text-ui-ink-muted">
                     No queue data (broker unreachable?).
                   </td>
                 </tr>
@@ -404,7 +587,7 @@ export default function QueuesPage() {
             const name = `${base}.dlq`;
             const stat = queues.find((q) => q.name === name);
             const count = stat ? stat.messages : 0;
-            const msgs = dlqMessages[name];
+            const msgs = peeked[name]?.messages;
             return (
               <div
                 key={name}
@@ -423,7 +606,7 @@ export default function QueuesPage() {
                     </span>
                   </p>
                   <div className="flex shrink-0 gap-1">
-                    <button className={cls.btnSm} onClick={() => peekDlq(name)} data-testid={`dlq-peek-${base}`}>
+                    <button className={cls.btnSm} onClick={() => peek(name)} data-testid={`dlq-peek-${base}`}>
                       Peek
                     </button>
                     <button
@@ -440,47 +623,11 @@ export default function QueuesPage() {
                   </div>
                 </div>
                 {msgs && (
-                  <ul className="flex max-h-72 flex-col gap-1.5 overflow-y-auto text-ui-2xs">
-                    {msgs.length === 0 && <li className="text-ui-ink-muted">empty</li>}
-                    {msgs.map((m, i) => {
-                      const sha = payloadSha(m.payload);
-                      const attempt = m.headers?.["x-attempt"];
-                      const err = m.headers?.["x-error"];
-                      return (
-                        <li
-                          key={i}
-                          className="min-w-0 rounded border border-ui-border/40 bg-ui-bg-soft/40 p-2"
-                        >
-                          {sha ? (
-                            <div className="truncate font-mono text-ui-ink" title={sha}>
-                              {shortSha(sha)}
-                            </div>
-                          ) : (
-                            <div className="truncate text-ui-ink" title={m.payload ?? ""}>
-                              {m.payload ?? "(no payload)"}
-                            </div>
-                          )}
-                          {(attempt != null || err != null) && (
-                            <div className="mt-1 break-words text-rose-500">
-                              {attempt != null && (
-                                <span className="mr-1 rounded bg-rose-500/10 px-1">attempt {String(attempt)}</span>
-                              )}
-                              {err != null && String(err)}
-                            </div>
-                          )}
-                          {sha && m.payload && (
-                            <details className="mt-1">
-                              <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">
-                                payload
-                              </summary>
-                              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
-                                {m.payload}
-                              </pre>
-                            </details>
-                          )}
-                        </li>
-                      );
-                    })}
+                  <ul className="flex max-h-72 flex-col gap-1.5 overflow-y-auto">
+                    {msgs.length === 0 && <li className="text-ui-2xs text-ui-ink-muted">empty</li>}
+                    {msgs.map((m, i) => (
+                      <MessageCard key={i} m={m} index={i} />
+                    ))}
                   </ul>
                 )}
               </div>

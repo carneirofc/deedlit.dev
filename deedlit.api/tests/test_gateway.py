@@ -623,6 +623,35 @@ def test_peek_queue_messages(rec, client):
     assert msg["headers"]["x-error"] == "boom"
 
 
+def test_peek_queue_messages_enriched(rec, client):
+    # A live queue can be peeked too (not just the DLQ); the per-message AMQP
+    # routing/delivery detail is surfaced and `remaining` reports the post-peek
+    # depth (message_count of the last sampled message).
+    rec.on(
+        "POST", "/api/queues///embed.dense/get",
+        lambda r: [
+            {
+                "payload": '{"sha256":"abc","type":"embed.dense","parent_op_id":"op1"}',
+                "payload_bytes": 57,
+                "payload_encoding": "string",
+                "redelivered": True,
+                "routing_key": "embed.dense",
+                "exchange": "",
+                "message_count": 4,
+                "properties": {"headers": {"x-attempt": 1}, "content_type": "application/json"},
+            }
+        ],
+    )
+    body = client.get("/queues/embed.dense/messages", params={"limit": 5}).json()
+    assert body["remaining"] == 4
+    msg = body["messages"][0]
+    assert msg["payload_bytes"] == 57
+    assert msg["redelivered"] is True
+    assert msg["routing_key"] == "embed.dense"
+    assert msg["properties"]["content_type"] == "application/json"
+    assert msg["headers"]["x-attempt"] == 1
+
+
 def test_purge_queue_calls_mgmt_contents(rec, client):
     rec.on("DELETE", "/api/queues///index.dlq/contents", lambda r: httpx.Response(204))
     r = client.post("/queues/index.dlq/purge")

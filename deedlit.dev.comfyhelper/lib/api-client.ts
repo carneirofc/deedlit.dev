@@ -460,22 +460,42 @@ export async function listQueues(signal?: AbortSignal): Promise<QueueStat[]> {
   return Array.isArray(res?.queues) ? res.queues : [];
 }
 
-/** One peeked message (non-destructive) — payload + AMQP headers (incl. x-error). */
+/** One peeked message (non-destructive) — payload + AMQP routing/delivery detail. */
 export interface QueueMessage {
   payload: string | null;
+  /** AMQP headers (incl. x-attempt / x-error on retried/dead-lettered tasks). */
   headers: Record<string, unknown>;
+  /** Payload size in bytes (RabbitMQ payload_bytes). */
+  payload_bytes?: number;
+  payload_encoding?: string;
+  /** True when this message was previously delivered and requeued. */
+  redelivered?: boolean;
+  routing_key?: string;
+  exchange?: string;
+  /** Full AMQP properties: content_type, delivery_mode, timestamp, headers… */
+  properties?: Record<string, unknown>;
+}
+
+/** Result of a non-destructive queue peek: the sampled messages + depth left. */
+export interface QueuePeek {
+  messages: QueueMessage[];
+  /** Messages still queued after the peek (the sample is requeued, not consumed). */
+  remaining: number;
 }
 
 export async function peekQueueMessages(
   name: string,
   limit = 20,
   signal?: AbortSignal,
-): Promise<QueueMessage[]> {
-  const res = await request<{ messages?: QueueMessage[] }>(
+): Promise<QueuePeek> {
+  const res = await request<{ messages?: QueueMessage[]; remaining?: number }>(
     `/queues/${encodeURIComponent(name)}/messages`,
     { query: { limit }, signal },
   );
-  return Array.isArray(res?.messages) ? res.messages : [];
+  return {
+    messages: Array.isArray(res?.messages) ? res.messages : [],
+    remaining: typeof res?.remaining === "number" ? res.remaining : 0,
+  };
 }
 
 /** Purge all messages from a queue (destructive). */
