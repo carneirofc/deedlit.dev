@@ -100,6 +100,8 @@ def test_embed_dense_handler_requires_sha():
 def test_embed_sparse_builds_text_from_catalog_truth(monkeypatch):
     seen_text: list[str] = []
     stored: list[tuple] = []
+    desc_text: list[str] = []
+    desc_stored: list[tuple] = []
     monkeypatch.setattr(
         pipeline, "fetch_image_record",
         lambda sha: {"prompt": "a cat", "description": "fluffy", "tags": ["cute", "pet"]},
@@ -109,10 +111,18 @@ def test_embed_sparse_builds_text_from_catalog_truth(monkeypatch):
         lambda t: seen_text.append(t) or {"indices": [1], "values": [0.5]},
     )
     monkeypatch.setattr(pipeline, "store_sparse_blob", lambda sha, v: stored.append((sha, v)))
+    monkeypatch.setattr(pipeline, "embed_text", lambda t: desc_text.append(t) or [0.1, 0.2])
+    monkeypatch.setattr(
+        pipeline, "store_description_blob", lambda sha, v: desc_stored.append((sha, v))
+    )
 
     asyncio.run(pipeline.embed_sparse(SHA))
     assert seen_text == ["a cat fluffy cute pet"]
     assert stored == [(SHA, {"indices": [1], "values": [0.5]})]
+    # The description ALSO gets its own CLIP-text dense vector — over the
+    # description text alone (not the combined sparse text).
+    assert desc_text == ["fluffy"]
+    assert desc_stored == [(SHA, [0.1, 0.2])]
 
 
 def test_embed_sparse_empty_text_stores_empty_without_calling_vision(monkeypatch):
@@ -124,9 +134,34 @@ def test_embed_sparse_empty_text_stores_empty_without_calling_vision(monkeypatch
 
     monkeypatch.setattr(pipeline, "embed_sparse_text", boom)
     monkeypatch.setattr(pipeline, "store_sparse_blob", lambda sha, v: stored.append((sha, v)))
+    # No description in the record -> no description vector, no /embed/text call.
+    monkeypatch.setattr(pipeline, "embed_text", boom)
+    monkeypatch.setattr(
+        pipeline, "store_description_blob",
+        lambda sha, v: (_ for _ in ()).throw(AssertionError("no description to store")),
+    )
 
     asyncio.run(pipeline.embed_sparse(SHA))
     assert stored == [(SHA, {"indices": [], "values": []})]
+
+
+def test_embed_sparse_embeds_description_even_when_no_prompt_tags(monkeypatch):
+    """A description with no prompt/tags still yields BOTH the sparse vector (over
+    the description) and its own description dense vector."""
+    sparse_stored: list[tuple] = []
+    desc_text: list[str] = []
+    desc_stored: list[tuple] = []
+    monkeypatch.setattr(pipeline, "fetch_image_record", lambda sha: {"description": "a lone wolf"})
+    monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [7], "values": [1.0]})
+    monkeypatch.setattr(pipeline, "store_sparse_blob", lambda sha, v: sparse_stored.append((sha, v)))
+    monkeypatch.setattr(pipeline, "embed_text", lambda t: desc_text.append(t) or [0.9])
+    monkeypatch.setattr(
+        pipeline, "store_description_blob", lambda sha, v: desc_stored.append((sha, v))
+    )
+
+    asyncio.run(pipeline.embed_sparse(SHA))
+    assert desc_text == ["a lone wolf"]
+    assert desc_stored == [(SHA, [0.9])]
 
 
 def test_embed_sparse_handler_publishes_index_search(monkeypatch):
@@ -148,6 +183,7 @@ def test_index_search_upserts_when_both_vectors_present(monkeypatch):
     posts: list[tuple] = []
     monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1, 0.2])
     monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": [3], "values": [0.9]})
+    monkeypatch.setattr(pipeline, "load_description_blob", lambda sha: [0.3, 0.4])
     monkeypatch.setattr(
         pipeline, "fetch_image_record",
         lambda sha: {
@@ -163,14 +199,32 @@ def test_index_search_upserts_when_both_vectors_present(monkeypatch):
     assert point["sha256"] == SHA
     assert point["dense"] == [0.1, 0.2]
     assert point["sparse"] == {"indices": [3], "values": [0.9]}
+    # The description dense vector rides along as its own named vector.
+    assert point["description"] == [0.3, 0.4]
     assert point["payload"]["filepath"] == "/lib/x.png"
     assert point["payload"]["description"] == "d"
     assert point["payload"]["safety"] == "sfw"
 
 
+def test_index_search_omits_description_vector_when_absent(monkeypatch):
+    """No persisted description vector -> the point indexes on dense+sparse only
+    (the missing description vector never blocks the fan-in)."""
+    posts: list[tuple] = []
+    monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1, 0.2])
+    monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": [3], "values": [0.9]})
+    monkeypatch.setattr(pipeline, "load_description_blob", lambda sha: None)
+    monkeypatch.setattr(pipeline, "fetch_image_record", lambda sha: {"filepath": "/lib/x.png"})
+    monkeypatch.setattr(pipeline, "_post_with_retry", lambda url, body, *a, **k: posts.append((url, body)))
+
+    assert asyncio.run(pipeline.index_search(SHA)) is True
+    _, point = posts[0]
+    assert "description" not in point
+
+
 def test_index_search_noop_when_dense_missing(monkeypatch):
     monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: None)
     monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": [], "values": []})
+    monkeypatch.setattr(pipeline, "load_description_blob", lambda sha: None)
 
     def boom(*a, **k):  # pragma: no cover - must not upsert while waiting
         raise AssertionError("must not upsert until both vectors land")
@@ -182,6 +236,7 @@ def test_index_search_noop_when_dense_missing(monkeypatch):
 def test_index_search_noop_when_sparse_missing(monkeypatch):
     monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1])
     monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: None)
+    monkeypatch.setattr(pipeline, "load_description_blob", lambda sha: None)
     monkeypatch.setattr(
         pipeline, "_post_with_retry",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not upsert")),

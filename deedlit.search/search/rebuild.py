@@ -4,11 +4,16 @@ This is the ONLY cross-service read the search service performs. It pulls image
 records from deedlit.catalog (``GET /images``) and upserts a point per image.
 
 Each catalog item is expected to carry the vectors to index:
-  - ``dense``       : list[float] (1024-dim CLIP image embedding)
-  - ``description`` : list[float] (optional CLIP-text vector of the description)
-  - ``sparse``      : {indices, values} (optional SPLADE sparse vector)
-  - ``payload``     : optional extra payload to store alongside the point
+  - ``dense``  : list[float] (1024-dim CLIP embedding)
+  - ``sparse`` : {indices, values} (optional SPLADE sparse vector)
+  - ``payload``: optional extra payload to store alongside the point
 Items without a ``dense`` vector are skipped (nothing to index on).
+
+NOTE: this inline-vector rebuild does NOT populate the ``description`` named
+vector — the catalog ``/images`` record's ``description`` is the AI *text*, not a
+vector. The description vector is (re)built through the ingest DAG rebuild
+(REBUILD_SEARCH republishes the embed stages), which embeds the description text
+on the GPU and upserts it via ``POST /points``.
 
 The catalog HTTP call is isolated in ``fetch_catalog_images`` so tests can mock
 it without requiring a running catalog.
@@ -77,7 +82,6 @@ def rebuild_from_catalog(store: SearchStore, config: SearchConfig) -> int:
             dense=dense,
             sparse=_sparse_from(item),
             payload=item.get("payload") or {},
-            description=item.get("description") or None,
         )
         upserted += 1
     return upserted

@@ -16,7 +16,12 @@ from fastapi.testclient import TestClient
 import app as app_module
 from conftest import TEST_COLLECTION
 from id_scheme import NAMESPACE, point_id_for_sha256
-from search.config import DENSE_DIM, DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
+from search.config import (
+    DENSE_DIM,
+    DENSE_VECTOR_NAME,
+    DESCRIPTION_VECTOR_NAME,
+    SPARSE_VECTOR_NAME,
+)
 
 client = TestClient(app_module.app)
 store = app_module.get_store()
@@ -85,6 +90,36 @@ def test_collection_has_named_dense_and_sparse_vectors():
     assert vectors[DENSE_VECTOR_NAME].distance.lower() == "cosine"
     sparse = info.config.params.sparse_vectors
     assert sparse is not None and SPARSE_VECTOR_NAME in sparse
+
+
+def test_collection_has_description_dense_vector():
+    info = store.client.get_collection(TEST_COLLECTION)
+    vectors = info.config.params.vectors
+    # The description (CLIP text) vector lives in the same space as the image one.
+    assert DESCRIPTION_VECTOR_NAME in vectors
+    assert vectors[DESCRIPTION_VECTOR_NAME].size == DENSE_DIM
+    assert vectors[DESCRIPTION_VECTOR_NAME].distance.lower() == "cosine"
+
+
+def test_description_vector_indexed_and_queryable():
+    """A point's optional description vector is stored under its own named vector
+    and can be queried independently (fusion='description')."""
+    sha = _sha("desc-point")
+    desc_vec = _dense(700)
+    r = client.post(
+        "/points",
+        json={"sha256": sha, "dense": _dense(701), "description": desc_vec},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.post("/query", json={"description": desc_vec, "limit": 5})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "description"
+    assert sha in {h["sha256"] for h in data["hits"]}
+
+    # Clean up so the seeded A/B/C neighbour assertions stay unaffected.
+    client.delete(f"/points/{sha}")
 
 
 # --- (2) /points upserts and the point id equals uuid5(sha256) --------------

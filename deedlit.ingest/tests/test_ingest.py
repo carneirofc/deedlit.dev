@@ -82,6 +82,12 @@ def mock_outbound(monkeypatch):
         calls["sparse_text"] = text
         return {"indices": [1, 2], "values": [0.5, 0.7]}
 
+    def fake_text(text):
+        # CLIP-text embedding of the AI description (the `description` named vector).
+        calls["text"] = calls.get("text", 0) + 1
+        calls["description_text"] = text
+        return [0.4, 0.5, 0.6]
+
     def fake_describe(data, filename, mime, prompt_hint=None):
         # Default: labelagent disabled (mirrors LABELAGENT_URL unset). Individual
         # tests monkeypatch this when they want AI enrichment.
@@ -110,6 +116,7 @@ def mock_outbound(monkeypatch):
     monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
     monkeypatch.setattr(pipeline, "embed_image", fake_image)
     monkeypatch.setattr(pipeline, "embed_sparse_text", fake_sparse)
+    monkeypatch.setattr(pipeline, "embed_text", fake_text)
     monkeypatch.setattr(pipeline, "describe_image", fake_describe)
     monkeypatch.setattr(pipeline, "fan_out_writes", fake_fanout)
     monkeypatch.setattr(pipeline, "ingest_fast", fake_ingest_fast)
@@ -413,6 +420,10 @@ def test_process_file_folds_catalog_truth_into_tags_sparse_and_payload(mock_outb
     # The description (and the extracted SD prompt) drive the sparse embedding text.
     assert "misty forest" in mock_outbound["sparse_text"]
     assert "a red knight" in mock_outbound["sparse_text"]
+    # The description ALSO gets its own CLIP-text dense vector on the point, embedded
+    # over the description text alone (not the combined sparse text).
+    assert mock_outbound["description_text"] == "A red-armored knight standing in a misty forest."
+    assert rec.point["description"] == [0.4, 0.5, 0.6]
 
 
 # ---------------------------------------------------------------------------
