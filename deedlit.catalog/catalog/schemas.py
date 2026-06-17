@@ -266,3 +266,57 @@ class Task(BaseModel):
     parent_op_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# jobs — durable projection of deedlit.ingest's in-memory JobStore.
+#
+# ingest is stateless (no DB driver), so it write-throughs each coarse op's
+# lifecycle here best-effort (like the tasks ledger) and hydrates the list back
+# on restart. ``id`` is the uuid ingest generates (and stamps on tasks as
+# ``parent_op_id``), so the catalog upserts ON CONFLICT (id) rather than minting
+# its own. ``stage_counts``/``report`` are opaque JSON snapshots.
+# ---------------------------------------------------------------------------
+class JobUpsert(BaseModel):
+    """A job-state snapshot written by ingest (POST /jobs), upserting one row.
+
+    Sent on each lifecycle edge (queued → running → terminal); live per-file
+    progress stays in ingest memory, so this is a coarse snapshot, not a stream.
+    """
+
+    id: str
+    type: str
+    status: str
+    folder_path: str | None = None
+    source_folder_id: str | None = None
+    total: int = 0
+    done: int = 0
+    skipped: int = 0
+    failed: int = 0
+    error: str | None = None
+    current_stage: str | None = None
+    stage_counts: dict[str, int] = Field(default_factory=dict)
+    report: dict[str, Any] | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class Job(JobUpsert):
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# settings — generic key/value store (one JSON blob per key).
+#
+# Currently holds ``ingest_config`` (the producer knobs the settings panel
+# edits) so a UI change survives an ingest restart.
+# ---------------------------------------------------------------------------
+class SettingPut(BaseModel):
+    value: dict[str, Any]
+
+
+class Setting(BaseModel):
+    key: str
+    value: dict[str, Any]
+    updated_at: datetime | None = None

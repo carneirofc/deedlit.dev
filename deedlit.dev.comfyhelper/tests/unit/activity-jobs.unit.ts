@@ -82,6 +82,14 @@ test("a cancelled job errors with a 'cancelled' fallback message", () => {
   expect(out.message).toBe("cancelled");
 });
 
+test("an interrupted job (ingest restart) settles to error, not perpetual poll", () => {
+  const out = applyJobToActivity(jobActivity(), snapshot({ status: "interrupted" }), NOW);
+  expect(out.status).toBe("error");
+  expect(out.message).toBe("interrupted (service restarted)");
+  expect(out.endedAt).toBe(NOW);
+  expect(TERMINAL_JOB_STATUSES.has("interrupted")).toBe(true);
+});
+
 test("returns the same reference when nothing changed", () => {
   const a = jobActivity({ progress: { processed: 3, total: 10, failed: 0 } });
   const out = applyJobToActivity(a, snapshot({ processedFiles: 3 }), NOW);

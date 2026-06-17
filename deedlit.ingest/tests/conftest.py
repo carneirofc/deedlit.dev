@@ -11,7 +11,44 @@ from __future__ import annotations
 import pytest
 
 import config
+import job_ledger
 import ledger
+import settings_client
+
+
+@pytest.fixture(autouse=True)
+def stub_job_persistence(monkeypatch):
+    """Keep the job/config write-through offline + fast in tests.
+
+    The startup hydrate (interrupt-stale + list) and the PUT /config persist call
+    catalog over HTTP best-effort (5s timeout each). Stub them so the suite never
+    blocks on a missing catalog. The returned list records job snapshots for
+    tests that want to assert what would have been persisted.
+    """
+    recorded: list[dict] = []
+
+    async def _record_job(snapshot):
+        recorded.append(snapshot)
+        return True
+
+    async def _list_jobs(limit: int = 200):
+        return []
+
+    async def _interrupt_stale():
+        return []
+
+    async def _settings_load():
+        return {}
+
+    async def _settings_save(overrides):
+        return True
+
+    monkeypatch.setattr(job_ledger, "record_job", _record_job)
+    monkeypatch.setattr(job_ledger, "list_jobs", _list_jobs)
+    monkeypatch.setattr(job_ledger, "interrupt_stale", _interrupt_stale)
+    monkeypatch.setattr(settings_client, "load", _settings_load)
+    monkeypatch.setattr(settings_client, "save", _settings_save)
+    return recorded
 
 
 @pytest.fixture(autouse=True)

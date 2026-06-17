@@ -40,8 +40,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
 import config
+import job_ledger
 import ledger
 import pipeline
+import settings_client
 from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
 from jobs import (
@@ -63,6 +65,25 @@ store = JobStore()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.start_worker()
+    # Restore durable state from catalog before serving (best-effort — a cold or
+    # unreachable catalog must never block startup; both helpers swallow their
+    # own errors and degrade to empty):
+    #   1. flip any job left queued/running by the previous process to
+    #      interrupted (its in-memory worker is gone),
+    #   2. hydrate the job registry so GET /jobs shows history immediately, and
+    #   3. seed the live producer config with the persisted UI overrides.
+    await job_ledger.interrupt_stale()
+    loaded = store.hydrate(await job_ledger.list_jobs(limit=200))
+    if loaded:
+        logging.getLogger("deedlit.ingest.app").info(
+            "hydrated %d job(s) from catalog history", loaded
+        )
+    overrides = await settings_client.load()
+    if overrides:
+        config.update(overrides)
+        logging.getLogger("deedlit.ingest.app").info(
+            "loaded persisted ingest config overrides: %s", overrides
+        )
     # Opt-in background schedulers (all disabled unless their interval env > 0,
     # so tests never get a surprise scheduler):
     #   - reconcile sweep (#21)
@@ -83,6 +104,8 @@ async def lifespan(app: FastAPI):
         # Close the shared pooled HTTP clients (best-effort).
         await pipeline.aclose()
         await ledger.aclose()
+        await job_ledger.aclose()
+        await settings_client.aclose()
 
 
 # Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
@@ -185,13 +208,17 @@ def get_config() -> dict:
 
 
 @app.put("/config")
-def put_config(patch: ConfigPatch) -> dict:
+async def put_config(patch: ConfigPatch) -> dict:
     """Update the live producer config; returns the new effective config.
 
     Tunes folder-scan parallelism from the settings panel without a restart.
-    Consumer-side parallelism (broker prefetch / worker replicas) is deploy-time
-    and not settable here."""
-    return config.update(patch.model_dump(exclude_none=True))
+    The effective config is persisted to catalog best-effort so the change
+    survives an ingest restart (a persist failure is swallowed — the in-memory
+    override still applies this run). Consumer-side parallelism (broker prefetch /
+    worker replicas) is deploy-time and not settable here."""
+    effective = config.update(patch.model_dump(exclude_none=True))
+    await settings_client.save(effective)
+    return effective
 
 
 @app.get("/fs/browse")

@@ -26,10 +26,13 @@ from catalog.schemas import (
     Image,
     ImagePatch,
     ImageUpsert,
+    Job,
+    JobUpsert,
     Note,
     NoteUpsert,
     Params,
     SafetyBreakdown,
+    Setting,
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
@@ -1394,3 +1397,185 @@ def list_unlabeled_sha256(limit: int, offset: int) -> list[str]:
             {"provider": _DESCRIPTION_PROVIDER, "limit": limit, "offset": offset},
         ).all()
         return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# jobs — durable projection of the ingest JobStore (coarse ops).
+#
+# ingest write-throughs each job snapshot here best-effort and hydrates the list
+# back on restart; the in-memory worker stays the source of truth for live
+# progress. UPSERT keyed on the ingest-supplied ``id``.
+# ---------------------------------------------------------------------------
+_JOB_COLUMNS = (
+    "id, type, status, folder_path, source_folder_id, total, done, skipped, "
+    "failed, error, current_stage, stage_counts, report, created_at, "
+    "started_at, finished_at, updated_at"
+)
+
+
+def _job_from_row(row: Any) -> Job:
+    return Job(
+        id=str(row["id"]),
+        type=row["type"],
+        status=row["status"],
+        folder_path=row["folder_path"],
+        source_folder_id=row["source_folder_id"],
+        total=int(row["total"] or 0),
+        done=int(row["done"] or 0),
+        skipped=int(row["skipped"] or 0),
+        failed=int(row["failed"] or 0),
+        error=row["error"],
+        current_stage=row["current_stage"],
+        # JSONB round-trips as a dict already; coerce defensively.
+        stage_counts=row["stage_counts"] or {},
+        report=row["report"],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def upsert_job(payload: JobUpsert) -> Job:
+    """Upsert one job row to its latest snapshot (ON CONFLICT (id)).
+
+    Timestamps are sticky: ``created_at`` is INSERT-only, and ``started_at`` /
+    ``finished_at`` keep an existing non-null value when the incoming snapshot
+    omits it, so an out-of-order write can't blank a lifecycle stamp.
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(
+            text(
+                f"""
+                INSERT INTO jobs (
+                    id, type, status, folder_path, source_folder_id,
+                    total, done, skipped, failed, error, current_stage,
+                    stage_counts, report, started_at, finished_at
+                ) VALUES (
+                    :id, :type, :status, :folder_path, :source_folder_id,
+                    :total, :done, :skipped, :failed, :error, :current_stage,
+                    CAST(:stage_counts AS JSONB), CAST(:report AS JSONB),
+                    :started_at, :finished_at
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    type = EXCLUDED.type,
+                    status = EXCLUDED.status,
+                    folder_path = COALESCE(EXCLUDED.folder_path, jobs.folder_path),
+                    source_folder_id =
+                        COALESCE(EXCLUDED.source_folder_id, jobs.source_folder_id),
+                    total = EXCLUDED.total,
+                    done = EXCLUDED.done,
+                    skipped = EXCLUDED.skipped,
+                    failed = EXCLUDED.failed,
+                    error = EXCLUDED.error,
+                    current_stage = EXCLUDED.current_stage,
+                    stage_counts = EXCLUDED.stage_counts,
+                    report = COALESCE(EXCLUDED.report, jobs.report),
+                    started_at = COALESCE(EXCLUDED.started_at, jobs.started_at),
+                    finished_at = COALESCE(EXCLUDED.finished_at, jobs.finished_at),
+                    updated_at = now()
+                RETURNING {_JOB_COLUMNS}
+                """
+            ),
+            {
+                "id": payload.id,
+                "type": payload.type,
+                "status": payload.status,
+                "folder_path": payload.folder_path,
+                "source_folder_id": payload.source_folder_id,
+                "total": payload.total,
+                "done": payload.done,
+                "skipped": payload.skipped,
+                "failed": payload.failed,
+                "error": payload.error,
+                "current_stage": payload.current_stage,
+                "stage_counts": json.dumps(payload.stage_counts or {}),
+                "report": json.dumps(payload.report) if payload.report is not None else None,
+                "started_at": payload.started_at,
+                "finished_at": payload.finished_at,
+            },
+        ).mappings().first()
+        return _job_from_row(row)
+
+
+def list_jobs(*, limit: int = 200, offset: int = 0) -> list[Job]:
+    """List jobs (newest-updated first) — backs the ingest restart hydrate."""
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT {_JOB_COLUMNS} FROM jobs "
+                "ORDER BY updated_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            {"limit": limit, "offset": offset},
+        ).mappings().all()
+        return [_job_from_row(r) for r in rows]
+
+
+def get_job(job_id: str) -> Job | None:
+    eng = get_engine()
+    with eng.connect() as conn:
+        row = conn.execute(
+            text(f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id = :id"),
+            {"id": job_id},
+        ).mappings().first()
+    return _job_from_row(row) if row is not None else None
+
+
+def interrupt_stale_jobs() -> list[str]:
+    """Flip every job still ``queued``/``running`` to ``interrupted``.
+
+    Called by ingest on startup: a job in those states belongs to a previous
+    process whose in-memory worker is gone, so it can never settle on its own.
+    Returns the ids it changed (stamps ``finished_at`` so the UI shows it ended).
+    """
+    eng = get_engine()
+    with eng.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                UPDATE jobs
+                   SET status = 'interrupted',
+                       finished_at = COALESCE(finished_at, now()),
+                       updated_at = now()
+                 WHERE status IN ('queued', 'running')
+                RETURNING id
+                """
+            )
+        ).all()
+        return [str(r[0]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# settings — generic key/value store (one JSON blob per key).
+# ---------------------------------------------------------------------------
+def get_setting(key: str) -> Setting | None:
+    eng = get_engine()
+    with eng.connect() as conn:
+        row = conn.execute(
+            text("SELECT key, value, updated_at FROM settings WHERE key = :key"),
+            {"key": key},
+        ).mappings().first()
+    if row is None:
+        return None
+    return Setting(key=row["key"], value=row["value"] or {}, updated_at=row["updated_at"])
+
+
+def put_setting(key: str, value: dict[str, Any]) -> Setting:
+    eng = get_engine()
+    with eng.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                INSERT INTO settings (key, value)
+                VALUES (:key, CAST(:value AS JSONB))
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = now()
+                RETURNING key, value, updated_at
+                """
+            ),
+            {"key": key, "value": json.dumps(value or {})},
+        ).mappings().first()
+        return Setting(key=row["key"], value=row["value"] or {}, updated_at=row["updated_at"])

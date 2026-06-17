@@ -54,8 +54,15 @@ export interface JobSnapshot {
   stageCounts: Record<string, number>;
 }
 
-/** Job statuses past which an activity is settled and no longer driven. */
-export const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+/** Job statuses past which an activity is settled and no longer driven.
+ * `interrupted` = the ingest service restarted mid-job (its in-memory worker is
+ * gone), so the activity must settle rather than poll a job that can't finish. */
+export const TERMINAL_JOB_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
 
 /** True once an activity has settled (succeeded or failed). */
 export function isTerminal(status: ActivityStatus): boolean {
@@ -88,7 +95,12 @@ export function applyJobToActivity(
       status: ok ? "success" : "error",
       message: ok
         ? undefined
-        : job.errorMessage ?? (job.status === "cancelled" ? "cancelled" : "failed"),
+        : job.errorMessage ??
+          (job.status === "cancelled"
+            ? "cancelled"
+            : job.status === "interrupted"
+              ? "interrupted (service restarted)"
+              : "failed"),
       // Clear the live stage once settled — there is no service still working.
       stage: null,
       stageCounts: job.stageCounts,

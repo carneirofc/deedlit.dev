@@ -15,9 +15,13 @@ from catalog.schemas import (
     Image,
     ImagePatch,
     ImageUpsert,
+    Job,
+    JobUpsert,
     Note,
     NoteUpsert,
     RatingBody,
+    Setting,
+    SettingPut,
     SourceFolder,
     SourceFolderPatch,
     SourceFolderUpsert,
@@ -342,6 +346,54 @@ def read_task(id: str = Path(...)) -> Task:
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     return task
+
+
+# --- jobs (durable projection of the ingest JobStore) ----------------------
+# Registered BEFORE /jobs/{id}: the literal "interrupt-stale" segment must win
+# over the parameterized route.
+@router.post("/jobs/interrupt-stale")
+def interrupt_stale_jobs() -> dict:
+    """Mark every job still queued/running as interrupted (ingest startup).
+
+    A job in those states belongs to a process whose in-memory worker is gone,
+    so it can never settle itself. Returns the ids flipped."""
+    return {"interrupted": repository.interrupt_stale_jobs()}
+
+
+@router.post("/jobs", response_model=Job)
+def upsert_job(payload: JobUpsert) -> Job:
+    """Record a job-state snapshot (best-effort, called by ingest)."""
+    return repository.upsert_job(payload)
+
+
+@router.get("/jobs", response_model=list[Job])
+def list_jobs(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[Job]:
+    return repository.list_jobs(limit=limit, offset=offset)
+
+
+@router.get("/jobs/{id}", response_model=Job)
+def read_job(id: str = Path(...)) -> Job:
+    job = repository.get_job(id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+# --- settings (generic KV; holds the ingest producer config) ---------------
+@router.get("/settings/{key}", response_model=Setting)
+def read_setting(key: str = Path(...)) -> Setting:
+    setting = repository.get_setting(key)
+    if setting is None:
+        raise HTTPException(status_code=404, detail="setting not found")
+    return setting
+
+
+@router.put("/settings/{key}", response_model=Setting)
+def write_setting(payload: SettingPut, key: str = Path(...)) -> Setting:
+    return repository.put_setting(key, payload.value)
 
 
 # --- reports ---------------------------------------------------------------

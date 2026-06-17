@@ -48,3 +48,36 @@ def test_config_endpoints_round_trip():
 
         # Persisted for the next read (same process).
         assert client.get("/config").json()["ingest_concurrency"] == 5
+
+
+def test_put_config_persists_to_catalog(monkeypatch):
+    """A UI config change is written through to the catalog settings store so it
+    survives an ingest restart (best-effort; the in-memory override applies now)."""
+    import settings_client
+
+    saved: list[dict] = []
+
+    async def _save(overrides):
+        saved.append(overrides)
+        return True
+
+    monkeypatch.setattr(settings_client, "save", _save)
+    with TestClient(app_module.app) as client:
+        client.put("/config", json={"ingest_concurrency": 7})
+    assert saved and saved[-1]["ingest_concurrency"] == 7
+
+
+def test_startup_seeds_config_from_persisted_overrides(monkeypatch):
+    """On boot the live config is seeded from the persisted overrides, so a knob
+    set from the UI is back in effect after a restart (not the env default)."""
+    import settings_client
+
+    async def _load():
+        return {"ingest_concurrency": 9, "ingest_via_queue": True}
+
+    monkeypatch.setattr(settings_client, "load", _load)
+    config.reset()
+    with TestClient(app_module.app) as client:
+        got = client.get("/config").json()
+    assert got["ingest_concurrency"] == 9
+    assert got["ingest_via_queue"] is True

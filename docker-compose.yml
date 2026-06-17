@@ -35,6 +35,11 @@ x-library-volume: &library-volume
 
 services:
   # --- Datastores --------------------------------------------------------
+  # Postgres is the source of truth and also the DURABILITY layer for ingest
+  # state: the source-folder registry (inventories), the per-image task ledger,
+  # the coarse JOB history, and the persisted ingest config overrides
+  # (settings table) all live here, so they survive a service restart. The
+  # postgres_data volume below is what makes that persistence durable.
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -142,9 +147,12 @@ services:
       retries: 20
 
   # RabbitMQ: durable transport for the async index/label task queues (ADR 0001).
-  # The management plugin (15672) backs the in-app queue visualization (#29) and
-  # is the deep-link target for power debugging. The ingest fast path publishes
-  # tasks here; ingest-worker replicas consume them.
+  # Queues survive a broker restart: they are declared durable=True and messages
+  # publish in PERSISTENT delivery mode (deedlit.ingest/broker.py), and the
+  # rabbitmq_data volume below holds the Mnesia store (durable queue defs +
+  # persistent messages). The management plugin (15672) backs the in-app queue
+  # visualization (#29) and is the deep-link target for power debugging. The
+  # ingest fast path publishes tasks here; ingest-worker replicas consume them.
   rabbitmq:
     image: rabbitmq:3-management-alpine
     restart: unless-stopped

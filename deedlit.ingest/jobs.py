@@ -20,6 +20,7 @@ from typing import Any
 
 import broker
 import config
+import job_ledger
 import ledger
 import pipeline
 
@@ -142,6 +143,9 @@ RUNNING = "running"
 COMPLETED = "completed"
 FAILED = "failed"
 CANCELLED = "cancelled"
+# Terminal state stamped (catalog-side) on hydrate for a job left queued/running
+# by a previous process — its in-memory worker is gone, so it can't settle.
+INTERRUPTED = "interrupted"
 
 # Root walked by the ``rescan-files`` maintenance job when no folderPath is
 # given. Mirrors the monolith's IMAGE_LIBRARY_ROOT.
@@ -275,6 +279,29 @@ class Job:
             out["report"] = self.report
         return out
 
+    def to_persist(self) -> dict[str, Any]:
+        """Snake_case snapshot for the catalog ``jobs`` table (job_ledger).
+
+        Coarse, not per-file: written on the lifecycle edges (queued → terminal).
+        ``*_at`` ride as ISO strings (Pydantic parses them back to datetimes)."""
+        return {
+            "id": self.id,
+            "type": self.type,
+            "status": self.status,
+            "folder_path": self.folder_path,
+            "source_folder_id": self.source_folder_id,
+            "total": self.progress.total,
+            "done": self.progress.done,
+            "skipped": self.progress.skipped,
+            "failed": self.progress.failed,
+            "error": self.error,
+            "current_stage": self.current_stage,
+            "stage_counts": self.stage_counts,
+            "report": self.report,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }
+
     def stage_callback(self) -> Callable[[str], None]:
         """A progress hook for the pipeline: record the current stage and bump
         the per-stage reached-count. Passed into ``pipeline.process_file`` /
@@ -303,6 +330,44 @@ class Job:
         return cb
 
 
+# Terminal job states — a hydrated job in any other state was left in-flight by
+# a dead process, so it is loaded as ``interrupted``.
+_TERMINAL_STATES = frozenset({COMPLETED, FAILED, CANCELLED, INTERRUPTED})
+
+
+def _as_str(value: Any) -> str | None:
+    """ISO datetime / id fields ride as strings; pass through, coercing None."""
+    return str(value) if value is not None else None
+
+
+def _job_from_snapshot(snap: dict[str, Any]) -> Job:
+    """Rebuild an in-memory Job from a persisted catalog snapshot (hydrate)."""
+    status = str(snap.get("status") or QUEUED)
+    if status not in _TERMINAL_STATES:
+        status = INTERRUPTED
+    job = Job(id=str(snap["id"]), type=str(snap.get("type") or "ingest"), status=status)
+    job.folder_path = snap.get("folder_path")
+    job.source_folder_id = snap.get("source_folder_id")
+    job.progress = Progress(
+        total=int(snap.get("total") or 0),
+        done=int(snap.get("done") or 0),
+        skipped=int(snap.get("skipped") or 0),
+        failed=int(snap.get("failed") or 0),
+    )
+    job.error = snap.get("error")
+    job.current_stage = snap.get("current_stage")
+    job.stage_counts = dict(snap.get("stage_counts") or {})
+    job.report = snap.get("report")
+    job.created_at = _as_str(snap.get("created_at")) or _now_iso()
+    job.started_at = _as_str(snap.get("started_at"))
+    # A job interrupted mid-run has no persisted finish; stamp one so the UI
+    # shows it as ended rather than perpetually open.
+    job.finished_at = _as_str(snap.get("finished_at")) or (
+        _now_iso() if status == INTERRUPTED else None
+    )
+    return job
+
+
 class JobStore:
     """Process-local registry + single-worker claim loop."""
 
@@ -314,6 +379,27 @@ class JobStore:
         # while still skipping unchanged files on a re-run within the process.
         self._seen_sha256: set[str] = set()
         self._worker: asyncio.Task | None = None
+        # The event loop the worker runs on, captured so a job snapshot can be
+        # scheduled onto it (best-effort, fire-and-forget) even from a sync
+        # endpoint thread. Set by start_worker / the async lifespan.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    # -- durable history (best-effort write-through to catalog) ------------
+    def _schedule_persist(self, job: Job) -> None:
+        """Mirror ``job``'s current snapshot to the catalog ``jobs`` table.
+
+        Fire-and-forget on the worker's loop (works from any thread via
+        run_coroutine_threadsafe), so a slow/absent catalog never stalls the job.
+        Called on the lifecycle edges only (queued → terminal); live per-file
+        progress stays in memory and is read straight off ``GET /jobs``."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        snapshot = job.to_persist()
+        try:
+            asyncio.run_coroutine_threadsafe(job_ledger.record_job(snapshot), loop)
+        except Exception:  # noqa: BLE001 — scheduling is best-effort
+            pass
 
     # -- registry ---------------------------------------------------------
     def get(self, job_id: str) -> Job | None:
@@ -322,6 +408,25 @@ class JobStore:
     def list(self) -> list[Job]:
         """All jobs, newest first — backs the gateway/dashboard GET /jobs list."""
         return list(reversed(self._jobs.values()))
+
+    def hydrate(self, snapshots: list[dict[str, Any]]) -> int:
+        """Seed the registry from persisted catalog snapshots on startup.
+
+        Loads history so ``GET /jobs`` (and the dashboard) shows past jobs right
+        after a restart. Hydrated jobs are NOT re-queued — their async work is
+        gone; any non-terminal one is flipped to ``interrupted`` (the catalog has
+        already done the same server-side). ``snapshots`` arrive newest-first
+        (catalog order); insert oldest-first so ``list`` still yields newest-first.
+        Existing ids win, so a live job created before hydrate isn't clobbered.
+        """
+        loaded = 0
+        for snap in reversed(snapshots):
+            jid = snap.get("id")
+            if not jid or jid in self._jobs:
+                continue
+            self._jobs[jid] = _job_from_snapshot(snap)
+            loaded += 1
+        return loaded
 
     def create_ingest_job(
         self, folder_path: str, *, source_folder_id: str | None = None
@@ -334,11 +439,13 @@ class JobStore:
         )
         self._jobs[job.id] = job
         self._queue.put_nowait(job.id)
+        self._schedule_persist(job)  # record the queued snapshot for history
         return job
 
     def _enqueue(self, job: Job) -> Job:
         self._jobs[job.id] = job
         self._queue.put_nowait(job.id)
+        self._schedule_persist(job)  # record the queued snapshot for history
         return job
 
     def create_maintenance_job(
@@ -392,10 +499,18 @@ class JobStore:
         if job.status == QUEUED:
             job.status = CANCELLED
             job.finished_at = _now_iso()
+            self._schedule_persist(job)  # terminal: persist the cancel
         return job
 
     # -- worker -----------------------------------------------------------
     def start_worker(self) -> None:
+        # Capture the running loop (lifespan/async context) so _schedule_persist
+        # can target it from any thread. A no-op from a sync endpoint thread
+        # (no running loop) — the lifespan has already set it by then.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._run_worker())
 
@@ -452,6 +567,9 @@ class JobStore:
                     error=job.error or "",
                     touch_last_scan_at=True,
                 )
+            # Persist the terminal snapshot (status + final counts + finished_at)
+            # so the job survives a restart in the catalog history.
+            self._schedule_persist(job)
         log.info(
             "job %s (%s) -> %s (total=%d done=%d skipped=%d failed=%d)",
             job.id, job.type, job.status,

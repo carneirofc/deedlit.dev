@@ -8,11 +8,20 @@ dependencies = [
     "fastapi>=0.116.0",
     # fastembed-gpu pulls onnxruntime-gpu so SPLADE sparse embeddings run on the
     # GPU (CUDAExecutionProvider). Plain `fastembed` ships CPU-only onnxruntime
-    # and pinned sparse to the CPU. onnxruntime-gpu is floored at 1.22 for sm_120
-    # (Blackwell / RTX 50-series) kernels + CUDA 12 / cuDNN 9. Set SPARSE_DEVICE=cpu
-    # to force CPU.
+    # and pinned sparse to the CPU. Set SPARSE_DEVICE=cpu to force CPU.
+    #
+    # CUDA 12 vs 13: PyPI's onnxruntime-gpu is now the CUDA-13 build — its
+    # provider DLL depends on cublasLt64_13.dll / CUDA-13 cuDNN, which are NOT on
+    # this box (it fell back to CPU with "cublasLt64_13.dll is missing"). torch
+    # below is the cu128 (CUDA 12.8) build and bundles the full CUDA-12 runtime
+    # (cublasLt64_12.dll, cudnn64_9.dll, …) in torch/lib, and torch imports before
+    # fastembed so that dir is already on the DLL search path. So we pull the
+    # CUDA-12 build of onnxruntime-gpu from the onnxruntime-cuda-12 Azure feed
+    # (see [[tool.uv.index]] / [tool.uv.sources]) — it reuses torch's CUDA-12 libs
+    # and needs no separate CUDA toolkit. Pinned to 1.27.0 (cp314 wheel, sm_120
+    # Blackwell / RTX 50-series kernels).
     "fastembed-gpu>=0.8.0",
-    "onnxruntime-gpu>=1.22.0",
+    "onnxruntime-gpu==1.27.0",
     "httpx>=0.27.0",
     "open-clip-torch>=2.24.0",
     "pillow>=10.0.0",
@@ -42,9 +51,18 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+# CUDA-12 builds of onnxruntime-gpu. PyPI now ships the CUDA-13 build (wants
+# cublasLt64_13.dll); this feed has the matching CUDA-12 wheels that reuse the
+# CUDA-12 runtime torch already bundles. See the onnxruntime-gpu comment above.
+[[tool.uv.index]]
+name = "onnxruntime-cuda-12"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
+onnxruntime-gpu = { index = "onnxruntime-cuda-12" }
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]

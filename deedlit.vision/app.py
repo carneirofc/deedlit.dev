@@ -36,6 +36,8 @@ from pydantic import BaseModel, Field
 from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms
+from torchvision.transforms import v2
+from torchvision.transforms.functional import pil_to_tensor
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
 
 from activity import install_activity
@@ -104,6 +106,28 @@ def _cuda_index(device: str) -> int:
 # Standard CLIP image normalization (OpenAI dataset stats, used by OpenCLIP too).
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# Image preprocessing device. The BICUBIC resize + normalize used to run CPU-side
+# (PIL/torchvision) on the single GPU worker thread, so each batch pegged ONE CPU
+# core resizing while the GPU sat idle, then ran a sub-100ms forward — CPU-bound,
+# GPU-starved. With CUDA we now upload the decoded uint8 image and run
+# resize/crop/scale/normalize ON THE GPU; the CPU only decodes (parallelised over
+# _cpu_pool). Set VISION_PREPROCESS_DEVICE=cpu to keep the exact original
+# PIL/torchvision numerics (e.g. to match vectors indexed before this change).
+PREPROCESS_ON_GPU = os.getenv("VISION_PREPROCESS_DEVICE", DEVICE).startswith("cuda")
+
+# GPU preprocessing pipeline applied to a uint8 [C,H,W] tensor already on-device.
+# Mirrors the CPU Compose below (Resize shorter-side 224 BICUBIC antialias ->
+# CenterCrop 224 -> /255 float -> CLIP normalize). The CLIP towers all use this
+# same 224 pipeline, so one shared transform serves every preset.
+_GPU_PREPROCESS = v2.Compose(
+    [
+        v2.Resize(224, interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
+        v2.CenterCrop(224),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=list(CLIP_IMAGE_MEAN), std=list(CLIP_IMAGE_STD)),
+    ]
+)
 
 
 MODEL_CONFIGS = {
@@ -484,6 +508,17 @@ _gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-gpu")
 # (no double model load).
 _sparse_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-sparse")
 
+# Image decode runs here, NOT on the asyncio event loop and NOT on the single
+# _gpu_pool worker. PIL/libjpeg decode is CPU-bound and releases the GIL, so a
+# pool of workers decodes the images of a burst in parallel across cores while
+# the GPU stays busy embedding the previous batch. (The expensive resize/normalize
+# moved to the GPU — see _preprocess_image — so decode is the only per-image CPU
+# cost left.) max_workers defaults to min(8, cpu_count).
+_cpu_pool = ThreadPoolExecutor(
+    max_workers=int(os.getenv("VISION_PREPROCESS_WORKERS", str(min(8, os.cpu_count() or 4)))),
+    thread_name_prefix="vision-cpu",
+)
+
 # Dense micro-batching. The ingest hot path POSTs /embed/image for ONE image per
 # file; with a scaled ingest-worker pool, hundreds of those land here at once. On
 # the single GPU worker they otherwise run one-image-at-a-time (batch=1), which
@@ -496,7 +531,7 @@ _sparse_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-spar
 #   VISION_DENSE_BATCH_WAIT_MS: how long the first request waits to accumulate a
 #                               batch before firing (latency vs. throughput knob;
 #                               0 = fire as soon as the worker is free).
-DENSE_BATCH_MAX = max(1, int(os.getenv("VISION_DENSE_BATCH_MAX", "16")))
+DENSE_BATCH_MAX = max(1, int(os.getenv("VISION_DENSE_BATCH_MAX", "32")))
 DENSE_BATCH_WAIT_MS = max(0.0, float(os.getenv("VISION_DENSE_BATCH_WAIT_MS", "10")))
 
 
@@ -547,11 +582,24 @@ def _embed_text_vec(text: str, preset: str = DEFAULT_PRESET) -> torch.Tensor:
     return vec[0]
 
 
+def _preprocess_image(image: Image.Image, preset: str) -> torch.Tensor:
+    """Turn a decoded PIL image into a model-input tensor ``[3,224,224]`` on DEVICE.
+
+    On CUDA (``PREPROCESS_ON_GPU``) the uint8 image is uploaded and the
+    resize/crop/scale/normalize run on the GPU, so the heavy BICUBIC resize no
+    longer pegs a CPU thread while the GPU idles. On CPU it falls back to the
+    original PIL/torchvision Compose for byte-identical numerics.
+    """
+    if PREPROCESS_ON_GPU:
+        return _GPU_PREPROCESS(pil_to_tensor(image).to(DEVICE))
+    return _vision_preprocess[preset](image).to(DEVICE)
+
+
 def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.Tensor:
     _load_vision_model(preset)
 
     started = time.perf_counter()
-    image_tensor = _vision_preprocess[preset](image).unsqueeze(0).to(DEVICE)
+    image_tensor = _preprocess_image(image, preset).unsqueeze(0)
 
     if USE_FP16 and DEVICE.startswith("cuda"):
         image_tensor = image_tensor.half()
@@ -591,20 +639,31 @@ def _embed_images_batch(images: list[Image.Image], preset: str) -> list[list[flo
     """
     _load_vision_model(preset)
 
+    on_cuda = DEVICE.startswith("cuda")
+
     started = time.perf_counter()
-    batch = torch.stack([_vision_preprocess[preset](image) for image in images]).to(DEVICE)
-
-    if USE_FP16 and DEVICE.startswith("cuda"):
+    batch = torch.stack([_preprocess_image(image, preset) for image in images])
+    if USE_FP16 and on_cuda:
         batch = batch.half()
+    if on_cuda:
+        torch.cuda.synchronize()  # let the prep timing capture the GPU resize, not just kernel launches
+    prep_ms = (time.perf_counter() - started) * 1000
 
+    fwd_started = time.perf_counter()
     with torch.no_grad():
         vecs = _vision_models[preset](pixel_values=batch).image_embeds
         vecs = _normalize(vecs)
+    if on_cuda:
+        torch.cuda.synchronize()
+    fwd_ms = (time.perf_counter() - fwd_started) * 1000
 
+    # Split prep vs forward so a CPU-bound preprocessing stall (the old bottleneck)
+    # is visible separately from the GPU forward. If prep >> fwd, decode/upload is
+    # the limit, not the GPU.
     log.info(
-        "embed image batch (%s) n=%d %.0f ms on %s%s",
-        preset, len(images), (time.perf_counter() - started) * 1000, DEVICE,
-        " fp16" if (USE_FP16 and DEVICE.startswith("cuda")) else "",
+        "embed image batch (%s) n=%d prep %.0f ms + fwd %.0f ms on %s%s",
+        preset, len(images), prep_ms, fwd_ms, DEVICE,
+        " fp16" if (USE_FP16 and on_cuda) else "",
     )
     return vecs.float().cpu().tolist()
 
@@ -683,6 +742,11 @@ async def _embed_image_batched(image: Image.Image, preset: str) -> list[float]:
     return await fut
 
 
+def _decode_rgb(raw: bytes) -> Image.Image:
+    """Decode raw image bytes to an RGB PIL image (CPU; runs on _cpu_pool)."""
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
 async def _read_image_upload(file: UploadFile) -> Image.Image:
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(
@@ -692,8 +756,12 @@ async def _read_image_upload(file: UploadFile) -> Image.Image:
 
     raw = await file.read()
 
+    # Decode off the event loop on the CPU pool: PIL/libjpeg decode is CPU-bound
+    # and releases the GIL, so a burst of uploads decodes in parallel across cores
+    # instead of blocking the single event-loop thread one image at a time.
+    loop = asyncio.get_running_loop()
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        return await loop.run_in_executor(_cpu_pool, _decode_rgb, raw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid image {file.filename!r}: {exc}") from exc
 
