@@ -116,8 +116,8 @@ def test_ingest_run_sets_timestamps_and_fast_path_staircase(tmp_path, monkeypatc
     monkeypatch.setattr(app_module, "store", store)
     # Keep the REAL ingest_fast (fast path), stubbing only its outbound calls, so
     # the per-file fast-path stages are exercised offline. Projection (dense/
-    # sparse/search/graph) now happens async in the index worker (ADR 0001), so
-    # it is NOT part of the folder-walk job's staircase.
+    # sparse/search/graph) now happens async in the per-stage DAG worker (ADR
+    # 0002), so it is NOT part of the folder-walk job's staircase.
     monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "p", "tags": ["t"]})
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_put_blob_with_retry", lambda *a, **k: None)

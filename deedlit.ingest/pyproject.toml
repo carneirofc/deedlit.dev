@@ -10,8 +10,8 @@ dependencies = [
     "pillow>=10.0.0",
     "imagehash>=4.3.1",
     "python-multipart>=0.0.9",
-    # RabbitMQ client for the async index/label task queues (ADR 0001). Imported
-    # lazily inside broker.py so the test suite runs offline without a broker.
+    # RabbitMQ client for the async per-stage DAG task queues (ADR 0001/0002).
+    # Imported lazily inside broker.py so the test suite runs offline without a broker.
     "aio-pika>=9.4.0",
     # OpenTelemetry: zero-code tracing via `opentelemetry-instrument`. Exports
     # OTLP/http to Tempo (see OTEL_* env / dev:ingest script). httpx instrumentation

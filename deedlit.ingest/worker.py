@@ -9,7 +9,7 @@ Deploying this as its own process (compose service ``ingest-worker``) lets the
 slow, GPU/LLM-bound work scale independently of the API — e.g. run extra
 replicas with ``QUEUES=label`` once the label queue exists (#26).
 
-    docker compose up -d ingest-worker          # QUEUES=index (default)
+    docker compose up -d ingest-worker          # fast per-stage DAG (default)
     QUEUES=label docker compose up -d ...        # a label-only replica (#26)
 """
 from __future__ import annotations
@@ -37,20 +37,6 @@ if not _pkg.handlers:
     _pkg.addHandler(_h)
     _pkg.propagate = False
 _pkg.setLevel(os.getenv("INGEST_LOG_LEVEL", "INFO").upper())
-
-
-async def index_handler(payload: dict) -> None:
-    """Build the search+graph projection for one image (ADR 0001).
-
-    Rebuilds entirely from catalog truth: resolve bytes (sha -> catalog filepath
-    -> shared disk), embed dense+sparse, upsert the search point and graph edges.
-    Idempotent — running it twice converges. ``reindex_image`` is synchronous
-    (httpx), so it runs in a thread to avoid blocking the consumer event loop.
-    """
-    sha256 = payload.get("sha256")
-    if not sha256:
-        raise ValueError("index task missing sha256")
-    await pipeline.maybe_await(pipeline.reindex_image(sha256))
 
 
 async def label_handler(payload: dict) -> None:
@@ -104,6 +90,7 @@ async def embed_dense_handler(payload: dict) -> None:
         raise ValueError("embed.dense task missing sha256")
     await pipeline.maybe_await(pipeline.embed_dense(sha256))
     await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
+    log.info("embed.dense %s done -> published index.search", sha256[:12])
 
 
 async def embed_sparse_handler(payload: dict) -> None:
@@ -138,8 +125,7 @@ async def index_graph_handler(payload: dict) -> None:
 
 # Per-queue handlers — a replica drains the subset named in QUEUES (ADR 0002).
 # The GPU-bound embed.dense is its own queue so a `QUEUES=embed.dense` replica set
-# scales independently of the cheap I/O stages. ``index`` is the legacy ADR 0001
-# monolith, retained so in-flight messages drain during the migration.
+# scales independently of the cheap I/O stages.
 HANDLERS = {
     broker.INGEST_QUEUE: ingest_handler,
     broker.EMBED_DENSE_QUEUE: embed_dense_handler,
@@ -147,7 +133,6 @@ HANDLERS = {
     broker.INDEX_SEARCH_QUEUE: index_search_handler,
     broker.INDEX_GRAPH_QUEUE: index_graph_handler,
     broker.LABEL_QUEUE: label_handler,
-    broker.INDEX_QUEUE: index_handler,
 }
 
 
@@ -177,7 +162,7 @@ def _ledger_event_factory(queue: str, payload: dict):
 
 
 def _queues_from_env() -> list[str]:
-    raw = os.getenv("QUEUES", broker.INDEX_QUEUE)
+    raw = os.getenv("QUEUES", ",".join(broker.DEFAULT_QUEUES))
     return [q.strip() for q in raw.split(",") if q.strip()]
 
 

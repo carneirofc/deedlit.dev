@@ -13,8 +13,8 @@ procs:
   ui:
     shell: "npm run dev:dev"        # Next landing app  -> :3001
   comfyhelper:
-    # shell: "npm run dev:comfyhelper" # Next comfyhelper -> :3000
-    shell: "npm run start:comfyhelper" # Next comfyhelper -> :3000
+    shell: "npm run dev:comfyhelper" # Next comfyhelper -> :3000
+    # shell: "npm run start:comfyhelper" # Next comfyhelper -> :3000
   api:
     shell: "npm run dev:api"        # BFF gateway       -> :8088
   catalog:
@@ -26,13 +26,19 @@ procs:
   ingest:
     shell: "npm run dev:ingest"     # -> :8004
   ingest-worker:
-    # RabbitMQ consumer (ADR 0001): drains the index/label task queues and
-    # rebuilds the search+graph projections. Same codebase as ingest, run as a
-    # consumer instead of an HTTP server (no port). Mirrors the compose
-    # `ingest-worker` default of draining both queues.
+    # RabbitMQ consumer (ADR 0002): drains the PER-STAGE DAG queues and builds
+    # the search+graph projections. Same codebase as ingest, run as a consumer
+    # instead of an HTTP server (no port). One local worker drains every queue
+    # (compose splits label into its own replica; run_worker still gives label
+    # its own prefetch-1 exclusive channel, so a combined local worker is fine).
+    #
+    # MUST list embed.dense/embed.sparse/index.search/index.graph: the producer
+    # publishes those (publish_post_ingest). Draining only label left them piling
+    # up unconsumed — the dense vector was never embedded/configured and the
+    # vision endpoint was never called (no logs).
     shell: "npm run dev:ingest-worker"
     env:
-      QUEUES: "index,label"
+      QUEUES: "ingest,embed.dense,embed.sparse,index.search,index.graph,label"
   metadata:
     shell: "npm run dev:metadata"   # -> :8005
   labelagent:

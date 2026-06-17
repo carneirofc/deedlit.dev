@@ -17,7 +17,7 @@ SHA = "a" * 64
 # ---------------------------------------------------------------------------
 # (1) queue set
 # ---------------------------------------------------------------------------
-def test_task_queues_cover_every_stage_plus_legacy_index():
+def test_task_queues_cover_every_stage():
     assert set(broker_module.TASK_QUEUES) == {
         "ingest",
         "embed.dense",
@@ -25,7 +25,6 @@ def test_task_queues_cover_every_stage_plus_legacy_index():
         "index.search",
         "index.graph",
         "label",
-        "index",  # legacy ADR 0001 queue, kept declared for in-flight messages
     }
 
 
@@ -108,7 +107,6 @@ def test_per_stage_publish_helpers_route_by_sha(monkeypatch):
         (broker_module.publish_embed_sparse_task, "embed.sparse"),
         (broker_module.publish_index_search_task, "index.search"),
         (broker_module.publish_index_graph_task, "index.graph"),
-        (broker_module.publish_index_task, "index"),
         (broker_module.publish_label_task, "label"),
     ]
     for fn, _q in cases:

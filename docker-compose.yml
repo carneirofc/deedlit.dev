@@ -305,8 +305,7 @@ services:
   # `label` queue. Tune throughput with TASK_PREFETCH (per-worker concurrency) +
   # WORKER_THREADS (the executor that runs the sync httpx calls) and scale out:
   #   docker compose up -d --scale ingest-worker=4
-  # `index` is the legacy ADR 0001 queue, kept to drain in-flight messages during
-  # the migration. No HTTP server, so no healthcheck.
+  # No HTTP server, so no healthcheck.
   ingest-worker:
     build: { context: ./deedlit.ingest }
     restart: unless-stopped
@@ -314,7 +313,7 @@ services:
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: deedlit-ingest-worker
-      QUEUES: ${INGEST_WORKER_QUEUES:-ingest,embed.dense,embed.sparse,index.search,index.graph,index}
+      QUEUES: ${INGEST_WORKER_QUEUES:-ingest,embed.dense,embed.sparse,index.search,index.graph}
       TASK_PREFETCH: ${TASK_PREFETCH:-16}
       WORKER_THREADS: ${WORKER_THREADS:-64}
       AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}

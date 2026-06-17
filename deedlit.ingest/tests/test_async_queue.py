@@ -204,40 +204,25 @@ def test_fetch_image_bytes_raises_without_filepath(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (5) index worker handler = rebuild projection from catalog truth
-# ---------------------------------------------------------------------------
-def test_index_handler_reindexes_sha(monkeypatch):
-    seen: list[str] = []
-    monkeypatch.setattr(pipeline, "reindex_image", lambda sha256: seen.append(sha256))
-    asyncio.run(worker_module.index_handler({"sha256": "a" * 64, "type": "index"}))
-    assert seen == ["a" * 64]
-
-
-def test_index_handler_requires_sha():
-    with pytest.raises(ValueError):
-        asyncio.run(worker_module.index_handler({"type": "index"}))
-
-
-# ---------------------------------------------------------------------------
 # (6) best-effort publish: a broker outage never fails the fast path
 # ---------------------------------------------------------------------------
-def test_publish_index_best_effort_swallows_broker_errors(monkeypatch):
+def test_publish_embed_dense_best_effort_swallows_broker_errors(monkeypatch):
     async def boom(sha256, parent_op_id=None):
         raise RuntimeError("broker down")
 
-    monkeypatch.setattr(broker_module, "publish_index_task", boom)
-    ok = asyncio.run(jobs_module._publish_index_best_effort("a" * 64))
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", boom)
+    ok = asyncio.run(jobs_module._publish_embed_dense_best_effort("a" * 64))
     assert ok is False
 
 
-def test_publish_index_best_effort_happy_path(monkeypatch):
+def test_publish_embed_dense_best_effort_happy_path(monkeypatch):
     seen: list[tuple] = []
 
     async def fake(sha256, parent_op_id=None):
         seen.append((sha256, parent_op_id))
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake)
-    ok = asyncio.run(jobs_module._publish_index_best_effort("a" * 64, parent_op_id="job1"))
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", fake)
+    ok = asyncio.run(jobs_module._publish_embed_dense_best_effort("a" * 64, parent_op_id="job1"))
     assert ok is True
     assert seen == [("a" * 64, "job1")]
 
@@ -274,7 +259,7 @@ def test_folder_ingest_completes_when_broker_is_down(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (7) label queue (#26): describe -> patch catalog -> re-enqueue index
+# (7) label queue (#26): describe -> patch catalog -> re-enqueue projection
 # ---------------------------------------------------------------------------
 class _Err:
     status_code = 500
@@ -406,8 +391,7 @@ def test_label_handler_requires_sha():
 
 
 def test_worker_registers_all_stage_handlers():
-    # Per-stage DAG (ADR 0002) + the opt-in ingest queue + the retained legacy
-    # `index` handler.
+    # Per-stage DAG (ADR 0002) + the opt-in ingest queue + the label queue.
     assert set(worker_module.HANDLERS) == {
         broker_module.INGEST_QUEUE,
         broker_module.EMBED_DENSE_QUEUE,
@@ -415,7 +399,6 @@ def test_worker_registers_all_stage_handlers():
         broker_module.INDEX_SEARCH_QUEUE,
         broker_module.INDEX_GRAPH_QUEUE,
         broker_module.LABEL_QUEUE,
-        broker_module.INDEX_QUEUE,
     }
 
 
@@ -434,7 +417,7 @@ def _run_delivery(headers, handler, **kw):
 
     action = asyncio.run(
         broker_module.process_delivery(
-            "index", b'{"sha256":"x","type":"index"}', headers, handler,
+            "embed.dense", b'{"sha256":"x","type":"embed.dense"}', headers, handler,
             publish=_noop_publish, on_event=on_event, **kw,
         )
     )
@@ -468,14 +451,14 @@ def test_process_delivery_emits_running_then_dlq_when_exhausted():
     assert events[1][1] == 3  # attempts
 
 
-def test_publish_index_records_queued_on_ledger(stub_ledger, monkeypatch):
+def test_publish_stage_records_queued_on_ledger(stub_ledger, monkeypatch):
     async def ok(sha256, parent_op_id=None):
         return None
 
-    monkeypatch.setattr(broker_module, "publish_index_task", ok)
-    assert asyncio.run(jobs_module._publish_index_best_effort("a" * 64, parent_op_id="op7")) is True
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", ok)
+    assert asyncio.run(jobs_module._publish_embed_dense_best_effort("a" * 64, parent_op_id="op7")) is True
     assert any(
-        c["type"] == "index" and c["status"] == "queued" and c["parent_op_id"] == "op7"
+        c["type"] == "embed.dense" and c["status"] == "queued" and c["parent_op_id"] == "op7"
         for c in stub_ledger
     )
 
@@ -484,17 +467,21 @@ def test_publish_index_records_queued_on_ledger(stub_ledger, monkeypatch):
 # (9) single-task endpoints (#30): POST /tasks/index, /tasks/label
 # ---------------------------------------------------------------------------
 def test_enqueue_index_endpoint_publishes(monkeypatch):
+    """POST /tasks/index re-projects via the per-stage DAG (embed.dense +
+    embed.sparse -> index.search, plus index.graph), not a legacy index task."""
     published: list[str] = []
 
     async def fake(sha256, parent_op_id=None):
         published.append(sha256)
 
-    monkeypatch.setattr(broker_module, "publish_index_task", fake)
+    for name in ("publish_embed_dense_task", "publish_embed_sparse_task", "publish_index_graph_task"):
+        monkeypatch.setattr(broker_module, name, fake)
     with TestClient(app_module.app) as client:
         r = client.post("/tasks/index", json={"sha256": "a" * 64})
         assert r.status_code == 202
-        assert r.json()["type"] == "index"
-    assert published == ["a" * 64]
+        assert r.json()["type"] == "reproject"
+    # All three projection stages were published for the image.
+    assert published == ["a" * 64, "a" * 64, "a" * 64]
 
 
 def test_enqueue_label_endpoint_publishes(monkeypatch):

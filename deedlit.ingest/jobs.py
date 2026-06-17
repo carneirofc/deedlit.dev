@@ -50,13 +50,6 @@ async def _publish_stage_best_effort(
     return True
 
 
-async def _publish_index_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
-    """Best-effort publish of the legacy ADR 0001 ``index`` task (migration only)."""
-    return await _publish_stage_best_effort(
-        broker.publish_index_task, broker.INDEX_QUEUE, sha256, parent_op_id
-    )
-
-
 async def _publish_embed_dense_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
     return await _publish_stage_best_effort(
         broker.publish_embed_dense_task, broker.EMBED_DENSE_QUEUE, sha256, parent_op_id
@@ -513,7 +506,7 @@ class JobStore:
         data, mime = await pipeline.maybe_await(pipeline.fetch_image_bytes(sha256))
         filename = f"{sha256}{_ext_for_mime(mime)}"
         # Backfill the source path from catalog so the re-projected search
-        # payload keeps the image's file identity (see pipeline.reindex_image).
+        # payload keeps the image's file identity.
         source_path = await pipeline.maybe_await(pipeline.fetch_image_filepath(sha256))
         if job.cancel_requested:
             job.status = CANCELLED

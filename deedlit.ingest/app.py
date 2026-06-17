@@ -47,8 +47,8 @@ from fs_browse import FsBrowseError, browse_directory
 from jobs import (
     REINDEX_ONE_IMAGE,
     JobStore,
-    _publish_index_best_effort,
     _publish_label_best_effort,
+    _publish_reproject_best_effort,
     folder_scan_scheduler,
     folder_scan_tick_seconds,
     label_backfill_interval_seconds,
@@ -268,9 +268,10 @@ class SingleTaskRequest(BaseModel):
 
 @app.post("/tasks/index", status_code=202)
 async def enqueue_index_task(req: SingleTaskRequest) -> dict:
-    """Publish a single index task for one image (re-project from catalog truth)."""
-    ok = await _publish_index_best_effort(req.sha256)
-    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "index"}
+    """Re-project one image from catalog truth: publish the per-stage projection
+    set (embed.dense + embed.sparse -> index.search, plus index.graph). No relabel."""
+    ok = await _publish_reproject_best_effort(req.sha256)
+    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "reproject"}
 
 
 @app.post("/tasks/label", status_code=202)

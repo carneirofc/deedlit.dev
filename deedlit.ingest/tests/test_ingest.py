@@ -91,8 +91,8 @@ def mock_outbound(monkeypatch):
     def fake_fanout(rec, *args):
         calls["fanout"].append(rec)
 
-    # Fast path (folder-walk ingest): catalog write + index-task publish, with the
-    # heavy projection deferred to the index worker (ADR 0001). Record both so the
+    # Fast path (folder-walk ingest): catalog write + per-stage task publish, with
+    # the heavy projection deferred to the DAG worker (ADR 0002). Record both so the
     # folder-walk tests can assert per-file fast-path + enqueue.
     def fake_ingest_fast(data, filename, source_path=None, on_stage=None):
         sha = pipeline.compute_sha256(data)

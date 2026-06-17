@@ -35,6 +35,7 @@ import io
 import json
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -261,13 +262,24 @@ async def extract_metadata(data: bytes, filename: str, mime: str) -> dict[str, A
 
 
 async def embed_image(data: bytes, filename: str, mime: str) -> list[float]:
-    """POST image bytes to deedlit.vision /embed/image; return the dense vector."""
+    """POST image bytes to deedlit.vision /embed/image; return the dense vector.
+
+    Logs the vision round-trip (time + returned dim) so the dense path is visible
+    in the worker log — without this the embed.dense stage runs silently and a
+    slow/failing vision endpoint is invisible.
+    """
     files = {"file": (filename, data, mime)}
+    started = time.perf_counter()
     resp = await get_client().post(f"{VISION_URL}/embed/image", files=files)
     resp.raise_for_status()
     body = resp.json()
     # The contract names the field `vector`; the live service returns `embedding`.
-    return body.get("vector") or body.get("embedding") or []
+    vector = body.get("vector") or body.get("embedding") or []
+    log.info(
+        "vision /embed/image %s -> dim=%d in %.0f ms",
+        filename, len(vector), (time.perf_counter() - started) * 1000,
+    )
+    return vector
 
 
 async def embed_sparse_text(text: str) -> dict[str, list]:
@@ -539,33 +551,6 @@ def list_unlabeled_sha256() -> list[str]:
     return out
 
 
-async def reindex_image(sha256: str) -> None:
-    """Index task: (re)build the search+graph projection for one sha256 from
-    catalog TRUTH (ADR 0001).
-
-    Reads the catalog record (description/safety/tags/filepath — whatever the
-    label task has patched so far), fetches the bytes, runs the per-file pipeline
-    (NO labelling), and fans the writes back out so the search point + graph edges
-    reflect the current catalog truth. Idempotent: running it twice converges, so
-    it is safe to re-enqueue after a label patch or from reconcile.
-    """
-    data, mime = await maybe_await(fetch_image_bytes(sha256))
-    filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
-    # Project from catalog truth: the AI fields (description/safety/tags) the
-    # label task patched flow into the sparse text + payload + graph edges. The
-    # source path keeps the file identity on the re-projected payload.
-    record = await maybe_await(fetch_image_record(sha256)) or {}
-    rec = await maybe_await(process_file(
-        data,
-        filename,
-        source_path=record.get("filepath"),
-        description=record.get("description"),
-        safety=record.get("safety"),
-        tags=record.get("tags"),
-    ))
-    await maybe_await(fan_out_writes(rec))
-
-
 async def label_image(sha256: str) -> bool:
     """Label task: describe one image and PATCH the catalog truth (ADR 0001).
 
@@ -622,12 +607,12 @@ def _reconcile_ext_for_mime(mime: str) -> str:
 # ---------------------------------------------------------------------------
 # Per-stage DAG (ADR 0002) — catalog is the fan-in rendezvous
 #
-# The monolithic ``index`` task (ADR 0001) is split into four independently
-# scalable stages. Each stage persists its output to CATALOG TRUTH and the worker
-# publishes the next stage; the one fan-in (``index.search`` needs both vectors)
-# is resolved by reading both back from catalog — no coordinator. The dense vector
-# is persisted once (the ``embedding`` blob) and reused, so a relabel/reindex
-# never recomputes the GPU result (this removes ADR 0001's 2x dense embed).
+# Projection is four independently scalable stages (embed.dense, embed.sparse,
+# index.search, index.graph). Each stage persists its output to CATALOG TRUTH and
+# the worker publishes the next stage; the one fan-in (``index.search`` needs both
+# vectors) is resolved by reading both back from catalog — no coordinator. The
+# dense vector is persisted once (the ``embedding`` blob) and reused, so a
+# relabel/reindex never recomputes the GPU result.
 #
 # Vectors round-trip through catalog blobs as JSON:
 #   dense  -> /blobs/{sha}/embedding   [floats]
@@ -687,10 +672,12 @@ async def embed_dense(sha256: str) -> None:
     by every later reprojection. A vision/transport error propagates so the broker
     retries / dead-letters.
     """
+    log.info("embed.dense %s: embedding image (label-independent)", sha256[:12])
     data, mime = await maybe_await(fetch_image_bytes(sha256))
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
     dense = await maybe_await(embed_image(data, filename, mime))
     await maybe_await(store_dense_blob(sha256, dense))
+    log.info("embed.dense %s: stored dense vector dim=%d -> catalog", sha256[:12], len(dense))
 
 
 async def embed_sparse(sha256: str) -> None:
@@ -762,7 +749,10 @@ async def index_search(sha256: str) -> bool:
         maybe_await(load_sparse_blob(sha256)),
     )
     if dense is None or sparse is None:
-        log.debug(
+        # Not an error: the sibling embed stage re-publishes index.search on its
+        # own completion. Logged at INFO so a point still waiting on one vector is
+        # visible (e.g. dense present, sparse pending) rather than silently absent.
+        log.info(
             "index.search %s waiting on vectors (dense=%s sparse=%s)",
             sha256[:12], dense is not None, sparse is not None,
         )
@@ -770,6 +760,10 @@ async def index_search(sha256: str) -> bool:
     record = await maybe_await(fetch_image_record(sha256)) or {}
     point = build_search_point(sha256, dense, sparse, record)
     await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", point))
+    log.info(
+        "index.search %s: upserted point (dense dim=%d, sparse terms=%d)",
+        sha256[:12], len(dense), len(sparse.get("indices", [])),
+    )
     return True
 
 

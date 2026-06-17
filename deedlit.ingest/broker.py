@@ -1,4 +1,4 @@
-"""RabbitMQ broker seam for the async index/label task queues (ADR 0001).
+"""RabbitMQ broker seam for the per-stage ingest DAG task queues (ADR 0002).
 
 deedlit.ingest is otherwise stateless and HTTP-only; this module is the one place
 that talks AMQP. The fast path (the API process) PUBLISHES tasks here; the
@@ -9,7 +9,7 @@ history projection.
 Topology (all via the default exchange, routing key == queue name — the default
 exchange is itself a direct exchange, so no custom exchange is needed):
 
-  <queue>        durable main queue (``index`` / ``label``)
+  <queue>        durable main queue (``embed.dense`` / ``label`` / …)
   <queue>.retry  durable; a failed message is republished here with a per-message
                  TTL (exponential backoff) and dead-letters BACK to <queue> when
                  it expires (x-dead-letter-routing-key=<queue>)
@@ -55,11 +55,6 @@ INDEX_SEARCH_QUEUE = "index.search"
 INDEX_GRAPH_QUEUE = "index.graph"
 LABEL_QUEUE = "label"
 
-# Legacy monolithic index queue (ADR 0001). Kept DECLARED through the 0002
-# migration so any in-flight `index` messages still drain; the per-stage queues
-# above replace it. Drop from TASK_QUEUES once nothing publishes `index`.
-INDEX_QUEUE = "index"
-
 TASK_QUEUES = (
     INGEST_QUEUE,
     EMBED_DENSE_QUEUE,
@@ -67,7 +62,17 @@ TASK_QUEUES = (
     INDEX_SEARCH_QUEUE,
     INDEX_GRAPH_QUEUE,
     LABEL_QUEUE,
-    INDEX_QUEUE,
+)
+
+# Queues a bare worker drains when QUEUES is unset: the fast per-stage DAG. The
+# LLM ``label`` queue is excluded — it is a separate, EXCLUSIVE single-consumer
+# replica (opt in with QUEUES=label).
+DEFAULT_QUEUES = (
+    INGEST_QUEUE,
+    EMBED_DENSE_QUEUE,
+    EMBED_SPARSE_QUEUE,
+    INDEX_SEARCH_QUEUE,
+    INDEX_GRAPH_QUEUE,
 )
 
 # Retry/backoff. A message is retried up to MAX_RETRIES times (counting from the
@@ -278,12 +283,6 @@ async def publish_index_search_task(sha256: str, *, parent_op_id: str | None = N
 async def publish_index_graph_task(sha256: str, *, parent_op_id: str | None = None) -> None:
     """Enqueue an ``index.graph`` task: upsert sha256's graph edges from catalog."""
     await _publish_sha_task(INDEX_GRAPH_QUEUE, sha256, parent_op_id=parent_op_id)
-
-
-async def publish_index_task(sha256: str, *, parent_op_id: str | None = None) -> None:
-    """Enqueue a legacy ``index`` task (ADR 0001). Retained for in-flight messages
-    during the 0002 migration; new code publishes the per-stage tasks above."""
-    await _publish_sha_task(INDEX_QUEUE, sha256, parent_op_id=parent_op_id)
 
 
 async def publish_label_task(sha256: str, *, parent_op_id: str | None = None) -> None:
