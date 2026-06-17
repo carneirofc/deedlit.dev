@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { PathInput } from "@/components/PathInput";
+import { isAlreadyConfigured, normalizePath, splitPaths } from "@/lib/library/paths";
 import { useActivity } from "@/lib/store/activity";
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,13 @@ export function SourceFoldersPanel() {
   const [newIntervalMin, setNewIntervalMin] = useState("15");
   const [adding, setAdding] = useState(false);
 
+  // Bulk add: one path per line. `bulkResults` reports per-path outcome.
+  const [multiMode, setMultiMode] = useState(false);
+  const [multiText, setMultiText] = useState("");
+  const [bulkResults, setBulkResults] = useState<
+    Array<{ path: string; status: "added" | "exists" | "error"; error?: string }>
+  >([]);
+
   // Local interval edits keyed by folder id (so polling doesn't clobber typing).
   const [intervalEdits, setIntervalEdits] = useState<Record<string, string>>({});
 
@@ -98,34 +106,78 @@ export function SourceFoldersPanel() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  const addFolder = async () => {
-    const path = newPath.trim();
-    if (!path) {
-      setError("A folder path is required.");
-      return;
-    }
+  // Add-form interval (minutes) → seconds; defaults to 15min on bad input.
+  const intervalSeconds = (): number => {
     const minutes = Number(newIntervalMin);
-    setAdding(true);
-    setError(null);
+    return Number.isFinite(minutes) ? Math.max(0, Math.round(minutes * 60)) : 900;
+  };
+
+  /** POST one folder; resolves to the per-path outcome (never throws). */
+  const postFolder = async (
+    path: string,
+    label: string | null,
+  ): Promise<{ path: string; status: "added" | "exists" | "error"; error?: string }> => {
+    if (isAlreadyConfigured(path, folders.map((f) => f.path))) {
+      return { path, status: "exists" };
+    }
     try {
       const res = await fetch("/api/library/folders", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          path,
-          label: newLabel.trim() || null,
-          scan_interval_seconds: Number.isFinite(minutes) ? Math.max(0, Math.round(minutes * 60)) : 900,
-        }),
+        body: JSON.stringify({ path, label, scan_interval_seconds: intervalSeconds() }),
       });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({})))?.error ?? "Add failed");
-      setNewPath("");
-      setNewLabel("");
-      refresh();
+      if (!res.ok) {
+        const msg = (await res.json().catch(() => ({})))?.error ?? "Add failed";
+        return { path, status: "error", error: msg };
+      }
+      return { path, status: "added" };
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Add failed");
-    } finally {
-      setAdding(false);
+      return { path, status: "error", error: e instanceof Error ? e.message : "Add failed" };
     }
+  };
+
+  const addFolder = async () => {
+    const path = normalizePath(newPath);
+    if (!path) {
+      setError("A folder path is required.");
+      return;
+    }
+    if (isAlreadyConfigured(path, folders.map((f) => f.path))) {
+      setError("That folder is already configured.");
+      return;
+    }
+    setAdding(true);
+    setError(null);
+    const result = await postFolder(path, newLabel.trim() || null);
+    setAdding(false);
+    if (result.status === "error") {
+      setError(result.error ?? "Add failed");
+      return;
+    }
+    setNewPath("");
+    setNewLabel("");
+    refresh();
+  };
+
+  const addMultiple = async () => {
+    const paths = splitPaths(multiText);
+    if (paths.length === 0) {
+      setError("Enter one folder path per line.");
+      return;
+    }
+    setAdding(true);
+    setError(null);
+    setBulkResults([]);
+    const results: Array<{ path: string; status: "added" | "exists" | "error"; error?: string }> = [];
+    for (const path of paths) {
+      results.push(await postFolder(path, null));
+    }
+    setAdding(false);
+    setBulkResults(results);
+    // Drop the lines that succeeded / were dupes; leave failures to retry.
+    const failed = results.filter((r) => r.status === "error").map((r) => r.path);
+    setMultiText(failed.join("\n"));
+    refresh();
   };
 
   const patchFolder = async (id: string, body: Record<string, unknown>) => {
@@ -198,47 +250,128 @@ export function SourceFoldersPanel() {
         )}
       </div>
 
-      {/* Add a folder */}
-      <div className="flex flex-wrap items-stretch gap-2">
-        <PathInput
-          className="min-w-[14rem] flex-1"
-          inputClassName={`${cls.input} flex-1`}
-          buttonClassName={cls.btn}
-          value={newPath}
-          onChange={setNewPath}
-          onEnter={addFolder}
-          placeholder="K:/comfyui/.../ComfyUI/output"
-          pickerTitle="Choose a folder to watch"
-          inputTestId="folder-path-input"
-          buttonTestId="folder-browse"
-        />
-        <input
-          className={`${cls.input} w-36`}
-          value={newLabel}
-          onChange={(e) => setNewLabel(e.target.value)}
-          placeholder="Label (optional)"
-          data-testid="folder-label-input"
-        />
-        <label className="flex items-center gap-1.5 text-ui-xs text-ui-ink-muted">
-          every
-          <input
-            className={`${cls.input} w-16`}
-            type="number"
-            min={0}
-            value={newIntervalMin}
-            onChange={(e) => setNewIntervalMin(e.target.value)}
-            data-testid="folder-interval-input"
-          />
-          min
-        </label>
-        <button
-          className={cls.btn}
-          onClick={addFolder}
-          disabled={adding}
-          data-testid="folder-add"
-        >
-          {adding ? "Adding…" : "Add folder"}
-        </button>
+      {/* Add folder(s) — single path (with live preview) or one-per-line bulk. */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <span className="text-ui-2xs text-ui-ink-muted">
+            {multiMode ? "One folder path per line." : "Add a folder to watch."}
+          </span>
+          <button
+            type="button"
+            className="text-ui-2xs text-accent-cyan hover:underline"
+            onClick={() => {
+              setMultiMode((m) => !m);
+              setBulkResults([]);
+              setError(null);
+            }}
+            data-testid="folder-multi-toggle"
+          >
+            {multiMode ? "← Single folder" : "Add multiple +"}
+          </button>
+        </div>
+
+        {multiMode ? (
+          <>
+            <textarea
+              className={`${cls.input} min-h-[5rem] font-mono`}
+              value={multiText}
+              onChange={(e) => setMultiText(e.target.value)}
+              placeholder={"K:/comfyui/output\nK:/comfyui/output/upscaled\n/mnt/share/renders"}
+              spellCheck={false}
+              data-testid="folder-multi-input"
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="flex items-center gap-1.5 text-ui-xs text-ui-ink-muted">
+                every
+                <input
+                  className={`${cls.input} w-16`}
+                  type="number"
+                  min={0}
+                  value={newIntervalMin}
+                  onChange={(e) => setNewIntervalMin(e.target.value)}
+                  data-testid="folder-interval-input"
+                />
+                min
+              </label>
+              <button
+                className={cls.btn}
+                onClick={addMultiple}
+                disabled={adding}
+                data-testid="folder-add-multiple"
+              >
+                {adding ? "Adding…" : "Add all"}
+              </button>
+              <span className="text-ui-2xs text-ui-ink-muted">
+                {splitPaths(multiText).length} path{splitPaths(multiText).length === 1 ? "" : "s"}
+              </span>
+            </div>
+            {bulkResults.length > 0 && (
+              <ul className="flex flex-col gap-0.5 text-ui-2xs" data-testid="folder-bulk-results">
+                {bulkResults.map((r) => (
+                  <li
+                    key={r.path}
+                    className={
+                      r.status === "added"
+                        ? "text-emerald-500"
+                        : r.status === "exists"
+                          ? "text-ui-ink-muted"
+                          : "text-rose-500"
+                    }
+                  >
+                    {r.status === "added" ? "✓" : r.status === "exists" ? "•" : "✗"}{" "}
+                    <span className="font-mono">{r.path}</span>
+                    {r.status === "exists" ? " — already configured" : ""}
+                    {r.status === "error" && r.error ? ` — ${r.error}` : ""}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        ) : (
+          <div className="flex flex-wrap items-start gap-2">
+            <PathInput
+              className="min-w-[14rem] flex-1"
+              inputClassName={`${cls.input} flex-1`}
+              buttonClassName={cls.btn}
+              value={newPath}
+              onChange={setNewPath}
+              onEnter={addFolder}
+              placeholder="K:/comfyui/.../ComfyUI/output"
+              pickerTitle="Choose a folder to watch"
+              inputTestId="folder-path-input"
+              buttonTestId="folder-browse"
+              showPreview
+              knownPaths={folders.map((f) => f.path)}
+            />
+            <input
+              className={`${cls.input} w-36`}
+              value={newLabel}
+              onChange={(e) => setNewLabel(e.target.value)}
+              placeholder="Label (optional)"
+              data-testid="folder-label-input"
+            />
+            <label className="flex items-center gap-1.5 text-ui-xs text-ui-ink-muted">
+              every
+              <input
+                className={`${cls.input} w-16`}
+                type="number"
+                min={0}
+                value={newIntervalMin}
+                onChange={(e) => setNewIntervalMin(e.target.value)}
+                data-testid="folder-interval-input"
+              />
+              min
+            </label>
+            <button
+              className={cls.btn}
+              onClick={addFolder}
+              disabled={adding}
+              data-testid="folder-add"
+            >
+              {adding ? "Adding…" : "Add folder"}
+            </button>
+          </div>
+        )}
       </div>
 
       {error && (

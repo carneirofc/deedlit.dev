@@ -116,6 +116,11 @@ export function Lightbox({
   const [playing, setPlaying] = useState(autoPlay);
   const [imgLoaded, setImgLoaded] = useState(false);
   const stripRef = useRef<HTMLDivElement>(null);
+  // Root element for the native Fullscreen API + whether we're currently in it.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  // Touch-swipe tracking for mobile navigation across the image stage.
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
 
   // Notes panel state
   const [notesOpen, setNotesOpen] = useState(false);
@@ -271,6 +276,32 @@ export function Lightbox({
     };
   }, []);
 
+  // Native fullscreen — fills the physical screen (hides browser chrome on
+  // mobile), which is what a slideshow wants. Toggle from the button or "f".
+  const toggleFullscreen = useCallback(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen?.();
+    } else {
+      void el.requestFullscreen?.().catch(() => {});
+    }
+  }, []);
+
+  // Mirror the real fullscreen state (covers Esc-exit and OS-level changes).
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  // Leave fullscreen when the viewer unmounts so the page isn't left zoomed.
+  useEffect(() => {
+    return () => {
+      if (document.fullscreenElement) void document.exitFullscreen?.();
+    };
+  }, []);
+
   // Keyboard shortcuts.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -295,14 +326,22 @@ export function Lightbox({
           e.preventDefault();
           goToIndex(live.current.items.length - 1);
           break;
+        case "f":
+        case "F":
+          e.preventDefault();
+          toggleFullscreen();
+          break;
         case "Escape":
+          // In fullscreen, let the browser reclaim Esc to exit it; only close
+          // the viewer on a second Esc once we're back to the windowed overlay.
+          if (document.fullscreenElement) return;
           onClose();
           break;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [go, goToIndex, onClose]);
+  }, [go, goToIndex, onClose, toggleFullscreen]);
 
   if (!current) return null;
 
@@ -311,24 +350,26 @@ export function Lightbox({
 
   return (
     <div
+      ref={rootRef}
       role="dialog"
       aria-modal="true"
       aria-label="Image viewer"
       className="fixed inset-0 z-100 flex flex-col bg-ui-bg-deep/95 backdrop-blur-md"
     >
       {/* Top control bar */}
-      <header className="flex items-center justify-between gap-3 px-3 py-2.5 sm:px-4">
-        <div className="flex min-w-0 items-center gap-3">
+      <header className="flex items-start justify-between gap-3 px-3 py-2.5 sm:px-4">
+        <div className="flex min-w-0 shrink-0 items-center gap-3 pt-1">
           <span className="shrink-0 rounded-lg bg-ui-bg/60 px-2 py-1 text-ui-xs font-medium tabular-nums text-ui-ink-muted">
             {index + 1} / {items.length}
             {hasMore ? "+" : ""}
           </span>
-          <p className="hidden min-w-0 truncate text-ui-sm text-ui-ink-muted sm:block">
+          <p className="hidden min-w-0 truncate text-ui-sm text-ui-ink-muted lg:block">
             {current.summary}
           </p>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1.5">
+        {/* Controls wrap onto a second row on narrow screens instead of squishing. */}
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
           <button
             type="button"
             onClick={() => setPlaying((p) => !p)}
@@ -344,6 +385,24 @@ export function Lightbox({
             ) : (
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
                 <path d="M8 5v14l11-7z" />
+              </svg>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={toggleFullscreen}
+            className={`${ctrlBtn} ${isFullscreen ? "border-accent-cyan text-accent-cyan" : ""}`}
+            aria-pressed={isFullscreen}
+            title={isFullscreen ? "Exit fullscreen (F)" : "Enter fullscreen (F)"}
+          >
+            {isFullscreen ? (
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M9 3v3a3 3 0 0 1-3 3H3M21 9h-3a3 3 0 0 1-3-3V3M3 15h3a3 3 0 0 1 3 3v3M15 21v-3a3 3 0 0 1 3-3h3" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M16 21h3a2 2 0 0 0 2-2v-3M8 21H5a2 2 0 0 1-2-2v-3" />
               </svg>
             )}
           </button>
@@ -519,17 +578,34 @@ export function Lightbox({
 
       {/* Inline details panel */}
       {detailsOpen && (
-        <aside className="flex w-96 shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-r border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm">
+        <aside className="flex w-[min(20rem,80vw)] shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-r border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm sm:w-96">
           {detailLoading && <p className="text-ui-xs text-ui-ink-muted">Loading…</p>}
           {detail && <LightboxDetailPanel detail={detail} imageId={current.imageId} />}
         </aside>
       )}
 
-      {/* Click the empty area to close */}
+      {/* Click the empty area to close; swipe horizontally to page (mobile). */}
       <div
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden px-2"
         onClick={(e) => {
           if (e.target === e.currentTarget) onClose();
+        }}
+        onTouchStart={(e) => {
+          const t = e.touches[0];
+          touchStart.current = { x: t.clientX, y: t.clientY };
+        }}
+        onTouchEnd={(e) => {
+          const s = touchStart.current;
+          touchStart.current = null;
+          if (!s) return;
+          const t = e.changedTouches[0];
+          const dx = t.clientX - s.x;
+          const dy = t.clientY - s.y;
+          // Horizontal fling: dominant-axis + min distance, so taps and vertical
+          // scrolls don't trigger navigation.
+          if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+            go(dx < 0 ? 1 : -1);
+          }
         }}
       >
         <button
