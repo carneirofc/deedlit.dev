@@ -95,6 +95,10 @@ const PREFETCH_AHEAD = 2;
 // page fetches, so cap it however deep the address claims the user had paged.
 const MAX_RESTORE_PAGES = 20;
 
+// How many of the most-used tags to surface as one-click filter chips before the
+// "+N more" expander reveals the rest of the catalog.
+const TAG_CHIP_PREVIEW = 40;
+
 /** The catalog browse path is used only for filter-only browsing (no query). */
 function isBrowsePath(mode: BrowseMode, query: string): boolean {
   return mode === "browse" && query.trim() === "";
@@ -143,6 +147,8 @@ export default function LibraryPage() {
   const [limit, setLimit] = useState(settings.pageSize);
   const [minScore, setMinScore] = useState(settings.defaultMinScore);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // Expand the one-click "popular tags" chip cloud beyond its preview slice.
+  const [showAllTagChips, setShowAllTagChips] = useState(false);
   const [similarRef, setSimilarRef] = useState<SimilarRef | null>(null);
   const [graphScope, setGraphScope] = useState<GraphScope | null>(null);
 
@@ -1301,6 +1307,53 @@ export default function LibraryPage() {
             placeholder="filter by tag — pick from the list, or type to narrow…"
             variant="include"
           />
+
+          {/* Always-visible selectable tag cloud: the most-used tags as one-click
+              include chips (no need to open the picker or type). Clicking a chip
+              toggles it in the include filter and re-searches; selected chips glow.
+              "+N more" expands to the whole catalog. */}
+          {allTags.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted">
+                Popular tags
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {(showAllTagChips ? allTags : allTags.slice(0, TAG_CHIP_PREVIEW)).map((t) => {
+                  const on = tags.some((x) => x.toLowerCase() === t.toLowerCase());
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() => {
+                        const next = on
+                          ? tags.filter((x) => x.toLowerCase() !== t.toLowerCase())
+                          : [...tags, t];
+                        setTags(next);
+                        doFetch(false, { tags: next });
+                      }}
+                      className={`rounded-full border px-2.5 py-1 text-ui-2xs font-medium transition ${
+                        on
+                          ? "border-accent-cyan bg-accent-cyan/15 text-accent-cyan"
+                          : "border-ui-border/60 text-ui-ink-muted hover:border-accent-cyan/60 hover:text-ui-ink"
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  );
+                })}
+                {allTags.length > TAG_CHIP_PREVIEW && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllTagChips((v) => !v)}
+                    className="rounded-full px-2.5 py-1 text-ui-2xs font-medium text-accent-cyan/80 transition hover:text-accent-cyan"
+                  >
+                    {showAllTagChips ? "show less" : `+${allTags.length - TAG_CHIP_PREVIEW} more`}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Essentials row: favorites + rating + safety. Everything else (model,
               checkpoint, LoRA, source-tool, exclude-tags, limits) lives under

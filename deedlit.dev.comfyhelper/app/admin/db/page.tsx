@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { deleteImages } from "@/lib/library/bulk-delete";
+
 // ---------------------------------------------------------------------------
 // DB power-user / debug page (#30, ADR 0001).
 //
@@ -78,6 +80,9 @@ export default function DbPage() {
   const [tag, setTag] = useState("");
   const [safety, setSafety] = useState("");
   const [favorite, setFavorite] = useState(false);
+  // Separator-insensitive substring match on the on-disk file path. Committed on
+  // Enter / Apply (not per keystroke) so a long path doesn't re-query each char.
+  const [path, setPath] = useState("");
   const [images, setImages] = useState<CatalogImage[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -87,15 +92,22 @@ export default function DbPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // Bulk selection for exclusion (un-index many at once). Separate from
+  // `selected` (the single row open in the editor): a checkbox toggles a row into
+  // `picked` without opening it.
+  const [picked, setPicked] = useState<Set<string>>(() => new Set());
+  const [confirmingBulk, setConfirmingBulk] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+
   // Page cursor + the scroll container / sentinel for infinite scroll. Filters
   // live in a ref so loadMore() reads the current values without re-creating the
   // callback (which would re-arm the observer on every keystroke).
   const pageRef = useRef(0);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const filtersRef = useRef({ tag, safety, favorite });
+  const filtersRef = useRef({ tag, safety, favorite, path });
   useEffect(() => {
-    filtersRef.current = { tag, safety, favorite };
+    filtersRef.current = { tag, safety, favorite, path };
   });
 
   const fetchPage = useCallback(async (reset: boolean) => {
@@ -105,6 +117,7 @@ export default function DbPage() {
     if (f.tag.trim()) sp.set("tag", f.tag.trim());
     if (f.safety) sp.set("safety", f.safety);
     if (f.favorite) sp.set("favorite", "true");
+    if (f.path.trim()) sp.set("path", f.path.trim());
     setLoadingMore(true);
     try {
       const j = await fetch(`/api/library/admin/images?${sp.toString()}`).then((r) => r.json());
@@ -220,6 +233,59 @@ export default function DbPage() {
     }
   };
 
+  // --- bulk exclusion (un-index many) ------------------------------------
+  const togglePick = (sha256: string) =>
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(sha256)) next.delete(sha256);
+      else next.add(sha256);
+      return next;
+    });
+
+  const pickAllLoaded = () => setPicked(new Set(images.map((i) => i.sha256)));
+  const clearPicked = () => {
+    setPicked(new Set());
+    setConfirmingBulk(false);
+  };
+
+  // Un-index every picked image (catalog + search + graph; files stay on disk),
+  // fanning the per-image delete out with bounded concurrency. Whatever actually
+  // went away is pruned from the list even on a partial failure.
+  const excludeSelected = async () => {
+    const ids = [...picked];
+    if (ids.length === 0) return;
+    setBulkBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const { deleted, failed } = await deleteImages(ids);
+      if (deleted.length > 0) {
+        const gone = new Set(deleted);
+        setImages((prev) => prev.filter((i) => !gone.has(i.sha256)));
+        setPicked((prev) => {
+          const next = new Set(prev);
+          for (const id of gone) next.delete(id);
+          return next;
+        });
+        if (selected && gone.has(selected.sha256)) {
+          setSelected(null);
+          setEdit(null);
+        }
+      }
+      if (failed.length > 0) {
+        setError(
+          `Excluded ${deleted.length}/${ids.length}. ${failed.length} failed: ${failed[0].error}`,
+        );
+        setConfirmingBulk(false);
+      } else {
+        setNotice(`Excluded ${deleted.length} image${deleted.length === 1 ? "" : "s"} (un-indexed).`);
+        clearPicked();
+      }
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
   return (
     <div className="flex w-full min-w-0 flex-col gap-6" data-testid="db-page">
       <header>
@@ -242,6 +308,14 @@ export default function DbPage() {
             onKeyDown={(e) => e.key === "Enter" && load()}
             placeholder="filter by tag"
             data-testid="db-tag"
+          />
+          <input
+            className={`${cls.input} max-w-[18rem]`}
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && load()}
+            placeholder="filter by path (folder/filename fragment)"
+            data-testid="db-path"
           />
           <select
             className={`${cls.input} max-w-[10rem]`}
@@ -273,52 +347,113 @@ export default function DbPage() {
       <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
         {/* List */}
         <section className={`${cls.card} min-w-0`} data-testid="db-list">
-          <h2 className="mb-2 text-ui-sm font-semibold text-ui-ink-title">
-            Images{" "}
-            <span className="text-ui-2xs text-ui-ink-muted">
-              ({images.length}
-              {hasMore ? "+" : ""})
-            </span>
-          </h2>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h2 className="text-ui-sm font-semibold text-ui-ink-title">
+              Images{" "}
+              <span className="text-ui-2xs text-ui-ink-muted">
+                ({images.length}
+                {hasMore ? "+" : ""})
+              </span>
+            </h2>
+            <button
+              className="text-ui-2xs text-ui-ink-muted transition hover:text-accent-cyan"
+              onClick={picked.size > 0 ? clearPicked : pickAllLoaded}
+              data-testid="db-pick-toggle"
+            >
+              {picked.size > 0 ? "Clear selection" : "Select all loaded"}
+            </button>
+          </div>
+
+          {/* Bulk-exclusion bar — un-index every picked image (catalog + search +
+              graph). The originals stay on disk. */}
+          {picked.size > 0 && (
+            <div
+              className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-ui-xs"
+              data-testid="db-bulk-bar"
+            >
+              <span className="font-medium text-ui-ink">{picked.size} selected</span>
+              <div className="ml-auto flex items-center gap-2">
+                {confirmingBulk ? (
+                  <>
+                    <span className="text-rose-500">Un-index {picked.size}? (files stay on disk)</span>
+                    <button
+                      className={cls.danger}
+                      onClick={excludeSelected}
+                      disabled={bulkBusy}
+                      data-testid="db-bulk-confirm"
+                    >
+                      {bulkBusy ? "Excluding…" : "Confirm exclude"}
+                    </button>
+                    <button className={cls.btn} onClick={() => setConfirmingBulk(false)} disabled={bulkBusy}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className={cls.danger}
+                    onClick={() => setConfirmingBulk(true)}
+                    data-testid="db-bulk-exclude"
+                  >
+                    Exclude selected
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
           <div
             ref={listScrollRef}
             className="flex max-h-[70vh] min-w-0 flex-col gap-1 overflow-y-auto"
           >
             {images.map((img) => (
-              <button
+              <div
                 key={img.sha256}
-                onClick={() => select(img)}
-                className={`flex w-full min-w-0 items-center gap-2 rounded-lg border px-3 py-2 text-left text-ui-xs transition ${
+                className={`flex w-full min-w-0 items-center gap-2 rounded-lg border px-2 py-1.5 transition ${
                   selected?.sha256 === img.sha256
                     ? "border-accent-cyan bg-accent-cyan/10"
-                    : "border-ui-border/50 bg-ui-bg hover:bg-ui-bg-soft"
+                    : picked.has(img.sha256)
+                      ? "border-rose-500/40 bg-rose-500/5"
+                      : "border-ui-border/50 bg-ui-bg hover:bg-ui-bg-soft"
                 }`}
                 data-testid={`db-row-${img.sha256}`}
               >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={`/api/library/images/${img.sha256}/thumbnail`}
-                  alt=""
-                  loading="lazy"
-                  className="h-10 w-10 shrink-0 rounded-md border border-ui-border/50 bg-ui-bg-soft object-cover"
+                <input
+                  type="checkbox"
+                  checked={picked.has(img.sha256)}
+                  onChange={() => togglePick(img.sha256)}
+                  aria-label={`Select ${img.sha256}`}
+                  className="ml-1 shrink-0"
+                  data-testid={`db-pick-${img.sha256}`}
                 />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    {img.safety && (
-                      <span className="shrink-0 rounded-full bg-ui-bg-soft px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">
-                        {img.safety}
+                <button
+                  onClick={() => select(img)}
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left text-ui-xs"
+                  data-testid={`db-open-${img.sha256}`}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`/api/library/images/${img.sha256}/thumbnail`}
+                    alt=""
+                    loading="lazy"
+                    className="h-10 w-10 shrink-0 rounded-md border border-ui-border/50 bg-ui-bg-soft object-cover"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      {img.safety && (
+                        <span className="shrink-0 rounded-full bg-ui-bg-soft px-1.5 py-0.5 text-ui-2xs text-ui-ink-muted">
+                          {img.safety}
+                        </span>
+                      )}
+                      <span className="min-w-0 flex-1 truncate text-ui-ink">
+                        {img.prompt || img.sha256.slice(0, 16)}
                       </span>
-                    )}
-                    <span className="min-w-0 flex-1 truncate text-ui-ink">
-                      {img.prompt || img.sha256.slice(0, 16)}
-                    </span>
-                    {img.favorite && <span className="shrink-0 text-amber-500">★</span>}
+                      {img.favorite && <span className="shrink-0 text-amber-500">★</span>}
+                    </div>
+                    <div className="mt-0.5 truncate font-mono text-ui-2xs text-ui-ink-muted">
+                      {img.sha256}
+                    </div>
                   </div>
-                  <div className="mt-0.5 truncate font-mono text-ui-2xs text-ui-ink-muted">
-                    {img.sha256}
-                  </div>
-                </div>
-              </button>
+                </button>
+              </div>
             ))}
             {images.length === 0 && !loadingMore && (
               <p className="text-ui-sm text-ui-ink-muted">No images.</p>

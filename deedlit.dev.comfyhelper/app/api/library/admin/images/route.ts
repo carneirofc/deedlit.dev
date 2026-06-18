@@ -7,7 +7,8 @@ export const dynamic = "force-dynamic";
 /**
  * RAW catalog records for the DB power-user page (#30) — full prompt / params /
  * workflow_json / api_prompt_json, not the search CompactResult shape. Proxies
- * the gateway GET /images (catalog truth). Filterable by ?tag=&favorite=&safety=.
+ * the gateway GET /images (catalog truth). Filterable by ?tag=&favorite=&safety=
+ * &path= (path is a separator-insensitive substring match on the file path).
  * Returns `{ images }`.
  */
 export async function GET(request: Request) {
@@ -18,10 +19,12 @@ export async function GET(request: Request) {
     const favoriteParam = sp.get("favorite");
     const tag = sp.get("tag")?.trim();
     const safety = sp.get("safety")?.trim();
+    const path = sp.get("path")?.trim();
     const images = await listCatalogImages({
       tags: tag ? [tag] : undefined,
       safety: safety ? [safety] : undefined,
       favorite: favoriteParam === "true" ? true : undefined,
+      path: path || undefined,
       limit: Number.isFinite(limit) ? limit : 50,
       offset: Number.isFinite(offset) ? offset : 0,
     });
