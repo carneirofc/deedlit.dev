@@ -2,8 +2,8 @@
 
 A tiny in-memory override layer over the env defaults, edited live from the
 settings panel via the ingest ``GET/PUT /config`` endpoints. Read on every
-folder scan (``jobs.ingest_concurrency`` / ``ingest_via_queue``), so a change
-takes effect on the next file without a restart.
+folder scan (``jobs.ingest_concurrency``), so a change takes effect on the next
+file without a restart.
 
 Process-local on purpose: these are PRODUCER knobs and the producer is the ingest
 API process, which is exactly where folder scans run. No DB, no lock — a dict
@@ -27,12 +27,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_bool(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _env_bool_default(name: str, default: bool) -> bool:
-    """``_env_bool`` with an explicit default for when the env var is unset."""
+    """Parse a boolean env var, falling back to ``default`` when unset/empty."""
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
@@ -49,8 +45,6 @@ def runtime() -> dict[str, Any]:
         "ingest_concurrency": max(
             1, int(_overrides.get("ingest_concurrency", _env_int("INGEST_CONCURRENCY", 32)))
         ),
-        # Route the scan through the `ingest` queue (cross-process pool) instead.
-        "ingest_via_queue": bool(_overrides.get("ingest_via_queue", _env_bool("INGEST_VIA_QUEUE"))),
         # Master switch for the vision-LLM (labelagent) enrichment stage. When off,
         # ingest skips publishing `label` tasks (and the label worker no-ops any
         # already-queued ones), so images are cataloged + projected WITHOUT an AI
@@ -66,8 +60,6 @@ def update(patch: dict[str, Any]) -> dict[str, Any]:
     """Apply a partial config patch (validated) and return the effective config."""
     if patch.get("ingest_concurrency") is not None:
         _overrides["ingest_concurrency"] = max(1, int(patch["ingest_concurrency"]))
-    if patch.get("ingest_via_queue") is not None:
-        _overrides["ingest_via_queue"] = bool(patch["ingest_via_queue"])
     if patch.get("llm_enabled") is not None:
         _overrides["llm_enabled"] = bool(patch["llm_enabled"])
     return runtime()

@@ -205,8 +205,8 @@ function IngestSettingsSection() {
       ) : (
         <>
           <Row
-            label="Folder-scan concurrency"
-            hint="How many files are cataloged in parallel during a scan (the fast path)."
+            label="Folder-scan publish concurrency"
+            hint="How many ingest tasks a scan publishes to the queue in parallel. The worker pool catalogs and projects them across processes."
             control={
               <NumberSlider
                 value={cfg.ingest_concurrency}
@@ -214,16 +214,6 @@ function IngestSettingsSection() {
                 max={32}
                 step={1}
                 onChange={(v) => save({ ingest_concurrency: v })}
-              />
-            }
-          />
-          <Row
-            label="Route scans via the ingest queue"
-            hint="Catalog files across worker processes instead of inline. Falls back to inline if the broker is down."
-            control={
-              <Toggle
-                checked={cfg.ingest_via_queue}
-                onChange={(v) => save({ ingest_via_queue: v })}
               />
             }
           />

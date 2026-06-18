@@ -15,6 +15,7 @@ Covered:
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -56,46 +57,26 @@ def fresh_store(monkeypatch):
 
 @pytest.fixture
 def mock_outbound(monkeypatch):
-    """Mock metadata/vision + the worker-path fan-out AND the fast-path catalog
-    write + broker publish so the pipeline runs offline (ADR 0001).
+    """Record every broker publish the producer makes (queue-driven, offline).
 
-    ``fanout`` records worker-path (reindex) fan-outs; ``fast`` records fast-path
-    catalog writes (folder-walk / rescan); ``pub_*`` record the per-stage DAG
-    tasks the fast path enqueues (ADR 0002).
+    ``pub_ingest`` records ``ingest`` task enqueues (folder-walk / rescan);
+    ``pub_dense``/``pub_sparse``/``pub_graph``/``pub_label`` record the per-stage
+    DAG publishes (reindex reproject + any direct stage publish).
     """
     calls: dict = {
-        "fanout": [], "extract": 0, "image": 0, "sparse": 0,
-        "fast": [], "pub_dense": [], "pub_sparse": [], "pub_graph": [], "pub_label": [],
+        "pub_ingest": [],
+        "pub_dense": [], "pub_sparse": [], "pub_graph": [], "pub_label": [],
     }
 
-    def fake_extract(data, filename, mime):
-        calls["extract"] += 1
-        return {
-            "sourceTool": "a1111",
-            "prompt": "a red knight",
-            "negative": None,
-            "tags": ["red", "knight"],
-            "params": {"seed": 1},
-            "references": {"checkpoints": [], "loras": []},
-            "workflow_json": None,
-            "api_prompt_json": None,
-        }
-
-    def fake_ingest_fast(data, filename, source_path=None, on_stage=None):
-        sha = pipeline.compute_sha256(data)
-        calls["fast"].append(sha)
-        return sha
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        calls["pub_ingest"].append(path)
 
     def _record(key):
         async def pub(sha256, parent_op_id=None, **kwargs):
             calls[key].append(sha256)
         return pub
 
-    monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
-    monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
-    monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [1], "values": [0.5]})
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec, *args: calls["fanout"].append(rec))
-    monkeypatch.setattr(pipeline, "ingest_fast", fake_ingest_fast)
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
     monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("pub_dense"))
     monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("pub_sparse"))
     monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("pub_graph"))
@@ -117,17 +98,8 @@ def _wait_for(client: TestClient, job_id: str, statuses: set[str], timeout: floa
 # ---------------------------------------------------------------------------
 # (1) reindex-one-image
 # ---------------------------------------------------------------------------
-def test_reindex_one_image_runs_and_reports_progress(fresh_store, mock_outbound, monkeypatch):
+def test_reindex_one_image_republishes_projection_stages(fresh_store, mock_outbound):
     sha = "a" * 64
-    data = _png_bytes((10, 20, 30))
-
-    fetched: list[str] = []
-
-    def fake_fetch(sha256):
-        fetched.append(sha256)
-        return data, "image/png"
-
-    monkeypatch.setattr(pipeline, "fetch_image_bytes", fake_fetch)
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": "reindex-one-image", "sha256": sha})
@@ -142,9 +114,13 @@ def test_reindex_one_image_runs_and_reports_progress(fresh_store, mock_outbound,
         assert final["progress"]["total"] == 1
         assert final["progress"]["done"] == 1
 
-    assert fetched == [sha]
-    # The single image was re-run through the pipeline and fanned out.
-    assert len(mock_outbound["fanout"]) == 1
+    # The image is re-projected via the queue: embed.dense + embed.sparse (which
+    # fan into index.search) + index.graph — from catalog truth, no inline pipeline.
+    assert mock_outbound["pub_dense"] == [sha]
+    assert mock_outbound["pub_sparse"] == [sha]
+    assert mock_outbound["pub_graph"] == [sha]
+    # reindex does NOT re-label (that is the separate label task / label-backfill).
+    assert mock_outbound["pub_label"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +144,10 @@ def test_rescan_files_walks_library_root(tmp_path, fresh_store, mock_outbound, m
         assert final["progress"]["done"] == 3
         assert final["progress"]["skipped"] == 0
 
-    # rescan now runs the synchronous fast path per file (catalog write) and
-    # enqueues the per-stage DAG each — projection/labelling happen async.
-    assert len(mock_outbound["fast"]) == 3
-    for key in ("pub_dense", "pub_sparse", "pub_graph", "pub_label"):
-        assert len(mock_outbound[key]) == 3, key
-    assert mock_outbound["fanout"] == []
+    # rescan walks the root and PUBLISHES one ingest task per file — the worker
+    # pool catalogs + projects them; the producer does no inline work.
+    assert len(mock_outbound["pub_ingest"]) == 3
+    assert all(str(tmp_path) in p for p in mock_outbound["pub_ingest"])
 
 
 def test_rescan_files_accepts_explicit_root(tmp_path, fresh_store, mock_outbound):
@@ -247,22 +221,13 @@ def test_rebuild_search_graph_bulk_reproject(fresh_store, monkeypatch, rtype):
 def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
     _write_pngs(tmp_path, [(i, 0, 0) for i in range(0, 60, 6)])  # 10 distinct images
 
-    def slow_fast(data, filename, source_path=None, on_stage=None):
-        time.sleep(0.05)
-        return pipeline.compute_sha256(data)
+    # Slow publish so cancel can land mid-run. Pin to serial so the cancel point
+    # is deterministic (this test is about cancellation, not concurrency).
+    async def slow_publish(path, source_folder_id=None, parent_op_id=None):
+        await asyncio.sleep(0.05)
 
-    async def noop_publish(sha256, parent_op_id=None):
-        return None
-
-    # Pin to serial so the cancel point is deterministic (this test is about
-    # cancellation, not concurrency).
     monkeypatch.setenv("INGEST_CONCURRENCY", "1")
-    monkeypatch.setattr(pipeline, "ingest_fast", slow_fast)
-    for name in (
-        "publish_embed_dense_task", "publish_embed_sparse_task",
-        "publish_index_graph_task", "publish_label_task",
-    ):
-        monkeypatch.setattr(broker_module, name, noop_publish)
+    monkeypatch.setattr(broker_module, "publish_ingest_task", slow_publish)
 
     with TestClient(app_module.app) as client:
         job_id = client.post(

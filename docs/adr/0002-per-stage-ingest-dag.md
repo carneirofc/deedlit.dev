@@ -1,10 +1,23 @@
 # ADR 0002 — Per-stage ingest DAG via catalog-rendezvous choreography
 
-- **Status:** Proposed
+- **Status:** Accepted (amended 2026-06-18)
 - **Date:** 2026-06-14
 - **Deciders:** carneirofc
 - **Extends / partially supersedes:** [ADR 0001](0001-async-queues-for-labelling-and-indexing.md)
 - **Tracking issues:** TBD
+
+## Amendment (2026-06-18) — pure-queue ingest, inline path removed
+
+Ingest is now **fully queue-driven**. The opt-in `INGEST_VIA_QUEUE` toggle and the
+inline fast path described below were **removed**: a folder scan ALWAYS publishes
+one `ingest` task per file (no in-process catalog write, no broker-down fallback),
+and `reindex-one-image` publishes the reproject DAG instead of running the pipeline
+inline. RabbitMQ is therefore a **hard dependency** for ingest — a publish failure
+marks the file failed and the next scan re-enqueues it. The `ingest` queue handler
+(`ingest_fast`) is unchanged and remains the first DAG stage. The producer config
+drops `ingest_via_queue`; `ingest_concurrency` now bounds concurrent *publishes*.
+Sections below describing the in-process fast path / `INGEST_VIA_QUEUE` fallback are
+retained as historical context.
 
 ## Context
 

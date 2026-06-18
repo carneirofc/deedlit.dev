@@ -92,25 +92,6 @@ async def _publish_label_best_effort(sha256: str, parent_op_id: str | None = Non
     )
 
 
-async def _publish_ingest_best_effort(
-    path: str, source_folder_id: str | None = None, parent_op_id: str | None = None
-) -> bool:
-    """Best-effort publish of an ``ingest`` task for one file path (ADR 0002).
-
-    No ledger row (ingest is keyed by path, not sha; the downstream per-image
-    stages carry the ledger). Returns False on a broker error so the caller can
-    fall back to the inline fast path and still land the catalog write.
-    """
-    try:
-        await broker.publish_ingest_task(
-            path, source_folder_id=source_folder_id, parent_op_id=parent_op_id
-        )
-    except Exception as exc:  # noqa: BLE001 — best-effort; caller falls back inline
-        log.warning("ingest publish failed for %s (%s); running inline fallback", path, exc)
-        return False
-    return True
-
-
 async def _publish_reproject_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
     """Re-publish the projection stages (no re-label) for one image (ADR 0002).
 
@@ -125,32 +106,6 @@ async def _publish_reproject_best_effort(sha256: str, parent_op_id: str | None =
         _publish_index_graph_best_effort(sha256, parent_op_id),
     )
     return all(results)
-
-
-async def _publish_post_ingest_best_effort(
-    sha256: str, parent_op_id: str | None = None, path: str | None = None
-) -> None:
-    """Enqueue the per-stage DAG after a fast-path catalog write (ADR 0002).
-
-    Fans out the downstream stages — embed.dense + embed.sparse (which both fan in
-    to index.search), index.graph, and (when LLM enrichment is enabled) label.
-    Each is best-effort: a broker hiccup leaves the image cataloged-but-unprojected,
-    and reconcile (embed/index) + label-backfill re-enqueue once the broker returns.
-    They are independent, so they are published CONCURRENTLY. ``path`` (the on-disk
-    source) rides to embed.dense so the GPU stage skips the catalog filepath lookup.
-
-    The ``label`` stage is skipped when the vision-LLM master switch is off
-    (:func:`llm_enabled`) — the image is still fully cataloged + projected, just
-    without an AI description/safety/tags.
-    """
-    publishes = [
-        _publish_embed_dense_best_effort(sha256, parent_op_id, path=path),
-        _publish_embed_sparse_best_effort(sha256, parent_op_id),
-        _publish_index_graph_best_effort(sha256, parent_op_id),
-    ]
-    if llm_enabled():
-        publishes.append(_publish_label_best_effort(sha256, parent_op_id))
-    await asyncio.gather(*publishes)
 
 
 def _now_iso() -> str:
@@ -173,28 +128,15 @@ LIBRARY_ROOT = os.getenv("IMAGE_LIBRARY_ROOT", os.path.join("data", "library"))
 
 
 def ingest_concurrency() -> int:
-    """How many files a folder scan fast-paths at once (ADR 0002). >= 1.
+    """How many ``ingest`` tasks a folder scan publishes concurrently (ADR 0002). >= 1.
 
     Read live from :mod:`config` (env default + settings-panel override) on every
     scan, so it can be tuned from the UI without a restart (and pinned to 1 in
     tests that need deterministic serial ordering, via the env). Bounds the
-    producer's in-flight work so a big folder parallelizes catalog writes without
-    unbounded fan-out — an asyncio.Semaphore, not a thread lock.
+    producer's in-flight publishes via an asyncio.Semaphore so a huge folder
+    enqueues at a steady rate instead of an unbounded burst.
     """
     return config.runtime()["ingest_concurrency"]
-
-
-def ingest_via_queue() -> bool:
-    """Opt-in: route the folder scan through the ``ingest`` queue (ADR 0002).
-
-    Off by default — the fast path runs inline (bounded concurrency), keeping the
-    catalog write as the durability boundary. When on, the scan publishes a cheap
-    ``ingest`` task per file and the ingest-worker pool catalogs them across
-    processes; a broker outage falls back to the inline fast path so the catalog
-    write still lands. Read live from :mod:`config` so it can be flipped from the
-    settings panel without a restart.
-    """
-    return config.runtime()["ingest_via_queue"]
 
 
 def llm_enabled() -> bool:
@@ -334,11 +276,11 @@ class Job:
         }
 
     def stage_callback(self) -> Callable[[str], None]:
-        """A progress hook for the pipeline: record the current stage and bump
-        the per-stage reached-count. Passed into ``pipeline.process_file`` /
-        ``pipeline.fan_out_writes`` so a running ingest reports which service is
-        active right now. Mutates simple fields only (atomic under the GIL), so
-        it is safe to call from the ``asyncio.to_thread`` worker thread."""
+        """A progress hook for a job: record the current stage and bump the
+        per-stage reached-count. The folder-scan producer reports the ``publish``
+        stage as it enqueues each file; the worker reports the ingest/DAG stages
+        on its own side. Mutates simple fields only (atomic under the GIL), so it
+        is safe to call from an ``asyncio.to_thread`` worker thread."""
 
         # Per-file timing state: log how long the PREVIOUS stage took as soon as
         # the next one begins, so a slow service (e.g. the labelagent LLM at the
@@ -405,10 +347,6 @@ class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
-        # sha256 seen across this process's lifetime — the dedup memory. A real
-        # dedup would query catalog; in-memory keeps the stateless service honest
-        # while still skipping unchanged files on a re-run within the process.
-        self._seen_sha256: set[str] = set()
         self._worker: asyncio.Task | None = None
         # The event loop the worker runs on, captured so a job snapshot can be
         # scheduled onto it (best-effort, fire-and-forget) even from a sync
@@ -608,15 +546,14 @@ class JobStore:
         )
 
     async def _run_folder(self, job: Job) -> None:
-        """Walk the folder and fast-path each file with BOUNDED CONCURRENCY (ADR
-        0002).
+        """Walk the folder and PUBLISH one ``ingest`` task per file (ADR 0002).
 
-        The fast path (catalog write + thumbnail) runs inline so the catalog write
-        stays the durability boundary, but up to ``INGEST_CONCURRENCY`` files are
-        processed at once — overlapping their metadata round-trip + catalog write
-        + thumbnail encode — so image availability scales past the old serial loop.
-        A semaphore bounds in-flight work; cancellation is honoured between
-        launches (already-launched files finish, then the job settles cancelled).
+        The producer does no processing — it only enqueues. The ingest-worker pool
+        reads the bytes, catalogs each file, and fans out the per-stage DAG, all in
+        parallel across processes. Up to ``INGEST_CONCURRENCY`` publishes are kept
+        in flight via a semaphore so a huge folder enqueues steadily; cancellation
+        is honoured between launches (already-launched publishes finish, then the
+        job settles cancelled). ``progress.done`` counts files ENQUEUED.
         """
         files = _list_supported_files(job.folder_path or "")
         job.progress.total = len(files)
@@ -641,32 +578,23 @@ class JobStore:
         job.status = CANCELLED if job.cancel_requested else COMPLETED
 
     async def _run_reindex_one(self, job: Job) -> None:
-        """Re-run the per-file pipeline for a single already-cataloged image.
+        """Re-project a single already-cataloged image via the queue (ADR 0002).
 
-        Fetches the image's raw bytes from the app by sha256, runs the full
-        pipeline, and fans out the writes — the same path a fresh ingest takes,
-        but bypassing the dedup memory so the record is always refreshed.
+        Publishes the projection stages from catalog truth — embed.dense +
+        embed.sparse (which fan into index.search) + index.graph — the same set
+        ``POST /tasks/index`` enqueues. No inline pipeline: the GPU/search/graph
+        work runs in the parallel worker pool. Does NOT re-label (that is the
+        separate ``label`` task / label-backfill).
         """
         job.progress.total = 1
         if job.cancel_requested:
             job.status = CANCELLED
             return
         sha256 = job.sha256 or ""
-        data, mime = await pipeline.maybe_await(pipeline.fetch_image_bytes(sha256))
-        filename = f"{sha256}{_ext_for_mime(mime)}"
-        # Backfill the source path from catalog so the re-projected search
-        # payload keeps the image's file identity.
-        source_path = await pipeline.maybe_await(pipeline.fetch_image_filepath(sha256))
-        if job.cancel_requested:
-            job.status = CANCELLED
-            return
-        on_stage = job.stage_callback()
-        rec = await pipeline.maybe_await(
-            pipeline.process_file(data, filename, source_path, on_stage)
-        )
-        await pipeline.maybe_await(pipeline.fan_out_writes(rec, on_stage))
-        self._seen_sha256.add(rec.sha256)
-        job.progress.done += 1
+        if await _publish_reproject_best_effort(sha256, parent_op_id=job.id):
+            job.progress.done += 1
+        else:
+            job.progress.failed += 1
         job.status = COMPLETED
 
     async def _run_rebuild(self, job: Job) -> None:
@@ -855,72 +783,32 @@ class JobStore:
         job.status = COMPLETED
 
     async def _process_one(self, job: Job, path: Path) -> None:
-        started = time.perf_counter()
-        try:
-            # Opt-in cross-process mode (ADR 0002): publish a cheap ingest task and
-            # let the ingest-worker pool catalog it. Falls through to the inline
-            # fast path below when the broker is down, so the catalog write still
-            # lands (preserving the durability boundary).
-            if ingest_via_queue():
-                on_stage = job.stage_callback()
-                on_stage("publish")
-                if await _publish_ingest_best_effort(
-                    str(path), source_folder_id=job.source_folder_id, parent_op_id=job.id
-                ):
-                    job.progress.done += 1
-                    log.info(
-                        "enqueued(ingest) %s in %.0f ms (%d/%d)", path.name,
-                        (time.perf_counter() - started) * 1000,
-                        job.progress.done, job.progress.total,
-                    )
-                    return
-                # broker down -> fall through to the inline fast path below
+        """Enqueue ONE ``ingest`` task for a file — no inline processing (ADR 0002).
 
-            data = await asyncio.to_thread(path.read_bytes)
-            sha256 = await asyncio.to_thread(pipeline.compute_sha256, data)
-            if sha256 in self._seen_sha256:
-                job.progress.skipped += 1
-                log.debug("skip (already seen) %s -> %s", path.name, sha256[:12])
-                return
-            # Mark each file's start so the log shows processing has BEGUN (and on
-            # which file) before the per-stage timings stream out below it.
-            log.info("processing %s -> %s", path.name, sha256[:12])
-            on_stage = job.stage_callback()
-            # Synchronous fast path: catalog record + thumbnail only (ADR 0001).
-            # Dense/sparse/search/graph projection happens asynchronously in the
-            # index task published below.
-            await pipeline.maybe_await(
-                pipeline.ingest_fast(data, path.name, str(path), on_stage)
-            )
-            # Enqueue the per-stage DAG (ADR 0002): embed.dense + embed.sparse
-            # (-> index.search fan-in), index.graph, and label. Best-effort: a
-            # broker outage must not fail the catalog write — the reconcile and
-            # label-backfill sweeps re-enqueue once the broker is back.
-            on_stage("publish")
-            await _publish_post_ingest_best_effort(sha256, parent_op_id=job.id, path=str(path))
-            self._seen_sha256.add(sha256)
-            job.progress.done += 1
-            log.info(
-                "ingested(fast) %s -> %s in %.0f ms (%d/%d)", path.name, sha256[:12],
-                (time.perf_counter() - started) * 1000, job.progress.done, job.progress.total,
+        The producer only publishes; the ingest-worker pool reads the bytes, writes
+        the catalog record + thumbnail, and fans out the per-stage DAG. RabbitMQ is
+        the durability boundary: a publish failure marks the file failed (no inline
+        fallback) — the next scan re-enqueues it once the broker is back.
+        """
+        started = time.perf_counter()
+        on_stage = job.stage_callback()
+        on_stage("publish")
+        try:
+            await broker.publish_ingest_task(
+                str(path), source_folder_id=job.source_folder_id, parent_op_id=job.id
             )
         except Exception as exc:
             job.progress.failed += 1
-            # Previously swallowed silently — the #1 reason ingest "fails" with no
-            # trace. Log the offending file, the STAGE it died at (so a slow/failing
-            # downstream is obvious), and the full traceback.
             log.exception(
-                "FAILED to ingest %s at stage=%s after %.0f ms: %s",
-                path.name, job.current_stage, (time.perf_counter() - started) * 1000, exc,
+                "FAILED to enqueue %s after %.0f ms: %s",
+                path.name, (time.perf_counter() - started) * 1000, exc,
             )
-
-
-def _ext_for_mime(mime: str) -> str:
-    return {
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/jpeg": ".jpg",
-    }.get(mime.lower(), ".png")
+            return
+        job.progress.done += 1
+        log.info(
+            "enqueued(ingest) %s in %.0f ms (%d/%d)", path.name,
+            (time.perf_counter() - started) * 1000, job.progress.done, job.progress.total,
+        )
 
 
 def _list_supported_files(folder_path: str) -> list[Path]:

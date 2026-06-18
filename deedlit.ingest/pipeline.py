@@ -1,30 +1,24 @@
 """Per-file ingest pipeline + outbound clients.
 
-The pipeline for one image file:
+Ingest is FULLY QUEUE-DRIVEN (ADR 0001/0002): there is no synchronous in-process
+projection. A folder scan only PUBLISHES an ``ingest`` task per file; everything
+else runs as an independent, parallel queue stage on the worker pool:
 
-    read bytes -> sha256 (dedup key) -> phash -> dims -> WebP thumbnail (Pillow)
-      -> metadata POST /extract
-      -> vision POST /embed/image (dense)
-      -> vision POST /embed/sparse (sparse, over the extracted prompt text)
-      -> assemble a catalog-shaped record + a search point + graph edges
-      -> fan out the writes DIRECTLY to the owning services (catalog/search/
-         graph), catalog-first, per-store retry.
+    ingest        -> sha256/phash/dims/WebP-thumbnail + metadata -> catalog
+                     record + thumbnail blob (``ingest_fast``), then publishes:
+    embed.dense   -> GPU dense vector              -> catalog blob -> index.search
+    embed.sparse  -> SPLADE + CLIP-text vectors    -> catalog blobs -> index.search
+    index.search  -> fan-in dense+sparse           -> search point
+    index.graph   -> reference/tag/lineage edges   -> graph
+    label         -> vision-LLM describe           -> catalog patch -> re-project
 
-deedlit.ingest holds NO DB drivers. Persistence happens by HTTP fan-out to the
-owning services (issue #17):
-
-  - record    -> catalog  POST /images            (ImageUpsert shape)
-  - thumbnail -> catalog  PUT  /blobs/{sha}/thumbnail
-  - point     -> search   POST /points            (dense + sparse + payload)
-  - edges     -> graph    POST /edges             (references/tags/lineage)
-
-The fan-out used the TS app's write endpoints as an interim (issue #9); #17
-re-points it at the owning service contracts (contracts/{catalog,search,graph}
-.openapi.yaml) so the TS app is UI-only.
+deedlit.ingest holds NO DB drivers. Each stage persists to the OWNING service
+contract directly (contracts/{catalog,search,graph}.openapi.yaml), catalog-first,
+per-store retry. The catalog is the fan-in rendezvous; there is no coordinator.
 
 The outbound HTTP boundary lives in small module-level functions
-(``extract_metadata``, ``embed_image``, ``embed_sparse_text``, ``fan_out_writes``)
-so tests can monkeypatch them and stay offline/deterministic.
+(``extract_metadata``, ``embed_image``, ``embed_sparse_text``, the per-stage DAG
+helpers) so tests can monkeypatch them and stay offline/deterministic.
 """
 from __future__ import annotations
 
@@ -38,7 +32,6 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -838,9 +831,8 @@ def build_search_point(
 ) -> dict[str, Any]:
     """Assemble the search UpsertPoint from the vectors + catalog truth.
 
-    Mirrors :func:`assemble_record`'s point/payload shape, but sources the payload
-    fields (tags/filepath/description/safety) from the catalog record instead of a
-    fresh extract — the index.search stage projects from truth, not from bytes.
+    Sources the payload fields (tags/filepath/description/safety) from the catalog
+    record — the index.search stage projects from truth, not from bytes.
 
     ``description`` is the optional CLIP-text vector; it is added to the point only
     when present so an image without an AI description indexes on dense + sparse.
@@ -971,17 +963,6 @@ def _proxy_urls(sha256: str, ext: str) -> tuple[str, str]:
     return image_url, thumbnail_url
 
 
-@dataclass
-class IngestRecord:
-    """Assembled per-file result: a catalog record, a search point, graph edges."""
-
-    sha256: str
-    record: dict[str, Any]
-    point: dict[str, Any]
-    edges: dict[str, Any]
-    thumbnail: bytes | None = None
-
-
 def file_created_at_iso(source_path: str | None) -> str | None:
     """Best-effort source-file creation time as a UTC ISO-8601 string, or None.
 
@@ -1014,10 +995,10 @@ def build_catalog_record(
 ) -> dict[str, Any]:
     """Build the catalog ImageUpsert record (the source-of-truth row).
 
-    Shared by the synchronous fast path (:func:`ingest_fast`, which has no dense/
-    sparse vectors) and the full projection pipeline (:func:`assemble_record`).
-    None for ``description``/``safety`` is safe: catalog COALESCEs them so a later
-    write never wipes an AI value that an earlier label task already stored.
+    Used by the ``ingest`` stage (:func:`ingest_fast`, catalog record only) and the
+    ``label`` stage (:func:`label_image`, a full record patch carrying the AI
+    description/safety/tags). None for ``description``/``safety`` is safe: catalog
+    COALESCEs them so a later write never wipes an AI value an earlier label stored.
     """
     return {
         "sha256": sha256,
@@ -1054,202 +1035,12 @@ def build_catalog_record(
     }
 
 
-def assemble_record(
-    *,
-    sha256: str,
-    phash: str | None,
-    width: int | None,
-    height: int | None,
-    extract: dict[str, Any],
-    dense: list[float],
-    sparse: dict[str, list],
-    thumbnail: bytes | None,
-    ext: str = "",
-    source_path: str | None = None,
-    tags: list[str] | None = None,
-    description: str | None = None,
-    description_dense: list[float] | None = None,
-    label: str | None = None,
-    safety: str | None = None,
-) -> IngestRecord:
-    references = _references_list(extract.get("references"))
-    # ``tags`` is the (already merged) extracted + AI-label tag list; falls back
-    # to the extracted tags when the labelagent enrichment is disabled.
-    tags = tags if tags is not None else (extract.get("tags") or [])
-
-    record = build_catalog_record(
-        sha256=sha256,
-        phash=phash,
-        width=width,
-        height=height,
-        extract=extract,
-        source_path=source_path,
-        tags=tags,
-        description=description,
-        safety=safety,
-    )
-
-    # search UpsertPoint: {sha256, dense, sparse?, payload?}. Search keys the
-    # Qdrant point by uuid5(sha256) itself; we surface the derived id in the
-    # payload so consumers that read points back can resolve it without
-    # recomputing. We also embed the proxy image/thumbnail URLs (with extensions)
-    # so a hit can be rendered straight from the payload — and so the Qdrant
-    # dashboard shows previews — without a follow-up catalog lookup.
-    image_url, thumbnail_url = _proxy_urls(sha256, ext)
-    payload = {
-        "sha256": sha256,
-        "point_id": point_id_for_sha256(sha256),
-        "tags": tags,
-        "image_url": image_url,
-        "thumbnail_url": thumbnail_url,
-    }
-    # Original source path, surfaced in the payload too, so a point inspected in
-    # the Qdrant dashboard is identifiable by its file (not just the opaque
-    # sha256). Only added when known so payloads stay clean for path-unknown
-    # ingests; mirrors the label/description convention below.
-    if source_path:
-        payload["filepath"] = source_path
-    # AI label/description (deedlit.labelagent) enrich the searchable payload.
-    # Only added when present so payloads stay clean when the labelagent is off.
-    if label:
-        payload["label"] = label
-    if description:
-        payload["description"] = description
-    # Content-safety class drives the app's safety filter on the search/vector
-    # path (Qdrant payload filter); only added when classified.
-    if safety:
-        payload["safety"] = safety
-    point = {
-        "sha256": sha256,
-        "dense": dense,
-        "sparse": sparse,
-        "payload": payload,
-    }
-    # Optional second dense vector (CLIP-text of the AI description); only added
-    # when present so a point without a description still indexes on dense+sparse.
-    if description_dense:
-        point["description"] = description_dense
-
-    edges = {
-        "sha256": sha256,
-        "references": references,
-        "tags": tags,
-        "lineage": [],
-    }
-
-    return IngestRecord(
-        sha256=sha256,
-        record=record,
-        point=point,
-        edges=edges,
-        thumbnail=thumbnail,
-    )
-
-
 # ---------------------------------------------------------------------------
-# Per-file pipeline
-# ---------------------------------------------------------------------------
-async def process_file(
-    data: bytes,
-    filename: str,
-    source_path: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
-    *,
-    description: str | None = None,
-    safety: str | None = None,
-    tags: list[str] | None = None,
-) -> IngestRecord:
-    """Build the search+graph projection (record/point/edges) from raw bytes.
-
-    Computes sha256/phash/dims/thumbnail + metadata, embeds dense+sparse, then
-    assembles record/point/edges. Does NOT label (labelling is the async ``label``
-    task, #26 / ADR 0001) and does NOT persist (see :func:`fan_out_writes`).
-
-    ``description``/``safety``/``tags`` carry the catalog TRUTH for the AI-derived
-    fields: the label task patches them onto the catalog, and the index task reads
-    them back and passes them in here so the projection (sparse text + payload +
-    graph edges) reflects them. When omitted (a first-pass before any label, or a
-    direct caller), the sparse text falls back to prompt + extracted tags only.
-
-    ``source_path`` is the original on-disk path (kept on the record/payload for
-    identification); ``filename`` is only the upload label used for mime
-    detection. ``on_stage`` reports the active stage (``hash`` / ``metadata`` /
-    ``vision:dense`` / ``vision:sparse``) for the live dashboard.
-    """
-    stage = on_stage if on_stage is not None else lambda _name: None
-
-    ext = os.path.splitext(filename)[1].lower()
-    mime = _mime_for_extension(ext)
-
-    stage("hash")
-    # All the CPU-bound pixel work in one thread hop (GIL released during it).
-    sha256, phash, width, height, thumbnail = await asyncio.to_thread(_pixel_work, data)
-
-    stage("metadata")
-    extract = await maybe_await(extract_metadata(data, filename, mime))
-    # Tags: prefer the explicit catalog-truth list (already merged with AI tags by
-    # the label task); fall back to the freshly extracted tags on a first pass.
-    final_tags = list(tags) if tags is not None else list(extract.get("tags") or [])
-
-    log.debug("%s sha=%s tool=%s dims=%sx%s", filename, sha256[:12], extract.get("sourceTool"), width, height)
-    # Dense (CLIP image, torch GPU) and sparse (SPLADE text, onnxruntime GPU) are
-    # independent — dense reads the image bytes, sparse reads the lexical text (SD
-    # prompt + AI description + tags). deedlit.vision runs them on separate worker
-    # threads, so firing both at once lets the two embeddings overlap on the GPU
-    # instead of serializing one HTTP round-trip behind the other. The AI
-    # description (catalog truth) lets images with thin/absent embedded metadata
-    # still index on the sparse side.
-    stage("vision:dense")
-    stage("vision:sparse")
-    sparse_text = " ".join(
-        s.strip() for s in (extract.get("prompt"), description, " ".join(final_tags)) if s and s.strip()
-    )
-
-    # The AI description (catalog truth) also gets its own CLIP-text dense vector
-    # (the ``description`` named vector) — embedded only when present, so a
-    # first-pass/undescribed image just carries dense+sparse.
-    desc_text = (description or "").strip()
-
-    async def _dense() -> list[float]:
-        return await maybe_await(embed_image(data, filename, mime))
-
-    async def _sparse() -> dict[str, list]:
-        if not sparse_text.strip():
-            return {"indices": [], "values": []}
-        return await maybe_await(embed_sparse_text(sparse_text))
-
-    async def _description() -> list[float] | None:
-        if not desc_text:
-            return None
-        return await maybe_await(embed_text(desc_text))
-
-    dense, sparse, description_dense = await asyncio.gather(_dense(), _sparse(), _description())
-    log.debug(
-        "%s dense_dim=%d sparse_terms=%d description=%s",
-        sha256[:12], len(dense), len(sparse.get("indices", [])), description_dense is not None,
-    )
-
-    return assemble_record(
-        sha256=sha256,
-        phash=phash,
-        width=width,
-        height=height,
-        extract=extract,
-        dense=dense,
-        sparse=sparse,
-        thumbnail=thumbnail,
-        ext=ext,
-        source_path=source_path,
-        tags=final_tags,
-        description=description,
-        description_dense=description_dense,
-        label=None,
-        safety=safety,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Synchronous fast path (ADR 0001)
+# ``ingest`` stage — fast catalog write (ADR 0001/0002)
+#
+# The body of the ``ingest`` queue handler: local pixel work + metadata + the
+# catalog record + thumbnail blob. NO projection runs here — the worker publishes
+# the per-stage DAG (embed.dense/embed.sparse/index.graph/label) once this lands.
 # ---------------------------------------------------------------------------
 async def ingest_fast(
     data: bytes,
@@ -1257,16 +1048,16 @@ async def ingest_fast(
     source_path: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> str:
-    """Run ONLY the synchronous fast path for one image and return its sha256.
+    """Run the ``ingest`` stage for one image and return its sha256.
 
     Local pixel work (sha256/phash/dims/WebP-thumbnail) + metadata extract +
     write the catalog record and thumbnail blob. No GPU, no LLM, no
-    search/graph projection — those are done asynchronously by the ``index``
-    task the caller publishes once this returns (ADR 0001). The image is in the
-    catalog (and renderable via its thumbnail) the moment this completes.
+    search/graph projection — the worker publishes those per-stage DAG tasks once
+    this returns (ADR 0001/0002). The image is in the catalog (and renderable via
+    its thumbnail) the moment this completes.
 
-    ``on_stage`` mirrors :func:`process_file`'s progress hook; it is called as the
-    pipeline enters each step (``hash`` / ``metadata`` / ``catalog``).
+    ``on_stage`` is the optional progress hook, called as the stage enters each
+    step (``hash`` / ``metadata`` / ``catalog``).
     """
     stage = on_stage if on_stage is not None else lambda _name: None
 
@@ -1362,40 +1153,3 @@ async def _put_blob_with_retry(
         retries,
     )
 
-
-async def fan_out_writes(rec: IngestRecord, on_stage: Callable[[str], None] | None = None) -> None:
-    """Persist one record directly to the owning services (catalog/search/graph).
-
-    Order is catalog/truth FIRST (the source of truth must land before the
-    derived projections), then the search point, then graph edges. Each store
-    gets its own retry. If catalog fails after retries the whole file fails
-    (the derived stores would point at a missing record); search/graph failures
-    propagate too so the file is recorded as failed and can be re-run.
-
-    Targets (issue #17 — direct to owning services, no longer the TS app):
-      1. catalog  POST /images                 record (ImageUpsert)
-         catalog  PUT  /blobs/{sha}/thumbnail  thumbnail blob (if present)
-      2. search   POST /points                 dense + sparse + payload
-      3. graph    POST /edges                   references/tags/lineage
-
-    ``on_stage`` is the same optional progress hook as :func:`process_file`,
-    called with ``catalog`` / ``search`` / ``graph`` as each write begins.
-    """
-    stage = on_stage if on_stage is not None else lambda _name: None
-    sha = rec.sha256
-    # 1. catalog / truth FIRST: the record, then its thumbnail blob. The record
-    #    must land before the blob (the blob hangs off the cataloged image) and
-    #    before the derived projections.
-    stage("catalog")
-    await maybe_await(_post_with_retry(f"{CATALOG_URL}/images", rec.record))
-    if rec.thumbnail is not None:
-        await maybe_await(_put_blob_with_retry(
-            f"{CATALOG_URL}/blobs/{sha}/thumbnail", rec.thumbnail, "image/webp"
-        ))
-    # 2. search: dense + sparse point (keyed by uuid5(sha256) inside search).
-    stage("search")
-    await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", rec.point))
-    # 3. graph: reference/tag/lineage edges.
-    stage("graph")
-    await maybe_await(_post_with_retry(f"{GRAPH_URL}/edges", rec.edges))
-    log.debug("fan-out OK %s -> catalog+search+graph", sha[:12])

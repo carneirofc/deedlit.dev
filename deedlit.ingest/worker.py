@@ -70,14 +70,14 @@ async def label_handler(payload: dict) -> None:
 
 
 async def ingest_handler(payload: dict) -> None:
-    """``ingest`` stage: run the fast path for one source file, then fan out.
+    """``ingest`` stage: catalog one source file, then fan out the DAG (ADR 0002).
 
-    Opt-in cross-process producer (ADR 0002): when ``INGEST_VIA_QUEUE`` routes the
-    folder scan through this queue, replicas catalog files in parallel. Reads the
+    The first stage of the fully queue-driven pipeline — a folder scan publishes
+    one of these per file and the worker pool runs them in parallel. Reads the
     bytes (shared disk path in the payload), writes the catalog record + thumbnail,
-    then publishes the four downstream stages. Downstream-publish errors propagate
-    so the broker retries the whole (idempotent) ingest task. Runs the sync fast
-    path in a thread.
+    then publishes the downstream stages (embed.dense/embed.sparse/index.graph,
+    plus label when the LLM master switch is on). Downstream-publish errors
+    propagate so the broker retries the whole (idempotent) ingest task.
     """
     path = payload.get("path")
     if not path:

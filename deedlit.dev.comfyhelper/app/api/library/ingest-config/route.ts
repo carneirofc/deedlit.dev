@@ -20,9 +20,6 @@ export async function PUT(req: Request) {
     if (typeof body.ingest_concurrency === "number") {
       patch.ingest_concurrency = body.ingest_concurrency;
     }
-    if (typeof body.ingest_via_queue === "boolean") {
-      patch.ingest_via_queue = body.ingest_via_queue;
-    }
     if (typeof body.llm_enabled === "boolean") {
       patch.llm_enabled = body.llm_enabled;
     }

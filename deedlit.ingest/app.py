@@ -198,7 +198,6 @@ class ConfigPatch(BaseModel):
     """
 
     ingest_concurrency: int | None = None
-    ingest_via_queue: bool | None = None
     # Master switch for the vision-LLM (labelagent) enrichment stage.
     llm_enabled: bool | None = None
 

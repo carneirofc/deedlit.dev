@@ -540,10 +540,8 @@ export async function listTasks(
 // ---------------------------------------------------------------------------
 
 export interface IngestConfig {
-  /** How many files a folder scan fast-paths at once (inline mode). */
+  /** How many `ingest` tasks a folder scan publishes concurrently. */
   ingest_concurrency: number;
-  /** Route the scan through the `ingest` queue (cross-process worker pool). */
-  ingest_via_queue: boolean;
   /**
    * Master switch for the vision-LLM (labelagent) enrichment stage. When off,
    * ingest skips the `label` stage so images are cataloged + indexed without an
@@ -557,7 +555,6 @@ export async function getIngestConfig(signal?: AbortSignal): Promise<IngestConfi
   return {
     ingest_concurrency:
       typeof res?.ingest_concurrency === "number" ? res.ingest_concurrency : 8,
-    ingest_via_queue: Boolean(res?.ingest_via_queue),
     // Default ON when the field is absent (older ingest builds) — matches the
     // service default so the toggle doesn't read as off against an unset value.
     llm_enabled: res?.llm_enabled !== false,

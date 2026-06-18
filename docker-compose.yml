@@ -279,17 +279,14 @@ services:
       GRAPH_URL: http://graph:8000
       # Optional AI labeling enrichment (best-effort; unset => disabled).
       LABELAGENT_URL: http://labelagent:8000
-      # RabbitMQ for the async index/label task queues (ADR 0001). The fast path
-      # publishes here best-effort; a publish failure never fails the catalog
-      # write (reconcile/backfill re-enqueue later).
+      # RabbitMQ for the async ingest DAG task queues (ADR 0001/0002). Ingest is
+      # fully queue-driven: a folder scan publishes one `ingest` task per file and
+      # the worker pool catalogs + projects them. RabbitMQ is a HARD dependency —
+      # a publish failure marks the file failed and the next scan re-enqueues it.
       AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
-      # Producer parallelism (ADR 0002). INGEST_CONCURRENCY: how many files a
-      # folder scan fast-paths at once (inline, default mode). INGEST_VIA_QUEUE:
-      # opt in to route the scan through the `ingest` queue instead, so the
-      # ingest-worker pool catalogs across processes (falls back to inline on a
-      # broker outage). Default off keeps the catalog write the durability boundary.
+      # Producer parallelism (ADR 0002). INGEST_CONCURRENCY bounds how many
+      # `ingest` tasks a folder scan publishes concurrently.
       INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-4}
-      INGEST_VIA_QUEUE: ${INGEST_VIA_QUEUE:-}
       # Background schedulers (0/unset disables each). Folder scan re-walks the
       # configured-folder registry on each folder's own interval; label backfill
       # periodically relabels images missing an AI description.

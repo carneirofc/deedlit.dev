@@ -1,7 +1,7 @@
 """Tests for the live-observability additions:
 
   - the per-service ActivityTracker + GET /activity endpoint (activity.py),
-  - pipeline-stage emissions threaded through process_file / fan_out_writes,
+  - stage emissions from the ``ingest`` queue stage (ingest_fast),
   - the ingest Job's current_stage / stage_counts + lifecycle timestamps.
 
 All outbound HTTP is monkeypatched so the suite stays offline/deterministic.
@@ -62,28 +62,18 @@ def test_activity_endpoint_excludes_probes_and_reports_last_real_op():
 
 
 # ---------------------------------------------------------------------------
-# Pipeline stage emissions (which microservice is active, in order)
+# ``ingest`` stage emissions (the queue handler body, in order)
 # ---------------------------------------------------------------------------
-def test_process_file_emits_stages_in_order(monkeypatch):
-    # process_file no longer labels (labelling is the async label task, ADR 0001),
-    # so the staircase drops the "label" stage.
+def test_ingest_fast_emits_stages_in_order(monkeypatch):
+    # The ``ingest`` stage catalogs only: hash -> metadata -> catalog. Projection
+    # (vision/search/graph) is the downstream DAG, not part of this stage.
     monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "x", "tags": []})
-    monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1])
-    monkeypatch.setattr(pipeline, "embed_sparse_text", lambda t: {"indices": [], "values": []})
-
-    stages: list[str] = []
-    asyncio.run(pipeline.process_file(_png_bytes(), "img.png", None, stages.append))
-    assert stages == ["hash", "metadata", "vision:dense", "vision:sparse"]
-
-
-def test_fan_out_writes_emits_stages_in_order(monkeypatch):
     monkeypatch.setattr(pipeline, "_post_with_retry", lambda *a, **k: None)
     monkeypatch.setattr(pipeline, "_put_blob_with_retry", lambda *a, **k: None)
 
-    rec = pipeline.IngestRecord(sha256="a" * 64, record={}, point={}, edges={}, thumbnail=b"x")
     stages: list[str] = []
-    asyncio.run(pipeline.fan_out_writes(rec, stages.append))
-    assert stages == ["catalog", "search", "graph"]
+    asyncio.run(pipeline.ingest_fast(_png_bytes(), "img.png", None, stages.append))
+    assert stages == ["hash", "metadata", "catalog"]
 
 
 # ---------------------------------------------------------------------------
@@ -109,27 +99,18 @@ def test_job_stage_callback_records_current_and_counts():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: a real ingest sets timestamps + the full per-stage staircase
+# End-to-end: a real folder scan sets timestamps + emits the publish stage only
 # ---------------------------------------------------------------------------
-def test_ingest_run_sets_timestamps_and_fast_path_staircase(tmp_path, monkeypatch):
+def test_ingest_run_sets_timestamps_and_publish_stage(tmp_path, monkeypatch):
     store = jobs_module.JobStore()
     monkeypatch.setattr(app_module, "store", store)
-    # Keep the REAL ingest_fast (fast path), stubbing only its outbound calls, so
-    # the per-file fast-path stages are exercised offline. Projection (dense/
-    # sparse/search/graph) now happens async in the per-stage DAG worker (ADR
-    # 0002), so it is NOT part of the folder-walk job's staircase.
-    monkeypatch.setattr(pipeline, "extract_metadata", lambda d, f, m: {"prompt": "p", "tags": ["t"]})
-    monkeypatch.setattr(pipeline, "_post_with_retry", lambda *a, **k: None)
-    monkeypatch.setattr(pipeline, "_put_blob_with_retry", lambda *a, **k: None)
-
-    async def noop_publish(sha256, parent_op_id=None):
+    # The producer only PUBLISHES ingest tasks — all per-file processing (hash/
+    # metadata/catalog + the DAG) happens in the worker pool, off this job. So the
+    # folder-walk job's only stage is ``publish``.
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
         return None
 
-    for name in (
-        "publish_embed_dense_task", "publish_embed_sparse_task",
-        "publish_index_graph_task", "publish_label_task",
-    ):
-        monkeypatch.setattr(broker_module, name, noop_publish)
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
 
     (tmp_path / "a.png").write_bytes(_png_bytes((1, 2, 3)))
     (tmp_path / "b.png").write_bytes(_png_bytes((4, 5, 6)))
@@ -147,13 +128,10 @@ def test_ingest_run_sets_timestamps_and_fast_path_staircase(tmp_path, monkeypatc
     assert final is not None and final["status"] == "completed"
     # Lifecycle timestamps populated (the UI shows created/started/finished).
     assert final["created_at"] and final["started_at"] and final["finished_at"]
-    # Fast-path stage reached once per file (2 files): hash/metadata/catalog +
-    # the index-task publish.
+    # The producer reaches only the publish stage, once per file (2 files).
     sc = final["stage_counts"]
-    for stage in ["hash", "metadata", "catalog", "publish"]:
-        assert sc.get(stage) == 2, f"stage {stage}: {sc.get(stage)}"
-    # The heavy projection stages no longer run on the fast path.
-    for stage in ["vision:dense", "vision:sparse", "search", "graph"]:
-        assert stage not in sc, f"unexpected fast-path stage {stage}"
-    # The final stage of the last file is the index-task publish.
+    assert sc.get("publish") == 2, f"stage publish: {sc.get('publish')}"
+    # No inline processing stages run on the producer side.
+    for stage in ["hash", "metadata", "catalog", "vision:dense", "vision:sparse", "search", "graph"]:
+        assert stage not in sc, f"unexpected producer stage {stage}"
     assert final["current_stage"] == "publish"
