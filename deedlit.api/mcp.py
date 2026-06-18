@@ -118,8 +118,14 @@ async def _semantic_image_search(args: dict[str, Any]) -> Any:
 
 
 async def _find_similar_images(args: dict[str, Any]) -> Any:
-    body = {"sha256": args["image_id"], "limit": args.get("limit", 30)}
-    res = await clients.search("POST", "/similar", json=body)
+    # ``filters`` is advertised in this tool's inputSchema; forward it so the
+    # by-image (similar) path honours the same safety/tag filter as text search.
+    res = await clients.search_similar(
+        args["image_id"],
+        args.get("limit", 30),
+        args.get("filters"),
+        args.get("offset", 0),
+    )
     return {"results": (res or {}).get("hits", [])}
 
 
@@ -296,6 +302,7 @@ MCP_TOOLS: list[dict[str, Any]] = [
                 "image_id": {"type": "string", "minLength": 1},
                 "filters": {"type": "object", "properties": _filter_props()},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 30},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
             },
             "required": ["image_id"],
         },

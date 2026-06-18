@@ -270,6 +270,32 @@ async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) 
     return await search("POST", "/query", json=body)
 
 
+async def search_similar(
+    sha256: str,
+    limit: int,
+    filters: dict[str, Any] | None = None,
+    offset: int = 0,
+) -> Any:
+    """Image-to-image search on deedlit.search, honouring the UI facet filter.
+
+    Mirrors :func:`search_by_text`'s facet handling on the by-image path: the UI's
+    flat camelCase facets are translated into a Qdrant payload filter (tags /
+    excludeTags / safety — see :func:`_to_qdrant_filter`) and forwarded so the
+    same safety/tag filter constrains similar results. Omitted when nothing is
+    translatable, so an unfiltered call keeps the old behaviour.
+
+    ``offset`` pages deeper into the ranked neighbours so the UI can keep loading
+    more proximity results.
+    """
+    body: dict[str, Any] = {"sha256": sha256, "limit": limit}
+    if offset:
+        body["offset"] = offset
+    qfilter = _to_qdrant_filter(filters)
+    if qfilter is not None:
+        body["filter"] = qfilter
+    return await search("POST", "/similar", json=body)
+
+
 async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str, Any]:
     """List cataloged images as search-shaped hits (no-query browse fallback).
 

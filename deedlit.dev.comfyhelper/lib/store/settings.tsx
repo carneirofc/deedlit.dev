@@ -17,6 +17,15 @@ export type ViewMode = "grid" | "list" | "masonry";
 export type GridDensity = "compact" | "comfortable" | "spacious";
 export type ImageFit = "contain" | "cover";
 
+/** AI content-safety class. Mirrors the catalog/labelagent `safety` enum. */
+export type SafetyClass = "sfw" | "nsfw" | "explicit";
+export const SAFETY_CLASSES: readonly SafetyClass[] = ["sfw", "nsfw", "explicit"] as const;
+export const SAFETY_LABEL: Record<SafetyClass, string> = {
+  sfw: "SFW",
+  nsfw: "NSFW",
+  explicit: "Explicit",
+};
+
 /**
  * Result ordering. `relevance` is the vector-search ranking (only meaningful
  * when there is a text/image query); the rest are server-side catalog sorts used
@@ -100,6 +109,12 @@ export interface LibrarySettings {
   defaultFavoritesOnly: boolean;
   /** Default minimum score for semantic / similar / by-image searches. */
   defaultMinScore: number;
+  /**
+   * Content-safety classes the browse/search grid shows by default. All three
+   * (or none) selected = no filter (everything, incl. unclassified); a strict
+   * subset hides the unlisted classes. Seeds the library page's safety chips.
+   */
+  defaultSafety: SafetyClass[];
 
   // --- Slideshow (fullscreen viewer) ---
   /** Seconds each image is shown before the slideshow auto-advances. */
@@ -138,6 +153,7 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   defaultMinRating: 0,
   defaultFavoritesOnly: false,
   defaultMinScore: 0,
+  defaultSafety: ["sfw", "nsfw", "explicit"],
 
   slideshowInterval: 5,
   slideshowLoop: true,
@@ -163,6 +179,13 @@ function mergeSettings(raw: unknown): LibrarySettings {
       : (DEFAULT_SETTINGS[k] as number);
   const oneOf = <T extends string>(k: keyof LibrarySettings, allowed: readonly T[]): T =>
     allowed.includes(r[k] as T) ? (r[k] as T) : (DEFAULT_SETTINGS[k] as unknown as T);
+  // Sanitize a stored multi-select against the allowed set (drop junk, de-dupe);
+  // a non-array falls back to the default.
+  const subsetOf = <T extends string>(k: keyof LibrarySettings, allowed: readonly T[]): T[] => {
+    const v = r[k];
+    if (!Array.isArray(v)) return [...(DEFAULT_SETTINGS[k] as T[])];
+    return Array.from(new Set(v.filter((x): x is T => allowed.includes(x as T))));
+  };
 
   return {
     pageSize: num("pageSize", 10, 200),
@@ -192,6 +215,7 @@ function mergeSettings(raw: unknown): LibrarySettings {
     defaultMinRating: num("defaultMinRating", 0, 5),
     defaultFavoritesOnly: bool("defaultFavoritesOnly"),
     defaultMinScore: num("defaultMinScore", 0, 1),
+    defaultSafety: subsetOf("defaultSafety", SAFETY_CLASSES),
 
     slideshowInterval: num("slideshowInterval", 1, 60),
     slideshowLoop: bool("slideshowLoop"),

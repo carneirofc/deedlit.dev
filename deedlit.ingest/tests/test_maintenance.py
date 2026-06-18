@@ -87,7 +87,7 @@ def mock_outbound(monkeypatch):
         return sha
 
     def _record(key):
-        async def pub(sha256, parent_op_id=None):
+        async def pub(sha256, parent_op_id=None, **kwargs):
             calls[key].append(sha256)
         return pub
 

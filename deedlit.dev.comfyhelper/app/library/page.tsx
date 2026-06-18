@@ -88,8 +88,8 @@ const BROWSE_SORTS: SortMode[] = ["newest", "oldest", "created_desc", "created_a
 const SEARCH_SORTS: SortMode[] = ["relevance", "rating_desc", "rating_asc"];
 
 // How many pages to warm in the background beyond what's rendered, so "load
-// more" / infinite scroll lands instantly. Only the offset-paged browse/search
-// paths prefetch (similar / by-image are single-page).
+// more" / infinite scroll lands instantly. The offset-paged paths prefetch
+// (browse / search / similar); by-image is single-page.
 const PREFETCH_AHEAD = 2;
 // Upper bound on the cold restore from `?page=N` — it costs up to N sequential
 // page fetches, so cap it however deep the address claims the user had paged.
@@ -128,10 +128,14 @@ export default function LibraryPage() {
   const [query, setQuery] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [excludeTags, setExcludeTags] = useState<string[]>([]);
+  // Full tag catalog backing the primary filter's show-all-tags picker.
+  const [allTags, setAllTags] = useState<string[]>([]);
   const [modelFamily, setModelFamily] = useState("");
   const [checkpoint, setCheckpoint] = useState("");
   const [loras, setLoras] = useState("");
   const [sourceTool, setSourceTool] = useState("");
+  // On-disk path fragment — a catalog-backed browse filter (file_path substring).
+  const [pathFilter, setPathFilter] = useState("");
   const [favorites, setFavorites] = useState(settings.defaultFavoritesOnly);
   const [minRating, setMinRating] = useState(settings.defaultMinRating);
   // Content-safety multi-select: which classes to SHOW. All on = no filter.
@@ -221,13 +225,13 @@ export default function LibraryPage() {
   // even when called from callbacks that close over an older render.
   const filtersRef = useRef({
     mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
-    favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
+    pathFilter, favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
     sort: settings.sortMode,
   });
   useEffect(() => {
     filtersRef.current = {
       mode, query, tags, excludeTags, modelFamily, checkpoint, loras, sourceTool,
-      favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
+      pathFilter, favorites, minRating, safety, limit, minScore, similarRef, imageFile, graphScope,
       sort: settings.sortMode,
     };
   });
@@ -266,12 +270,12 @@ export default function LibraryPage() {
         const r = await fetch("/api/library/search/similar", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ imageId: s.similarRef.id, filters, limit: pageSize, minScore: s.minScore, graphScope: s.graphScope ?? undefined }),
+          body: JSON.stringify({ imageId: s.similarRef.id, filters, limit: pageSize, offset: pageOffset, minScore: s.minScore, graphScope: s.graphScope ?? undefined }),
           signal,
         });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error ?? "Similarity search failed");
-        return { fresh: j.results ?? [], more: false };
+        return { fresh: j.results ?? [], more: j.hasMore ?? false };
       }
       if (s.mode === "image" && s.imageFile) {
         const fd = new FormData();
@@ -301,6 +305,7 @@ export default function LibraryPage() {
             favorite: filters.favorite,
             ratingGte: filters.ratingGte,
             safety: filters.safety,
+            path: s.pathFilter.trim() || undefined,
             sort: browseSort,
             limit: pageSize,
             offset: pageOffset,
@@ -350,15 +355,16 @@ export default function LibraryPage() {
     JSON.stringify({
       mode: s.mode, query: s.query, tags: s.tags, excludeTags: s.excludeTags,
       modelFamily: s.modelFamily, checkpoint: s.checkpoint, loras: s.loras, sourceTool: s.sourceTool,
+      pathFilter: s.pathFilter,
       favorites: s.favorites, minRating: s.minRating, safety: s.safety, limit: s.limit,
       minScore: s.minScore, similar: s.similarRef?.id ?? null, image: !!s.imageFile,
       graphScope: s.graphScope, sort: s.sort,
     });
 
-  // similar / by-image return a single relevance-ranked window (no offset), so
-  // there are no further pages to warm.
+  // by-image returns a single relevance-ranked window (no offset), so there are
+  // no further pages to warm. Similar now pages by rank offset like browse/search.
   const paginates = (s: typeof filtersRef.current): boolean =>
-    s.mode !== "similar" && !(s.mode === "image" && s.imageFile);
+    !(s.mode === "image" && s.imageFile);
 
   // Abort outstanding prefetches and rebind the buffer to a new filter signature.
   const resetPrefetch = useCallback((s: typeof filtersRef.current) => {
@@ -907,6 +913,7 @@ export default function LibraryPage() {
     setFavorites(settings.defaultFavoritesOnly);
     setMinRating(settings.defaultMinRating);
     setMinScore(settings.defaultMinScore);
+    setSafety(settings.defaultSafety);
     setLimit(settings.pageSize);
     // State setters above don't reach filtersRef before this runs, so pass the
     // full snapshot as overrides — to the initial load AND every restore page.
@@ -917,6 +924,7 @@ export default function LibraryPage() {
       favorites: settings.defaultFavoritesOnly,
       minRating: settings.defaultMinRating,
       minScore: settings.defaultMinScore,
+      safety: settings.defaultSafety,
       limit: settings.pageSize,
       similarRef: null,
       imageFile: null,
@@ -975,6 +983,7 @@ export default function LibraryPage() {
       favorite: favorites || undefined,
       ratingGte: minRating > 0 ? minRating : undefined,
       safety: safetySubset,
+      path: pathFilter.trim() || undefined,
       sort: "newest" as const,
       // Pull a small window when we may splice (catch a short burst of arrivals);
       // a single row is enough just to detect change for the banner path.
@@ -1025,7 +1034,7 @@ export default function LibraryPage() {
       alive = false;
       clearInterval(id);
     };
-  }, [mode, query, tags, excludeTags, favorites, minRating, safety, settings.sortMode, invalidatePrefetchPages]);
+  }, [mode, query, tags, excludeTags, favorites, minRating, safety, pathFilter, settings.sortMode, invalidatePrefetchPages]);
 
   const startIngest = async () => {
     if (!folderPath.trim()) return;
@@ -1064,6 +1073,18 @@ export default function LibraryPage() {
     } catch {
       return [];
     }
+  }, []);
+
+  // Whole tag catalog for the primary filter's "show all tags" picker (ranked
+  // most-used first). Fetched once on mount; the picker lists every tag and the
+  // input just narrows the list client-side, instead of a blind type-ahead.
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/library/tags?limit=2000")
+      .then((r) => (r.ok ? r.json() : { tags: [] }))
+      .then((j) => { if (alive && Array.isArray(j.tags)) setAllTags(j.tags as string[]); })
+      .catch(() => { /* quiet — the picker just stays empty */ });
+    return () => { alive = false; };
   }, []);
 
   // The vector path can't sort by date/name (its rows lack them), so honour a
@@ -1266,14 +1287,18 @@ export default function LibraryPage() {
             </div>
           )}
 
-          {/* Primary filter: tags with live, library-wide autocomplete. Adding /
-              removing a chip re-searches instantly (cheap server filter). */}
+          {/* Primary filter: shows the WHOLE tag catalog to pick from (ranked
+              most-used first); typing just narrows the list. Adding / removing a
+              chip re-searches instantly (cheap server filter). Falls back to the
+              live prefix type-ahead until the catalog has loaded. */}
           <TagSelect
             value={tags}
             onChange={setTags}
             onCommit={(next) => doFetch(false, { tags: next })}
-            fetchSuggestions={fetchTagSuggestions}
-            placeholder="filter by tag — type to add, pick from suggestions…"
+            suggestions={allTags}
+            fetchSuggestions={allTags.length ? undefined : fetchTagSuggestions}
+            maxSuggestions={500}
+            placeholder="filter by tag — pick from the list, or type to narrow…"
             variant="include"
           />
 
@@ -1369,9 +1394,23 @@ export default function LibraryPage() {
           {showAdvanced && (
             <div className="grid gap-3 rounded-lg border border-ui-border/40 bg-ui-bg/40 p-3 sm:grid-cols-2 lg:grid-cols-3">
               <p className="col-span-full text-ui-2xs text-ui-ink-muted/70">
-                Tags, rating, favorite & safety filter plain browsing too. Model,
-                checkpoint, LoRA & source-tool apply when a text or image search is active.
+                Tags, rating, favorite, safety & path filter plain browsing too.
+                Model, checkpoint, LoRA & source-tool apply when a text or image
+                search is active.
               </p>
+              <label className={`${cls.label} col-span-full`}>
+                Path contains
+                <input
+                  className={cls.input}
+                  placeholder="folder or filename fragment — e.g. 2024/portraits or _upscaled"
+                  value={pathFilter}
+                  onChange={(e) => setPathFilter(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && doFetch(false, { pathFilter: e.currentTarget.value })}
+                />
+                <span className="text-ui-2xs normal-case tracking-normal text-ui-ink-muted/70">
+                  matches the on-disk image path (any separator); applies to plain browsing
+                </span>
+              </label>
               <label className={cls.label}>
                 Exclude tags
                 <TagSelect

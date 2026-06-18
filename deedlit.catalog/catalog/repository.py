@@ -231,6 +231,7 @@ def _image_filters(
     favorite: bool | None,
     rating_gte: int | None,
     safety: list[str] | None,
+    path: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build the shared WHERE clause + bind params for the browse filters.
 
@@ -274,6 +275,17 @@ def _image_filters(
         # filter, which is what the UI's "show these classes" chips intend.
         clauses.append("i.safety = ANY(:safety)")
         params["safety"] = list(safety)
+    needle = (path or "").strip()
+    if needle:
+        # Separator-insensitive SUBSTRING match over the on-disk path: lets the
+        # caller filter by any folder/filename fragment regardless of the OS
+        # separator the file was ingested with (Windows backslash vs forward
+        # slash — see _folder_counts). strpos avoids the LIKE metacharacter /
+        # escape pitfalls of the backslashes and %/_ that real paths contain.
+        clauses.append(
+            "strpos(lower(replace(i.file_path, '\\', '/')), lower(:path_q)) > 0"
+        )
+        params["path_q"] = needle.replace("\\", "/")
 
     return " AND ".join(clauses), params
 
@@ -288,13 +300,16 @@ def list_images(
     offset: int,
     safety: list[str] | None = None,
     sort: str = "newest",
+    path: str | None = None,
 ) -> list[Image]:
     """Browse the catalog with AND-combined filters and a whitelisted sort.
 
     `tags` matches images carrying EVERY listed tag; `exclude_tags` drops images
-    carrying ANY of them. Tag membership uses correlated EXISTS subqueries so the
-    row set never multiplies (no JOIN/DISTINCT) and the ORDER BY can reference the
-    image columns directly. Unknown `sort` falls back to newest-first.
+    carrying ANY of them. `path` keeps only images whose on-disk file path
+    contains the given fragment (separator-insensitive). Tag membership uses
+    correlated EXISTS subqueries so the row set never multiplies (no
+    JOIN/DISTINCT) and the ORDER BY can reference the image columns directly.
+    Unknown `sort` falls back to newest-first.
     """
     eng = get_engine()
     where, params = _image_filters(
@@ -303,6 +318,7 @@ def list_images(
         favorite=favorite,
         rating_gte=rating_gte,
         safety=safety,
+        path=path,
     )
     params.update({"limit": limit, "offset": offset})
     order_by = _ORDER_BY.get(sort, _ORDER_BY["newest"])
@@ -334,6 +350,7 @@ def count_images(
     favorite: bool | None = None,
     rating_gte: int | None = None,
     safety: list[str] | None = None,
+    path: str | None = None,
 ) -> int:
     """Total images matching the same filters as ``list_images``.
 
@@ -347,6 +364,7 @@ def count_images(
         favorite=favorite,
         rating_gte=rating_gte,
         safety=safety,
+        path=path,
     )
     eng = get_engine()
     with eng.connect() as conn:

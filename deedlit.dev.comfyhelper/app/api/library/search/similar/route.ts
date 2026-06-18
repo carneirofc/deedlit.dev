@@ -19,15 +19,31 @@ export async function POST(request: Request) {
     const tool = await callMcpTool("find_similar_images", {
       image_id: body.imageId,
       limit: body.limit,
+      offset: body.offset,
+      // Forward the active facet filter so by-image results honour the same
+      // safety/tag filter as text search (tags/excludeTags/safety apply on the
+      // vector path; the gateway translates them to a Qdrant filter).
+      ...(body.filters ? { filters: body.filters } : {}),
     });
     const structured = (tool.structuredContent ?? {}) as { results?: SearchHit[] };
-    let results = hitsToCompactResults(structured.results ?? []);
+    const raw = hitsToCompactResults(structured.results ?? []);
+    let results = raw;
+    // minScore is a client-side cutoff; the gateway has no minScore knob. Hits
+    // come back sorted by descending score, so the first time a full page drops
+    // any row below the threshold we've reached the boundary — nothing deeper
+    // can qualify, so stop paging there.
+    let cutoff = false;
     if (body.minScore > 0) {
-      results = results.filter((r) => (r.score ?? 0) >= body.minScore);
+      results = raw.filter((r) => (r.score ?? 0) >= body.minScore);
+      cutoff = results.length < raw.length;
     }
+    // A full page (raw === requested limit) means more neighbours likely exist;
+    // a short page is the end. The minScore boundary also ends paging.
+    const hasMore = raw.length >= body.limit && !cutoff;
     return jsonOk({
       results,
       count: results.length,
+      hasMore,
       provider: "deedlit.search",
       semantic: true,
     });

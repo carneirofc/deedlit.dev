@@ -17,11 +17,9 @@ const nextConfig: NextConfig = {
     externalDir: true
   },
   output: 'standalone',
-  images: {
-    // Use custom loader for our /image route
-    loader: 'custom',
-    loaderFile: './src/lib/image-loader.ts',
-  },
+  // Image optimization (resize + WebP/AVIF) is left to Next's built-in
+  // optimizer. The /image?id=… route is a same-origin local path, so the
+  // default loader serves resized variants via /_next/image and caches them.
 };
 
 export default nextConfig;

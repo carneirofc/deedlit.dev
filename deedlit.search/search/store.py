@@ -35,6 +35,12 @@ class SearchStore:
         self.config = config
         self.client = QdrantClient(url=config.qdrant_url)
         self.collection = config.collection
+        # Once we've confirmed/created the collection, remember it so the upsert
+        # hot path stops probing Qdrant (`collection_exists`) on every single
+        # point — that probe was a full Qdrant round-trip per upsert. Reset by
+        # drop_collection so a rebuild re-creates it. A stale-True only costs one
+        # failed upsert that the broker retries, so the unsynchronised bool is safe.
+        self._ensured = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -42,8 +48,16 @@ class SearchStore:
         return self.client.collection_exists(self.collection)
 
     def ensure_collection(self) -> None:
-        """Create the collection with named dense + sparse vectors if missing."""
+        """Create the collection with named dense + sparse vectors if missing.
+
+        Cached after the first success: the per-upsert call is then a no-op (no
+        Qdrant round-trip), so a burst of index.search upserts hits Qdrant once
+        per point instead of twice.
+        """
+        if self._ensured:
+            return
         if self.collection_exists():
+            self._ensured = True
             return
         self.client.create_collection(
             collection_name=self.collection,
@@ -66,15 +80,44 @@ class SearchStore:
                 ),
             },
         )
+        self._ensured = True
 
     def drop_collection(self) -> None:
         if self.collection_exists():
             self.client.delete_collection(self.collection)
+        self._ensured = False  # force the next ensure_collection to recreate
 
     def close(self) -> None:
         self.client.close()
 
     # -- writes -------------------------------------------------------------
+
+    def _point_struct(
+        self,
+        sha256: str,
+        dense: list[float],
+        sparse: SparseVector | None,
+        payload: dict[str, Any] | None,
+        description: list[float] | None = None,
+    ) -> Any:
+        """Build one PointStruct (id = uuid5(sha256), named vectors + payload).
+
+        ``description`` is the optional CLIP-text vector; stored under its own
+        named vector only when present so a point without one still indexes on
+        ``dense`` (+ ``sparse``)."""
+        vector: dict[str, Any] = {DENSE_VECTOR_NAME: dense}
+        if description is not None:
+            vector[DESCRIPTION_VECTOR_NAME] = description
+        if sparse is not None:
+            vector[SPARSE_VECTOR_NAME] = models.SparseVector(
+                indices=sparse.indices, values=sparse.values
+            )
+        full_payload = dict(payload or {})
+        # Always carry the canonical cross-service id in the payload.
+        full_payload[SHA256_PAYLOAD_KEY] = sha256.lower()
+        return models.PointStruct(
+            id=point_id_for_sha256(sha256), vector=vector, payload=full_payload
+        )
 
     def upsert_point(
         self,
@@ -84,37 +127,30 @@ class SearchStore:
         payload: dict[str, Any] | None,
         description: list[float] | None = None,
     ) -> str:
-        """Upsert one point keyed by uuid5(sha256). Returns the point id.
+        """Upsert one point keyed by uuid5(sha256). Returns the point id."""
+        return self.upsert_points(
+            [(sha256, dense, sparse, payload, description)]
+        )[0]
 
-        ``description`` is the optional CLIP-text vector of the AI description; it
-        is stored under its own named vector only when present, so images without
-        a description still index on ``dense`` (+ ``sparse``).
+    def upsert_points(
+        self,
+        items: list[tuple[str, list[float], SparseVector | None, dict[str, Any] | None, list[float] | None]],
+    ) -> list[str]:
+        """Upsert MANY points in ONE Qdrant call. Returns the point ids in order.
+
+        The ingest hot path posts one point per image, but a scaled worker pool
+        lands hundreds concurrently; coalescing them into a single ``upsert`` (one
+        Qdrant round-trip + one WAL flush for the whole batch instead of per point)
+        is the dominant throughput lever for index.search. ``wait=True`` so the
+        batch is queryable the moment this returns — every caller that awaited this
+        flush keeps read-after-write. Idempotent: a duplicate point id just
+        overwrites.
         """
-        point_id = point_id_for_sha256(sha256)
-
-        vector: dict[str, Any] = {DENSE_VECTOR_NAME: dense}
-        if description is not None:
-            vector[DESCRIPTION_VECTOR_NAME] = description
-        if sparse is not None:
-            vector[SPARSE_VECTOR_NAME] = models.SparseVector(
-                indices=sparse.indices, values=sparse.values
-            )
-
-        full_payload = dict(payload or {})
-        # Always carry the canonical cross-service id in the payload.
-        full_payload[SHA256_PAYLOAD_KEY] = sha256.lower()
-
-        self.client.upsert(
-            collection_name=self.collection,
-            points=[
-                models.PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload=full_payload,
-                )
-            ],
-        )
-        return point_id
+        if not items:
+            return []
+        points = [self._point_struct(*item) for item in items]
+        self.client.upsert(collection_name=self.collection, points=points, wait=True)
+        return [p.id for p in points]
 
     def delete_point(self, sha256: str) -> str:
         """Delete the point keyed by ``uuid5(sha256)``. Idempotent.
@@ -205,16 +241,41 @@ class SearchStore:
         )
         return "rrf", self._to_hits(result.points)
 
-    def query_similar(self, sha256: str, limit: int) -> list[Hit]:
-        """Nearest neighbors to a stored point's dense vector (excludes self)."""
+    def query_similar(
+        self,
+        sha256: str,
+        limit: int,
+        query_filter: dict[str, Any] | None = None,
+        offset: int = 0,
+    ) -> list[Hit]:
+        """Nearest neighbors to a stored point's dense vector (excludes self).
+
+        ``query_filter`` is the SAME payload-filter shape as :meth:`query_hybrid`
+        (e.g. a safety/tag filter). Without it, image-to-image search returned
+        neighbours across ALL payloads — so the UI's safety/tag filter had no
+        effect on by-image results; pass it through so the filter applies here too.
+
+        ``offset`` pages deeper into the ranked neighbours so similar/by-image can
+        keep loading more, mirroring /query pagination. The query point itself is
+        dropped via a ``must_not`` on its sha256 (rather than over-fetching and
+        filtering it out afterwards) so neighbour ranks line up exactly with
+        ``offset``/``limit`` — pagination is gapless and never duplicates a row.
+        """
         point_id = point_id_for_sha256(sha256)
-        # Ask for one extra so we can drop the query point itself.
+        # Exclude the query point itself with a payload filter so it never eats a
+        # result slot — keeps offset paging exact even when a user filter is also
+        # in play (its conditions merge with ours).
+        merged = dict(query_filter or {})
+        must_not = list(merged.get("must_not") or [])
+        must_not.append({"key": SHA256_PAYLOAD_KEY, "match": {"value": sha256.lower()}})
+        merged["must_not"] = must_not
         result = self.client.query_points(
             collection_name=self.collection,
             query=point_id,
             using=DENSE_VECTOR_NAME,
-            limit=limit + 1,
+            limit=limit,
+            offset=offset,
+            query_filter=self._filter(merged),
             with_payload=True,
         )
-        hits = self._to_hits(result.points)
-        return [h for h in hits if h.sha256 != sha256.lower()][:limit]
+        return self._to_hits(result.points)

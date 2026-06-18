@@ -14,8 +14,11 @@ if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
     _otel_initialize()
     del _otel_initialize
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,17 +84,79 @@ def health() -> Health:
     return Health(status="ok", collection_ready=ready)
 
 
-@app.post("/points")
-def upsert_point(point: UpsertPoint) -> dict:
+# --- Upsert micro-batcher -------------------------------------------------
+# The ingest hot path POSTs /points one point per image; a scaled index.search
+# worker pool lands hundreds concurrently. On Qdrant each single-point upsert is
+# its own round-trip + WAL flush — the index.search bottleneck. The batcher
+# coalesces concurrent /points calls that arrive within a short window into ONE
+# `upsert(points=[...])`, amortising the round-trip + flush over the whole batch.
+# Each caller still awaits its flush (which runs wait=True), so read-after-write
+# holds: the point is queryable the moment the POST returns.
+#   SEARCH_UPSERT_BATCH_MAX:     max points per Qdrant upsert.
+#   SEARCH_UPSERT_BATCH_WAIT_MS: how long the first waiter accumulates a batch.
+UPSERT_BATCH_MAX = max(1, int(os.getenv("SEARCH_UPSERT_BATCH_MAX", "64")))
+UPSERT_BATCH_WAIT_MS = max(0.0, float(os.getenv("SEARCH_UPSERT_BATCH_WAIT_MS", "10")))
+
+# Loop-bound (recreated if the running loop changes, e.g. across TestClient
+# requests) so a Future is never awaited on a foreign loop.
+_upsert_queue: asyncio.Queue | None = None
+_upsert_task: asyncio.Task | None = None
+_upsert_loop: Any = None
+
+
+async def _upsert_batch_loop(queue: asyncio.Queue) -> None:
+    """Drain ``queue`` forever, flushing each coalesced batch in one Qdrant upsert."""
+    loop = asyncio.get_running_loop()
     store = get_store()
-    store.ensure_collection()
-    point_id = store.upsert_point(
-        sha256=point.sha256,
-        dense=point.dense,
-        sparse=point.sparse,
-        payload=point.payload,
-        description=point.description,
-    )
+    while True:
+        item, fut = await queue.get()
+        batch: list[tuple[tuple, asyncio.Future]] = [(item, fut)]
+        deadline = loop.time() + UPSERT_BATCH_WAIT_MS / 1000.0
+        while len(batch) < UPSERT_BATCH_MAX:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(queue.get(), remaining))
+            except asyncio.TimeoutError:
+                break
+
+        items = [it for it, _ in batch]
+
+        def _flush() -> list[str]:
+            store.ensure_collection()  # cached after first call (no round-trip)
+            return store.upsert_points(items)
+
+        try:
+            ids = await asyncio.to_thread(_flush)
+            for (_, f), pid in zip(batch, ids):
+                if not f.done():
+                    f.set_result(pid)
+        except Exception as exc:  # propagate the same failure to every waiter
+            for _, f in batch:
+                if not f.done():
+                    f.set_exception(exc)
+
+
+def _get_upsert_queue() -> asyncio.Queue:
+    """Return (lazily creating) the per-loop upsert queue + its drain task."""
+    global _upsert_queue, _upsert_task, _upsert_loop
+    loop = asyncio.get_running_loop()
+    if _upsert_queue is None or _upsert_loop is not loop:
+        _upsert_queue = asyncio.Queue()
+        _upsert_loop = loop
+        _upsert_task = loop.create_task(_upsert_batch_loop(_upsert_queue))
+    return _upsert_queue
+
+
+@app.post("/points")
+async def upsert_point(point: UpsertPoint) -> dict:
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    await _get_upsert_queue().put((
+        (point.sha256, point.dense, point.sparse, point.payload, point.description),
+        fut,
+    ))
+    point_id = await fut
     return {"status": "ok", "id": point_id, "sha256": point.sha256.lower()}
 
 
@@ -128,15 +193,20 @@ def query(body: HybridQuery) -> QueryResponse:
 
 @app.post("/similar", response_model=QueryResponse)
 def similar(body: SimilarQuery) -> QueryResponse:
-    hits = get_store().query_similar(body.sha256, body.limit)
+    hits = get_store().query_similar(
+        body.sha256, body.limit, query_filter=body.filter, offset=body.offset
+    )
     return QueryResponse(fusion="dense", hits=hits)
 
 
 @app.post("/by-image", response_model=QueryResponse)
 def by_image(body: SimilarQuery) -> QueryResponse:
     # Image-to-image search reuses a stored point's dense vector, which is
-    # exactly the "nearest to this point" operation.
-    hits = get_store().query_similar(body.sha256, body.limit)
+    # exactly the "nearest to this point" operation. ``filter`` (when supplied)
+    # applies the same payload filter as /query so by-image honours the UI filter.
+    hits = get_store().query_similar(
+        body.sha256, body.limit, query_filter=body.filter, offset=body.offset
+    )
     return QueryResponse(fusion="dense", hits=hits)
 
 

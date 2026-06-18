@@ -28,7 +28,11 @@ log = logging.getLogger("deedlit.ingest.jobs")
 
 
 async def _publish_stage_best_effort(
-    publisher: Callable[..., Any], queue: str, sha256: str, parent_op_id: str | None = None
+    publisher: Callable[..., Any],
+    queue: str,
+    sha256: str,
+    parent_op_id: str | None = None,
+    **pub_kwargs: Any,
 ) -> bool:
     """Publish one per-image stage task, swallowing broker errors (ADR 0001/0002).
 
@@ -37,9 +41,10 @@ async def _publish_stage_best_effort(
     reconcile / label-backfill sweeps re-enqueue it once the broker is back.
     Records ``queued`` on the ledger best-effort (off the critical path). Returns
     True on a successful publish (lets callers/tests assert the happy path).
+    ``pub_kwargs`` forwards stage-specific publish args (e.g. embed.dense's ``path``).
     """
     try:
-        await publisher(sha256, parent_op_id=parent_op_id)
+        await publisher(sha256, parent_op_id=parent_op_id, **pub_kwargs)
     except Exception as exc:  # noqa: BLE001 — best-effort by design
         log.warning(
             "%s publish failed for %s (%s); a sweep will re-enqueue", queue, sha256[:12], exc
@@ -51,9 +56,15 @@ async def _publish_stage_best_effort(
     return True
 
 
-async def _publish_embed_dense_best_effort(sha256: str, parent_op_id: str | None = None) -> bool:
+async def _publish_embed_dense_best_effort(
+    sha256: str, parent_op_id: str | None = None, path: str | None = None
+) -> bool:
+    # Forward ``path`` only when known so the re-publish callers (reconcile /
+    # rebuild) keep the bare (sha, parent_op_id) publish shape unchanged.
+    extra = {"path": path} if path else {}
     return await _publish_stage_best_effort(
-        broker.publish_embed_dense_task, broker.EMBED_DENSE_QUEUE, sha256, parent_op_id
+        broker.publish_embed_dense_task, broker.EMBED_DENSE_QUEUE, sha256, parent_op_id,
+        **extra,
     )
 
 
@@ -116,21 +127,30 @@ async def _publish_reproject_best_effort(sha256: str, parent_op_id: str | None =
     return all(results)
 
 
-async def _publish_post_ingest_best_effort(sha256: str, parent_op_id: str | None = None) -> None:
+async def _publish_post_ingest_best_effort(
+    sha256: str, parent_op_id: str | None = None, path: str | None = None
+) -> None:
     """Enqueue the per-stage DAG after a fast-path catalog write (ADR 0002).
 
-    Fans out the four downstream stages — embed.dense + embed.sparse (which both
-    fan in to index.search), index.graph, and label. Each is best-effort: a broker
-    hiccup leaves the image cataloged-but-unprojected, and reconcile (embed/index)
-    + label-backfill re-enqueue once the broker returns. The four are independent,
-    so they are published CONCURRENTLY.
+    Fans out the downstream stages — embed.dense + embed.sparse (which both fan in
+    to index.search), index.graph, and (when LLM enrichment is enabled) label.
+    Each is best-effort: a broker hiccup leaves the image cataloged-but-unprojected,
+    and reconcile (embed/index) + label-backfill re-enqueue once the broker returns.
+    They are independent, so they are published CONCURRENTLY. ``path`` (the on-disk
+    source) rides to embed.dense so the GPU stage skips the catalog filepath lookup.
+
+    The ``label`` stage is skipped when the vision-LLM master switch is off
+    (:func:`llm_enabled`) — the image is still fully cataloged + projected, just
+    without an AI description/safety/tags.
     """
-    await asyncio.gather(
-        _publish_embed_dense_best_effort(sha256, parent_op_id),
+    publishes = [
+        _publish_embed_dense_best_effort(sha256, parent_op_id, path=path),
         _publish_embed_sparse_best_effort(sha256, parent_op_id),
         _publish_index_graph_best_effort(sha256, parent_op_id),
-        _publish_label_best_effort(sha256, parent_op_id),
-    )
+    ]
+    if llm_enabled():
+        publishes.append(_publish_label_best_effort(sha256, parent_op_id))
+    await asyncio.gather(*publishes)
 
 
 def _now_iso() -> str:
@@ -175,6 +195,17 @@ def ingest_via_queue() -> bool:
     settings panel without a restart.
     """
     return config.runtime()["ingest_via_queue"]
+
+
+def llm_enabled() -> bool:
+    """Master switch for the vision-LLM (labelagent) enrichment stage (ADR 0001).
+
+    Read live from :mod:`config` (env default + settings-panel override), so the
+    label stage can be turned off from the UI without a restart. When off, the
+    producer skips publishing ``label`` tasks and the label-backfill sweep no-ops
+    — images are cataloged + projected without an AI description/safety/tags.
+    """
+    return config.runtime()["llm_enabled"]
 
 # Maintenance job types (mirrors MaintenanceRequest.type in the contract).
 REINDEX_ONE_IMAGE = "reindex-one-image"
@@ -801,7 +832,16 @@ class JobStore:
         (describe -> patch catalog -> re-index). Also the safety net for label
         publishes missed during a broker outage. Cancellation is checked between
         publishes; a publish hiccup increments ``failed`` rather than aborting.
+
+        No-op when the vision-LLM master switch is off (:func:`llm_enabled`) — the
+        sweep exists to ADD AI descriptions, so it has nothing to do while LLM
+        enrichment is disabled; it completes immediately with zero work.
         """
+        if not llm_enabled():
+            job.progress.total = 0
+            job.status = COMPLETED
+            log.info("label-backfill %s skipped: LLM processing is disabled", job.id)
+            return
         shas = await asyncio.to_thread(pipeline.list_unlabeled_sha256)
         job.progress.total = len(shas)
         for sha in shas:
@@ -857,7 +897,7 @@ class JobStore:
             # broker outage must not fail the catalog write — the reconcile and
             # label-backfill sweeps re-enqueue once the broker is back.
             on_stage("publish")
-            await _publish_post_ingest_best_effort(sha256, parent_op_id=job.id)
+            await _publish_post_ingest_best_effort(sha256, parent_op_id=job.id, path=str(path))
             self._seen_sha256.add(sha256)
             job.progress.done += 1
             log.info(

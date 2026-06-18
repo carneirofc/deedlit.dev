@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import { Gallery } from "@deedlit.dev/ui";
@@ -19,6 +19,25 @@ interface GallerySectionProps {
 interface GalleryApiResponse {
   assets: ImageAsset[];
 }
+
+// Memoized so opening the modal / typing in search / the refresh poll
+// re-renders GallerySection without re-rendering (and re-decoding) every
+// thumbnail. Props are primitive strings, so React.memo bails on equality.
+const GalleryCard = memo(function GalleryCard({ src, alt }: { src: string; alt: string }) {
+  return (
+    <div className="relative overflow-hidden rounded-lg">
+      <div className="relative aspect-[3/4]">
+        <Image
+          src={src}
+          alt={alt}
+          fill
+          sizes="(max-width: 768px) 100vw, (max-width: 1280px) 50vw, 33vw"
+          className="object-cover transition-transform duration-500 group-hover:scale-[1.03]"
+        />
+      </div>
+    </div>
+  );
+});
 
 function hasAssetListChanged(current: ImageAsset[], next: ImageAsset[]) {
   if (current.length !== next.length) return true;
@@ -58,27 +77,20 @@ export function GallerySection({ assets }: GallerySectionProps) {
   }, []);
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      void refreshAssets();
-    }, 12000);
-
-    const onFocus = () => {
-      void refreshAssets();
-    };
-
-    const onVisibility = () => {
+    // Poll only while the tab is visible, and refresh once on return to it.
+    // Single trigger avoids the focus + visibilitychange double-fire.
+    const maybeRefresh = () => {
       if (document.visibilityState === "visible") {
         void refreshAssets();
       }
     };
 
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibility);
+    const intervalId = window.setInterval(maybeRefresh, 30000);
+    document.addEventListener("visibilitychange", maybeRefresh);
 
     return () => {
       window.clearInterval(intervalId);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("visibilitychange", maybeRefresh);
     };
   }, [refreshAssets]);
 
@@ -187,19 +199,7 @@ export function GallerySection({ assets }: GallerySectionProps) {
           cardClassName="rounded-xl2 bg-surface/75 p-3 shadow-soft"
           mediaClassName="focus-ring w-full"
           onOpen={(index) => openModal(index)}
-          renderMedia={(asset) => (
-            <div className="relative overflow-hidden rounded-lg">
-              <div className="relative aspect-[3/4]">
-                <Image
-                  src={asset.src}
-                  alt={asset.title}
-                  fill
-                  sizes="(max-width: 768px) 100vw, (max-width: 1280px) 50vw, 33vw"
-                  className="object-cover transition-transform duration-500 group-hover:scale-[1.03]"
-                />
-              </div>
-            </div>
-          )}
+          renderMedia={(asset) => <GalleryCard src={asset.src} alt={asset.title} />}
           renderMeta={(asset) => (
             <div className="mt-3">
               <a

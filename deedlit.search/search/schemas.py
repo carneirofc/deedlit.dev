@@ -38,6 +38,13 @@ class HybridQuery(BaseModel):
 class SimilarQuery(BaseModel):
     sha256: str = Field(pattern=SHA256_PATTERN)
     limit: int = 24
+    # Rank offset into the neighbour list, so similar/by-image can paginate the
+    # same way /search does (deeper proximity pages). 0 = the nearest window.
+    offset: int = Field(default=0, ge=0)
+    # Same payload-filter shape as HybridQuery (e.g. a safety/tag filter). When
+    # given it is applied to image-to-image (/by-image, /similar) results too, so
+    # the UI's filter holds on by-image search.
+    filter: dict[str, Any] | None = None
 
 
 class Hit(BaseModel):

@@ -31,6 +31,14 @@ def _env_bool(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_bool_default(name: str, default: bool) -> bool:
+    """``_env_bool`` with an explicit default for when the env var is unset."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def runtime() -> dict[str, Any]:
     """The effective config = env defaults with any live overrides applied."""
     return {
@@ -43,6 +51,14 @@ def runtime() -> dict[str, Any]:
         ),
         # Route the scan through the `ingest` queue (cross-process pool) instead.
         "ingest_via_queue": bool(_overrides.get("ingest_via_queue", _env_bool("INGEST_VIA_QUEUE"))),
+        # Master switch for the vision-LLM (labelagent) enrichment stage. When off,
+        # ingest skips publishing `label` tasks (and the label worker no-ops any
+        # already-queued ones), so images are cataloged + projected WITHOUT an AI
+        # description/safety/tags. On by default; the labelagent must also be
+        # configured (LABELAGENT_URL) for it to actually run.
+        "llm_enabled": _env_bool_default("INGEST_LLM_ENABLED", True)
+        if _overrides.get("llm_enabled") is None
+        else bool(_overrides["llm_enabled"]),
     }
 
 
@@ -52,6 +68,8 @@ def update(patch: dict[str, Any]) -> dict[str, Any]:
         _overrides["ingest_concurrency"] = max(1, int(patch["ingest_concurrency"]))
     if patch.get("ingest_via_queue") is not None:
         _overrides["ingest_via_queue"] = bool(patch["ingest_via_queue"])
+    if patch.get("llm_enabled") is not None:
+        _overrides["llm_enabled"] = bool(patch["llm_enabled"])
     return runtime()
 
 

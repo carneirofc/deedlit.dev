@@ -24,8 +24,10 @@ import logging
 import os
 
 import broker
+import config
 import ledger
 import pipeline
+import settings_client
 
 # Mirror app.py's package-logger setup so the worker's per-task logs are visible
 # (uvicorn isn't running here to configure logging for us).
@@ -54,6 +56,12 @@ async def label_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("label task missing sha256")
+    # Master switch: when LLM enrichment is off, drop any label task already in the
+    # queue (or one a producer published before the toggle reached it) as a clean
+    # no-op so it isn't described. The producer also skips publishing new ones.
+    if not config.runtime()["llm_enabled"]:
+        log.info("label %s skipped: LLM processing is disabled", sha256[:12])
+        return
     changed = await pipeline.maybe_await(pipeline.label_image(sha256))
     if changed:
         parent = payload.get("parent_op_id")
@@ -75,7 +83,16 @@ async def ingest_handler(payload: dict) -> None:
     if not path:
         raise ValueError("ingest task missing path")
     sha256 = await pipeline.maybe_await(pipeline.ingest_path(path))
-    await broker.publish_post_ingest(sha256, parent_op_id=payload.get("parent_op_id"))
+    # Carry the disk path to embed.dense so the GPU stage reads bytes straight off
+    # disk instead of a catalog round-trip for the filepath (the GPU-feeding hop).
+    # Skip the label stage when the vision-LLM master switch is off (live config,
+    # seeded from the persisted UI override at worker startup).
+    await broker.publish_post_ingest(
+        sha256,
+        path=path,
+        parent_op_id=payload.get("parent_op_id"),
+        with_label=config.runtime()["llm_enabled"],
+    )
 
 
 async def embed_dense_handler(payload: dict) -> None:
@@ -88,7 +105,10 @@ async def embed_dense_handler(payload: dict) -> None:
     sha256 = payload.get("sha256")
     if not sha256:
         raise ValueError("embed.dense task missing sha256")
-    await pipeline.maybe_await(pipeline.embed_dense(sha256))
+    # ``path`` (when the producer supplied it) lets embed_dense read the bytes
+    # straight off disk; absent (e.g. a reconcile re-publish) it falls back to the
+    # catalog filepath lookup.
+    await pipeline.maybe_await(pipeline.embed_dense(sha256, path=payload.get("path")))
     await broker.publish_index_search_task(sha256, parent_op_id=payload.get("parent_op_id"))
     log.info("embed.dense %s done -> published index.search", sha256[:12])
 
@@ -139,9 +159,11 @@ HANDLERS = {
 def _ledger_event_factory(queue: str, payload: dict):
     """Build the per-message ledger hook for one delivery (#27).
 
-    Records running/done/failed/dlq to the catalog tasks ledger, best-effort
-    (record_task swallows its own errors). Runs in a thread (httpx is sync) so it
-    never blocks the consumer event loop.
+    Records done/failed/dlq to the catalog tasks ledger, best-effort. The
+    high-frequency ``running`` transition is dropped — queued/done/failed/dlq are
+    enough for the queue UI and it halves consumer-side ledger writes. Each write
+    is fire-and-forget (see :func:`ledger.record_task_bg`) so a slow/absent catalog
+    never adds latency to the consumer's ack path.
     """
     sha256 = payload.get("sha256")
     task_type = payload.get("type") or queue
@@ -153,10 +175,10 @@ def _ledger_event_factory(queue: str, payload: dict):
     if not sha256:
         return None
 
-    async def on_event(status: str, attempts: int, error: str | None) -> None:
-        await pipeline.maybe_await(
-            ledger.record_task(sha256, task_type, status, attempts, error, parent_op_id)
-        )
+    def on_event(status: str, attempts: int, error: str | None) -> None:
+        if status == "running":
+            return  # dropped: see docstring (queued/done/failed/dlq suffice)
+        ledger.record_task_bg(sha256, task_type, status, attempts, error, parent_op_id)
 
     return on_event
 
@@ -171,7 +193,7 @@ def _install_thread_pool() -> None:
 
     All outbound HTTP is now natively async on the event loop, so the only work
     offloaded via ``asyncio.to_thread`` is the CPU-bound pixel bundle
-    (sha256/pHash/dims/lossless-WebP encode) and the disk read. Pillow/hashlib
+    (sha256/pHash/dims/WebP encode) and the disk read. Pillow/hashlib
     release the GIL during that work, so a pool sized to the cores lets the
     encodes for concurrent deliveries overlap across CPUs. Defaults to the broker
     prefetch so a fully-saturated fast queue never queues on threads.
@@ -186,6 +208,16 @@ def _install_thread_pool() -> None:
 
 async def main() -> None:
     _install_thread_pool()
+    # Seed the live producer config from the persisted UI overrides so a worker
+    # honours the same knobs (e.g. the LLM master switch) the API process does.
+    # Best-effort: a cold/absent catalog just leaves the env defaults in place.
+    try:
+        overrides = await settings_client.load()
+        if overrides:
+            config.update(overrides)
+            log.info("loaded persisted ingest config overrides: %s", overrides)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never block worker boot
+        log.debug("worker config seed skipped: %s", exc)
     requested = _queues_from_env()
     queues = [q for q in requested if q in HANDLERS]
     for q in requested:

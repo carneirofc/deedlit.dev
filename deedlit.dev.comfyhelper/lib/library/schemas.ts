@@ -180,6 +180,8 @@ export const CatalogBrowseRequestSchema = z.object({
   favorite: z.boolean().optional(),
   ratingGte: z.number().int().min(0).max(5).optional(),
   safety: z.array(SafetySchema).optional(),
+  /** Substring match on the on-disk image path (separator-insensitive). */
+  path: z.string().optional(),
   sort: CatalogSortSchema.default("newest"),
   limit: z.number().int().min(1).max(200).default(40),
   offset: z.number().int().min(0).default(0),
@@ -206,6 +208,8 @@ export const SimilarSearchRequestSchema = z.object({
   filters: SearchFiltersSchema.optional(),
   graphScope: GraphScopeSchema.optional(),
   limit: z.number().int().min(1).max(200).default(30),
+  /** Rank offset into the neighbour list — pages deeper proximity results. */
+  offset: z.number().int().min(0).default(0),
   minScore: z.number().min(0).max(1).default(0),
   /** HNSW search beam width — raise for recall on larger collections. */
   hnswEf: z.number().int().min(4).max(1024).optional(),

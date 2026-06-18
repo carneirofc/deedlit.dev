@@ -41,6 +41,7 @@ paths:
         - { name: favorite, in: query, schema: { type: boolean } }
         - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
         - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: path, in: query, description: "Keep images whose on-disk file path contains this fragment (separator-insensitive substring).", schema: { type: string } }
         - { name: sort, in: query, schema: { type: string, enum: [newest, oldest, rating_desc, rating_asc, name_asc, name_desc], default: newest } }
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
@@ -84,6 +85,7 @@ paths:
         - { name: favorite, in: query, schema: { type: boolean } }
         - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
         - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: path, in: query, description: "Keep images whose on-disk file path contains this fragment (separator-insensitive substring).", schema: { type: string } }
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CountResult" } } } } }
   /tags:
     get:

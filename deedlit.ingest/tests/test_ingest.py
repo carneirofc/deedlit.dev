@@ -109,7 +109,7 @@ def mock_outbound(monkeypatch):
     # embed.sparse + index.graph + label. Record each so the folder-walk tests can
     # assert per-file enqueue of every stage.
     def _record(key):
-        async def pub(sha256, parent_op_id=None):
+        async def pub(sha256, parent_op_id=None, **kwargs):
             calls[key].append(sha256)
         return pub
 

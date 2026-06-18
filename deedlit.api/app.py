@@ -676,13 +676,15 @@ async def list_images(
     favorite: bool | None = None,
     rating_gte: int | None = Query(default=None, ge=0, le=5),
     safety: list[str] | None = Query(default=None),
+    path: str | None = Query(default=None),
     sort: str = "newest",
     limit: int = 50,
     offset: int = 0,
 ) -> Any:
     """Browse the catalog truth. `tag`/`exclude_tag`/`safety` are repeatable
-    (?tag=a&tag=b); `sort` and `rating_gte` drive server-side ordering/filtering
-    for the library browse grid. All filters are forwarded verbatim to catalog."""
+    (?tag=a&tag=b); `path` substring-matches the on-disk file path; `sort` and
+    `rating_gte` drive server-side ordering/filtering for the library browse
+    grid. All filters are forwarded verbatim to catalog."""
     from urllib.parse import urlencode
 
     params: list[tuple[str, str]] = [
@@ -700,6 +702,8 @@ async def list_images(
         params.append(("rating_gte", str(int(rating_gte))))
     for s in safety or []:
         params.append(("safety", s))
+    if path:
+        params.append(("path", path))
     try:
         res = await clients.catalog("GET", f"/images?{urlencode(params)}")
     except DownstreamError:
@@ -714,6 +718,7 @@ async def count_images(
     favorite: bool | None = None,
     rating_gte: int | None = Query(default=None, ge=0, le=5),
     safety: list[str] | None = Query(default=None),
+    path: str | None = Query(default=None),
 ) -> Any:
     """Total images matching a filter set (catalog proxy), for report tooling to
     size the export before paging GET /images. Same repeatable filters as the
@@ -731,6 +736,8 @@ async def count_images(
         params.append(("rating_gte", str(int(rating_gte))))
     for s in safety or []:
         params.append(("safety", s))
+    if path:
+        params.append(("path", path))
     qs = f"?{urlencode(params)}" if params else ""
     try:
         res = await clients.catalog("GET", f"/images/count{qs}")

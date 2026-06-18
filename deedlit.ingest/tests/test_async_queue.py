@@ -390,6 +390,19 @@ def test_label_handler_requires_sha():
         asyncio.run(worker_module.label_handler({"type": "label"}))
 
 
+def test_label_handler_noop_when_llm_disabled(monkeypatch):
+    # Master switch off: a label task already in the queue is dropped without
+    # describing the image (the producer also stops publishing new ones).
+    import config as config_module
+
+    def boom(*a, **k):  # pragma: no cover - must not run when LLM is off
+        raise AssertionError("label_image must not run when LLM is disabled")
+
+    monkeypatch.setattr(pipeline, "label_image", boom)
+    config_module.update({"llm_enabled": False})
+    asyncio.run(worker_module.label_handler({"sha256": "a" * 64}))
+
+
 def test_worker_registers_all_stage_handlers():
     # Per-stage DAG (ADR 0002) + the opt-in ingest queue + the label queue.
     assert set(worker_module.HANDLERS) == {

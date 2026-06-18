@@ -232,14 +232,24 @@ async def publish_task(
     await channel.default_exchange.publish(message, routing_key=queue)
 
 
-async def _publish_sha_task(queue: str, sha256: str, *, parent_op_id: str | None = None) -> None:
+async def _publish_sha_task(
+    queue: str,
+    sha256: str,
+    *,
+    parent_op_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
     """Publish a per-image stage task keyed by ``sha256`` (the common DAG shape).
 
     Every per-stage queue except ``ingest`` operates on an already-cataloged
     image, so they share one payload shape: ``{sha256, type, parent_op_id}``. The
     thin wrappers below name the queue so callers (and tests) read clearly.
+    ``extra`` merges stage-specific fields (e.g. embed.dense's optional ``path``).
     """
-    await publish_task(queue, {"sha256": sha256, "type": queue, "parent_op_id": parent_op_id})
+    payload: dict[str, Any] = {"sha256": sha256, "type": queue, "parent_op_id": parent_op_id}
+    if extra:
+        payload.update(extra)
+    await publish_task(queue, payload)
 
 
 async def publish_ingest_task(
@@ -265,9 +275,18 @@ async def publish_ingest_task(
     )
 
 
-async def publish_embed_dense_task(sha256: str, *, parent_op_id: str | None = None) -> None:
-    """Enqueue an ``embed.dense`` task: GPU dense-embed sha256, persist to catalog."""
-    await _publish_sha_task(EMBED_DENSE_QUEUE, sha256, parent_op_id=parent_op_id)
+async def publish_embed_dense_task(
+    sha256: str, *, path: str | None = None, parent_op_id: str | None = None
+) -> None:
+    """Enqueue an ``embed.dense`` task: GPU dense-embed sha256, persist to catalog.
+
+    ``path`` (the producer's on-disk source path, when known) rides along so the
+    GPU stage reads the bytes off disk directly instead of a catalog filepath
+    lookup; omitted on re-publish paths (reconcile/rebuild), which fall back to the
+    catalog lookup.
+    """
+    extra = {"path": path} if path else None
+    await _publish_sha_task(EMBED_DENSE_QUEUE, sha256, parent_op_id=parent_op_id, extra=extra)
 
 
 async def publish_embed_sparse_task(sha256: str, *, parent_op_id: str | None = None) -> None:
@@ -290,24 +309,34 @@ async def publish_label_task(sha256: str, *, parent_op_id: str | None = None) ->
     await _publish_sha_task(LABEL_QUEUE, sha256, parent_op_id=parent_op_id)
 
 
-async def publish_post_ingest(sha256: str, *, parent_op_id: str | None = None) -> None:
-    """Publish the four downstream stages after a fast-path ingest (ADR 0002).
+async def publish_post_ingest(
+    sha256: str,
+    *,
+    path: str | None = None,
+    parent_op_id: str | None = None,
+    with_label: bool = True,
+) -> None:
+    """Publish the downstream stages after a fast-path ingest (ADR 0002).
 
-    embed.dense + embed.sparse (both fan into index.search) + index.graph + label.
-    Errors PROPAGATE (unlike the producer's best-effort fan-out) so the caller —
-    the ``ingest`` queue handler — fails and the broker retries the whole ingest
-    task, which re-runs the idempotent fast path and re-publishes these. The four
-    are independent, so they are published CONCURRENTLY (gather propagates the
-    first failure).
+    embed.dense + embed.sparse (both fan into index.search) + index.graph, plus
+    ``label`` when ``with_label`` (the vision-LLM master switch — the caller passes
+    the live config). Errors PROPAGATE (unlike the producer's best-effort fan-out)
+    so the caller — the ``ingest`` queue handler — fails and the broker retries the
+    whole ingest task, which re-runs the idempotent fast path and re-publishes
+    these. The stages are independent, so they are published CONCURRENTLY (gather
+    propagates the first failure). ``path`` is forwarded to embed.dense only (the
+    GPU stage that reads bytes); the other stages project from catalog truth.
     """
     import asyncio
 
-    await asyncio.gather(
-        publish_embed_dense_task(sha256, parent_op_id=parent_op_id),
+    tasks = [
+        publish_embed_dense_task(sha256, path=path, parent_op_id=parent_op_id),
         publish_embed_sparse_task(sha256, parent_op_id=parent_op_id),
         publish_index_graph_task(sha256, parent_op_id=parent_op_id),
-        publish_label_task(sha256, parent_op_id=parent_op_id),
-    )
+    ]
+    if with_label:
+        tasks.append(publish_label_task(sha256, parent_op_id=parent_op_id))
+    await asyncio.gather(*tasks)
 
 
 # ---------------------------------------------------------------------------

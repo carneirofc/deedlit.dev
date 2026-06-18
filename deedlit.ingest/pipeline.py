@@ -114,10 +114,20 @@ SUPPORTED_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
 
 # Thumbnail geometry: keep the SHORTER edge at >= this many px (true "1080p"
 # class), downscaling ONLY — a smaller source is kept untouched (never upscaled).
-# These double as the viewer image, so they are encoded LOSSLESS WebP.
+# These double as the viewer image.
 THUMBNAIL_MIN_EDGE = int(os.getenv("INGEST_THUMBNAIL_MIN_EDGE", "1080"))
-# Compression EFFORT for the lossless encode (0-100, higher = smaller + slower).
-THUMBNAIL_QUALITY = int(os.getenv("INGEST_THUMBNAIL_QUALITY", "100"))
+# WebP encode tuning. Default is LOSSY: a viewer thumbnail does not need a
+# lossless encode, and lossless WebP at high effort was the single most expensive
+# CPU op in the pipeline — it dominated ingest CPU and starved the GPU (which sits
+# idle until the catalog write lands). Lossy q82 is visually indistinguishable for
+# a 1080p viewer image and ~10-50x cheaper to encode. Set
+# INGEST_THUMBNAIL_LOSSLESS=true to restore the old lossless behaviour.
+#   quality: lossy 0-100 (higher = better + bigger); for lossless it is the
+#            compression EFFORT (higher = smaller + slower).
+#   method : 0-6 encoder effort (higher = smaller + slower); 4 is the libwebp default.
+THUMBNAIL_LOSSLESS = os.getenv("INGEST_THUMBNAIL_LOSSLESS", "false").lower() == "true"
+THUMBNAIL_QUALITY = int(os.getenv("INGEST_THUMBNAIL_QUALITY", "82"))
+THUMBNAIL_METHOD = int(os.getenv("INGEST_THUMBNAIL_METHOD", "4"))
 
 
 def _mime_for_extension(ext: str) -> str:
@@ -190,56 +200,103 @@ def compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def compute_phash(data: bytes) -> str | None:
-    """64-bit perceptual hash (pHash) as a 16-char hex string, or None."""
+def _decode_image(data: bytes) -> Image.Image | None:
+    """Decode raw image bytes to a PIL image (forcing the pixel load), or None.
+
+    The single decode point so the per-file pixel work (pHash / dims / thumbnail)
+    shares ONE decode instead of re-opening the bytes for each. Image decode (PNG
+    especially) is CPU-heavy and was happening twice per file (pHash + thumbnail).
+    ``.load()`` forces Pillow's lazy decode to happen here, on the worker thread.
+    """
     try:
-        with Image.open(io.BytesIO(data)) as im:
-            return str(imagehash.phash(im))
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        return im
     except Exception:
         return None
+
+
+def _phash_image(im: Image.Image) -> str | None:
+    """64-bit pHash as a 16-char hex string from an already-decoded image.
+
+    ``imagehash.phash`` converts to L + resizes internally without mutating ``im``,
+    so the same decoded image is reused for the thumbnail afterwards.
+    """
+    try:
+        return str(imagehash.phash(im))
+    except Exception:
+        return None
+
+
+def _thumbnail_image(im: Image.Image, min_edge: int = THUMBNAIL_MIN_EDGE) -> bytes | None:
+    """Downscale an already-decoded image so its SHORTER edge is ``min_edge`` px
+    and encode as WebP (lossy by default; see THUMBNAIL_* config). Downscale only
+    — a source already <= ``min_edge`` on its short side is kept at native size
+    (never upscaled). Returns bytes or None.
+    """
+    try:
+        rgb = im.convert("RGB")
+        width, height = rgb.size
+        short = min(width, height)
+        if short > min_edge:  # downscale only; keep smaller sources untouched
+            scale = min_edge / short
+            rgb = rgb.resize((round(width * scale), round(height * scale)), Image.LANCZOS)
+        out = io.BytesIO()
+        rgb.save(
+            out,
+            format="WEBP",
+            lossless=THUMBNAIL_LOSSLESS,
+            quality=THUMBNAIL_QUALITY,
+            method=THUMBNAIL_METHOD,
+        )
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def compute_phash(data: bytes) -> str | None:
+    """64-bit perceptual hash (pHash) as a 16-char hex string, or None."""
+    im = _decode_image(data)
+    return _phash_image(im) if im is not None else None
 
 
 def compute_dims(data: bytes) -> tuple[int | None, int | None]:
-    try:
-        with Image.open(io.BytesIO(data)) as im:
-            return im.width, im.height
-    except Exception:
-        return None, None
+    im = _decode_image(data)
+    return (im.width, im.height) if im is not None else (None, None)
 
 
 def make_webp_thumbnail(data: bytes, min_edge: int = THUMBNAIL_MIN_EDGE) -> bytes | None:
-    """Downscale so the SHORTER edge is ``min_edge`` px and encode as LOSSLESS
-    WebP. Downscale only — a source already <= ``min_edge`` on its short side is
-    kept at native size (never upscaled). Returns bytes or None.
+    """Downscale so the SHORTER edge is ``min_edge`` px and encode as WebP (lossy
+    by default; see THUMBNAIL_* config). Downscale only — a source already <=
+    ``min_edge`` on its short side is kept at native size. Returns bytes or None.
     """
-    try:
-        with Image.open(io.BytesIO(data)) as im:
-            im = im.convert("RGB")
-            width, height = im.size
-            short = min(width, height)
-            if short > min_edge:  # downscale only; keep smaller sources untouched
-                scale = min_edge / short
-                im = im.resize(
-                    (round(width * scale), round(height * scale)), Image.LANCZOS
-                )
-            out = io.BytesIO()
-            im.save(out, format="WEBP", lossless=True, quality=THUMBNAIL_QUALITY)
-            return out.getvalue()
-    except Exception:
-        return None
+    im = _decode_image(data)
+    return _thumbnail_image(im, min_edge) if im is not None else None
+
+
+def _phash_dims(data: bytes) -> tuple[str | None, int | None, int | None]:
+    """pHash + dims from a SINGLE decode (the relabel path's pixel work)."""
+    im = _decode_image(data)
+    if im is None:
+        return None, None, None
+    return _phash_image(im), im.width, im.height
 
 
 def _pixel_work(data: bytes) -> tuple[str, str | None, int | None, int | None, bytes | None]:
     """Run ALL the CPU-bound pixel work for one image in a single call.
 
-    sha256 + pHash + dims + the (heavy, lossless) WebP thumbnail encode. These are
-    CPU-bound and cannot be made non-blocking with async — Pillow/hashlib release
-    the GIL during the C work, so the orchestrators offload this whole bundle to a
-    worker thread (one hop, real cross-core parallelism) while their HTTP I/O stays
-    natively async on the event loop.
+    sha256 + pHash + dims + the WebP thumbnail encode. The image is decoded ONCE
+    and shared across pHash / dims / thumbnail (decode is CPU-heavy and used to
+    run twice per file). These are CPU-bound and cannot be made non-blocking with
+    async — Pillow/hashlib release the GIL during the C work, so the orchestrators
+    offload this whole bundle to a worker thread (one hop, real cross-core
+    parallelism) while their HTTP I/O stays natively async on the event loop.
     """
-    width, height = compute_dims(data)
-    return compute_sha256(data), compute_phash(data), width, height, make_webp_thumbnail(data)
+    sha256 = compute_sha256(data)
+    im = _decode_image(data)
+    if im is None:
+        return sha256, None, None, None, None
+    return sha256, _phash_image(im), im.width, im.height, _thumbnail_image(im)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +420,19 @@ async def fetch_image_bytes(sha256: str) -> tuple[bytes, str]:
     filepath = await maybe_await(fetch_image_filepath(sha256))
     if not filepath:
         raise FileNotFoundError(f"no catalog filepath for sha256={sha256}")
-    path = Path(filepath)
-    # Disk read is blocking; keep it off the event loop. raises FileNotFoundError
-    # if the file moved/was deleted.
-    data = await asyncio.to_thread(path.read_bytes)
-    mime = _mime_for_extension(path.suffix)
-    return data, mime
+    return await _read_path_bytes(filepath)
+
+
+async def _read_path_bytes(path: str) -> tuple[bytes, str]:
+    """Read ``(bytes, mime)`` for a source file by on-disk path (off the loop).
+
+    The shared tail of every byte-fetch: the catalog-lookup path resolves a sha256
+    to its filepath first, while embed.dense's hot path is handed the filepath
+    directly by the producer (skipping the catalog round-trip). Raises
+    FileNotFoundError if the file moved/was deleted (the broker then retries)."""
+    p = Path(path)
+    data = await asyncio.to_thread(p.read_bytes)
+    return data, _mime_for_extension(p.suffix)
 
 
 async def fetch_image_record(sha256: str) -> dict[str, Any] | None:
@@ -605,9 +669,7 @@ async def label_image(sha256: str) -> bool:
     # order-stable), falling back to the freshly extracted tags.
     base_tags = record.get("tags") or extract.get("tags") or []
     merged = list(dict.fromkeys([*base_tags, *(describe.get("tags") or [])]))
-    phash, (width, height) = await asyncio.to_thread(
-        lambda: (compute_phash(data), compute_dims(data))
-    )
+    phash, width, height = await asyncio.to_thread(_phash_dims, data)
     patched = build_catalog_record(
         sha256=sha256,
         phash=phash,
@@ -708,17 +770,23 @@ async def load_description_blob(sha256: str) -> list[float] | None:
     return await maybe_await(_load_json_blob(sha256, CATALOG_DESCRIPTION_BLOB_KIND))
 
 
-async def embed_dense(sha256: str) -> None:
+async def embed_dense(sha256: str, path: str | None = None) -> None:
     """``embed.dense`` stage: GPU dense-embed one image, persist to catalog.
 
-    Reads the bytes (sha -> catalog filepath -> shared disk), runs the dense
-    image embedding, and stores the vector as the catalog ``embedding`` blob. The
-    worker then publishes ``index.search``; the vector is now durable and reused
-    by every later reprojection. A vision/transport error propagates so the broker
-    retries / dead-letters.
+    Reads the bytes, runs the dense image embedding, and stores the vector as the
+    catalog ``embedding`` blob. The worker then publishes ``index.search``; the
+    vector is now durable and reused by every later reprojection. A vision/
+    transport error propagates so the broker retries / dead-letters.
+
+    ``path`` is the producer's on-disk source path: when supplied (the fresh-ingest
+    hot path) the bytes are read straight off disk, skipping the catalog filepath
+    lookup that would otherwise gate the GPU call. Absent (reconcile/rebuild
+    re-publish) it falls back to ``sha -> catalog filepath -> shared disk``.
     """
     log.info("embed.dense %s: embedding image (label-independent)", sha256[:12])
-    data, mime = await maybe_await(fetch_image_bytes(sha256))
+    data, mime = await maybe_await(
+        _read_path_bytes(path) if path else fetch_image_bytes(sha256)
+    )
     filename = f"{sha256}{_reconcile_ext_for_mime(mime)}"
     dense = await maybe_await(embed_image(data, filename, mime))
     await maybe_await(store_dense_blob(sha256, dense))
@@ -809,14 +877,16 @@ async def index_search(sha256: str) -> bool:
     both present and upserts. Idempotent: a duplicate upsert is wasted work, never
     incorrect. Returns True when the point was upserted.
 
-    The reads are independent, so they are fired CONCURRENTLY (the fan-in
-    rendezvous resolves in one round-trip's latency, not three). The description
-    vector is OPTIONAL — its absence never blocks the fan-in.
+    Only the two GATING reads (dense + sparse) are fired up front, CONCURRENTLY.
+    The first of the two index.search publishes is ALWAYS a no-op (one vector
+    still missing), so deferring the record + optional description reads until
+    BOTH vectors are present keeps that common no-op down to two blob GETs instead
+    of four. The description vector is OPTIONAL — its absence never blocks the
+    fan-in.
     """
-    dense, sparse, description = await asyncio.gather(
+    dense, sparse = await asyncio.gather(
         maybe_await(load_dense_blob(sha256)),
         maybe_await(load_sparse_blob(sha256)),
-        maybe_await(load_description_blob(sha256)),
     )
     if dense is None or sparse is None:
         # Not an error: the sibling embed stage re-publishes index.search on its
@@ -827,7 +897,13 @@ async def index_search(sha256: str) -> bool:
             sha256[:12], dense is not None, sparse is not None,
         )
         return False
-    record = await maybe_await(fetch_image_record(sha256)) or {}
+    # Both vectors present — NOW read the record + optional description vector
+    # (concurrently), the reads the no-op path above never has to make.
+    description, record = await asyncio.gather(
+        maybe_await(load_description_blob(sha256)),
+        maybe_await(fetch_image_record(sha256)),
+    )
+    record = record or {}
     point = build_search_point(sha256, dense, sparse, record, description=description)
     await maybe_await(_post_with_retry(f"{SEARCH_URL}/points", point))
     log.info(

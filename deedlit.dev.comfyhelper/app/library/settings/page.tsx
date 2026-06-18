@@ -6,8 +6,11 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { getIngestConfig, updateIngestConfig, type IngestConfig } from "@/lib/api-client";
 import {
   DEFAULT_SETTINGS,
+  SAFETY_CLASSES,
+  SAFETY_LABEL,
   useSettings,
   type LibrarySettings,
+  type SafetyClass,
 } from "@/lib/store/settings";
 
 // ---------------------------------------------------------------------------
@@ -155,6 +158,19 @@ function NumberSlider({
 function IngestSettingsSection() {
   const [cfg, setCfg] = useState<IngestConfig | null>(null);
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  // Manual library rescan (walks the source root for new/vanished files). Reuses
+  // the existing maintenance job — this is just a trigger from the settings panel.
+  const [rescan, setRescan] = useState<"idle" | "running" | "done" | "error">("idle");
+
+  const rescanNow = useCallback(async () => {
+    setRescan("running");
+    try {
+      const r = await fetch("/api/library/maintenance/rescan-files", { method: "POST" });
+      setRescan(r.ok ? "done" : "error");
+    } catch {
+      setRescan("error");
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -211,6 +227,37 @@ function IngestSettingsSection() {
               />
             }
           />
+          <Row
+            label="AI labelling (LLM)"
+            hint="Run the vision model to add a description, content-safety class & extra tags to each image. Off skips it — images are still cataloged, embedded & searchable. Applies to new ingests (and the label-backfill sweep)."
+            control={
+              <Toggle
+                checked={cfg.llm_enabled}
+                onChange={(v) => save({ llm_enabled: v })}
+              />
+            }
+          />
+          <Row
+            label="Rescan library now"
+            hint="Walk the source folders for new or vanished files and reconcile the catalog. Runs as a background job — watch it on the Admin page."
+            control={
+              <button
+                type="button"
+                className={cls.btn}
+                onClick={rescanNow}
+                disabled={rescan === "running"}
+                data-testid="rescan-now"
+              >
+                {rescan === "running"
+                  ? "Starting…"
+                  : rescan === "done"
+                    ? "Started ✓"
+                    : rescan === "error"
+                      ? "Retry"
+                      : "Rescan"}
+              </button>
+            }
+          />
           <InfoRow
             label="Consumer prefetch (fast queues)"
             value="TASK_PREFETCH"
@@ -219,16 +266,18 @@ function IngestSettingsSection() {
           <InfoRow
             label="LLM (label) queue"
             value="single · prefetch 1"
-            hint="Exclusive consumer + prefetch 1 so the vision model is never hit concurrently. Fixed."
+            hint="When AI labelling is on, the label queue runs one exclusive consumer at prefetch 1 so the vision model is never hit concurrently. Fixed."
           />
           <p className="pt-2 text-ui-2xs text-ui-ink-muted" aria-live="polite" data-testid="ingest-config-status">
-            {status === "saving"
-              ? "Saving…"
-              : status === "saved"
-                ? "Saved."
-                : status === "error"
-                  ? "Save failed — is the ingest service up?"
-                  : ""}
+            {rescan === "error"
+              ? "Rescan failed — is the ingest service up?"
+              : status === "saving"
+                ? "Saving…"
+                : status === "saved"
+                  ? "Saved."
+                  : status === "error"
+                    ? "Save failed — is the ingest service up?"
+                    : ""}
           </p>
         </>
       )}
@@ -255,9 +304,25 @@ export default function SettingsPage() {
     onChange: (v: number) => setKey(k, v as never),
   });
 
-  const dirty = (Object.keys(DEFAULT_SETTINGS) as Array<keyof LibrarySettings>).some(
-    (k) => settings[k] !== DEFAULT_SETTINGS[k],
-  );
+  // Toggle one content-safety class in/out of the default-shown set.
+  const toggleDefaultSafety = (c: SafetyClass) => {
+    const cur = settings.defaultSafety;
+    setKey("defaultSafety", cur.includes(c) ? cur.filter((x) => x !== c) : [...cur, c]);
+  };
+
+  const dirty = (Object.keys(DEFAULT_SETTINGS) as Array<keyof LibrarySettings>).some((k) => {
+    const a = settings[k];
+    const b = DEFAULT_SETTINGS[k];
+    // Array settings (e.g. defaultSafety) compare by content, order-insensitive —
+    // a reference compare would read as perpetually dirty after hydration.
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return true;
+      const sa = [...a].sort();
+      const sb = [...b].sort();
+      return sa.some((v, i) => v !== sb[i]);
+    }
+    return a !== b;
+  });
 
   return (
     <div className="mx-auto flex w-full max-w-[1700px] flex-col gap-6" data-testid="settings-page">
@@ -479,6 +544,32 @@ export default function SettingsPage() {
           }
         />
         <Row label="Favorites only" control={<Toggle {...bool("defaultFavoritesOnly")} />} />
+        <Row
+          label="Content safety"
+          hint="Which safety classes the grid shows by default. All on = no filter; turn one off (e.g. Explicit) to hide it everywhere until you re-enable it."
+          control={
+            <div className="flex gap-1.5" data-testid="default-safety">
+              {SAFETY_CLASSES.map((c) => {
+                const on = settings.defaultSafety.includes(c);
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => toggleDefaultSafety(c)}
+                    className={`rounded-full border px-2.5 py-1 text-ui-2xs font-medium transition ${
+                      on
+                        ? "border-accent-cyan bg-accent-cyan/15 text-accent-cyan"
+                        : "border-ui-border/60 text-ui-ink-muted hover:text-ui-ink"
+                    }`}
+                  >
+                    {SAFETY_LABEL[c]}
+                  </button>
+                );
+              })}
+            </div>
+          }
+        />
         <Row
           label="Minimum match score"
           hint="Default threshold for semantic / similar / by-image search."

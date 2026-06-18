@@ -135,6 +135,21 @@ def test_point_id_is_uuid5_of_sha256():
     assert stored[0].payload["sha256"] == _sha("idcheck")
 
 
+def test_upsert_points_writes_whole_batch_in_one_call():
+    """The batch upsert writes every point (one Qdrant round-trip) and returns
+    their ids in order; each is immediately retrievable (wait=True)."""
+    shas = [_sha(f"batch-{i}") for i in range(3)]
+    ids = store.upsert_points(
+        [(s, _dense(800 + i), None, {"name": f"batch{i}"}, None) for i, s in enumerate(shas)]
+    )
+    assert ids == [point_id_for_sha256(s) for s in shas]
+    for pid in ids:
+        assert store.client.retrieve(TEST_COLLECTION, ids=[pid])
+    # Clean up so the seeded A/B/C neighbour assertions stay unaffected.
+    for s in shas:
+        client.delete(f"/points/{s}")
+
+
 # --- (3) /query hybrid dense+sparse returns RRF-fused hits -------------------
 
 
@@ -203,6 +218,20 @@ def test_similar_returns_neighbors_excluding_self():
     assert shas[0] == SHA_B
 
 
+def test_similar_offset_pages_deeper_neighbors():
+    """offset pages past the nearest window. Page 0 (offset 0) yields the nearest
+    neighbour B; offset 1 skips it and surfaces the next-nearest (C) — no self,
+    no duplicate of the already-seen B."""
+    page0 = client.post("/similar", json={"sha256": SHA_A, "limit": 1, "offset": 0})
+    page1 = client.post("/similar", json={"sha256": SHA_A, "limit": 1, "offset": 1})
+    assert page0.status_code == 200 and page1.status_code == 200
+    first = [h["sha256"] for h in page0.json()["hits"]]
+    second = [h["sha256"] for h in page1.json()["hits"]]
+    assert first == [SHA_B]
+    assert SHA_A not in second and SHA_B not in second
+    assert second == [SHA_C]
+
+
 def test_by_image_returns_neighbors():
     r = client.post("/by-image", json={"sha256": SHA_A, "limit": 5})
     assert r.status_code == 200, r.text
@@ -211,6 +240,22 @@ def test_by_image_returns_neighbors():
     shas = [h["sha256"] for h in data["hits"]]
     assert SHA_A not in shas
     assert shas[0] == SHA_B
+
+
+def test_by_image_applies_payload_filter():
+    """A payload filter on /by-image excludes non-matching neighbours — B is the
+    nearest to A but is filtered out, leaving only C (which the filter matches)."""
+    r = client.post(
+        "/by-image",
+        json={
+            "sha256": SHA_A,
+            "limit": 5,
+            "filter": {"must": [{"key": "name", "match": {"value": "c"}}]},
+        },
+    )
+    assert r.status_code == 200, r.text
+    shas = [h["sha256"] for h in r.json()["hits"]]
+    assert shas == [SHA_C]  # B (nearest, name=b) filtered out; only C remains
 
 
 # --- (6) DELETE /points/{sha256} removes the point (idempotent) --------------

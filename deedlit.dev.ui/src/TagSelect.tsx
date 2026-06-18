@@ -23,6 +23,12 @@ export interface TagSelectProps {
   variant?: "include" | "exclude";
   /** Fired after the selection changes via the UI (add/remove) — e.g. to re-search. */
   onCommit?: (next: string[]) => void;
+  /**
+   * Max options rendered in the dropdown. Defaults to 8 (a tight type-ahead).
+   * Pass a large value with a full `suggestions` list to turn the control into a
+   * "browse every tag" picker — the list scrolls and the input just narrows it.
+   */
+  maxSuggestions?: number;
   /** Override the wrapper class. */
   className?: string;
 }
@@ -54,6 +60,7 @@ function TagSelect({
   placeholder = "add tag…",
   variant = "include",
   onCommit,
+  maxSuggestions = 8,
   className,
 }: TagSelectProps) {
   const [draft, setDraft] = useState("");
@@ -94,10 +101,10 @@ function TagSelect({
       if (!fetchSuggestions && q && !key.includes(q)) continue;
       seen.add(key);
       out.push(s);
-      if (out.length >= 8) break;
+      if (out.length >= maxSuggestions) break;
     }
     return out;
-  }, [suggestions, remote, fetchSuggestions, value, draft]);
+  }, [suggestions, remote, fetchSuggestions, value, draft, maxSuggestions]);
 
   const commit = (next: string[]) => {
     onChange(next);

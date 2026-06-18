@@ -544,6 +544,12 @@ export interface IngestConfig {
   ingest_concurrency: number;
   /** Route the scan through the `ingest` queue (cross-process worker pool). */
   ingest_via_queue: boolean;
+  /**
+   * Master switch for the vision-LLM (labelagent) enrichment stage. When off,
+   * ingest skips the `label` stage so images are cataloged + indexed without an
+   * AI description/safety/tags. On by default (labelagent must also be configured).
+   */
+  llm_enabled: boolean;
 }
 
 export async function getIngestConfig(signal?: AbortSignal): Promise<IngestConfig> {
@@ -552,6 +558,9 @@ export async function getIngestConfig(signal?: AbortSignal): Promise<IngestConfi
     ingest_concurrency:
       typeof res?.ingest_concurrency === "number" ? res.ingest_concurrency : 8,
     ingest_via_queue: Boolean(res?.ingest_via_queue),
+    // Default ON when the field is absent (older ingest builds) — matches the
+    // service default so the toggle doesn't read as off against an unset value.
+    llm_enabled: res?.llm_enabled !== false,
   };
 }
 
@@ -591,6 +600,8 @@ export interface CatalogBrowseParams {
   ratingGte?: number;
   /** Content-safety classes to include; omit/empty = all. */
   safety?: string[];
+  /** Keep images whose on-disk path contains this fragment (separator-insensitive). */
+  path?: string;
   sort?: CatalogSort;
   limit?: number;
   offset?: number;
@@ -608,6 +619,7 @@ export async function listCatalogImages(
       favorite: params.favorite,
       rating_gte: params.ratingGte,
       safety: params.safety,
+      path: params.path,
       sort: params.sort,
       limit: params.limit,
       offset: params.offset,

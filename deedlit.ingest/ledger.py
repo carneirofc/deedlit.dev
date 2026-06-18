@@ -9,6 +9,7 @@ stall a consumer. The ingest publisher records ``queued``; the worker records
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any
@@ -76,3 +77,43 @@ async def record_task(
     except Exception as exc:  # noqa: BLE001 — ledger is best-effort observability
         log.debug("ledger write failed (%s %s -> %s): %s", task_type, status, sha256, exc)
         return False
+
+
+# Strong refs to in-flight fire-and-forget writes so the loop doesn't GC a task
+# mid-flight (asyncio only holds a weak ref to a bare create_task result).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def record_task_bg(
+    sha256: str | None,
+    task_type: str | None,
+    status: str,
+    attempts: int | None = None,
+    error: str | None = None,
+    parent_op_id: str | None = None,
+) -> None:
+    """Schedule a ledger write WITHOUT awaiting it (fire-and-forget).
+
+    The ledger is best-effort observability, so the hot paths (the consumer ack
+    path, the producer fan-out) must never block on a catalog round-trip for it.
+    This schedules :func:`record_task` on the running loop and returns immediately;
+    the write completes off the critical path and swallows its own errors. A no-op
+    when no loop is running (e.g. a sync caller outside the worker). Tolerates a
+    monkeypatched sync ``record_task`` (the test stub) via the isawaitable check.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _run() -> None:
+        try:
+            result = record_task(sha256, task_type, status, attempts, error, parent_op_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 — best-effort; never surface
+            pass
+
+    task = loop.create_task(_run())
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)

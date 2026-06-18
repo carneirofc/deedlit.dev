@@ -51,18 +51,21 @@ def list_images(
     favorite: bool | None = Query(default=None),
     rating_gte: int | None = Query(default=None, ge=0, le=5),
     safety: list[str] | None = Query(default=None),
+    path: str | None = Query(default=None),
     sort: str = Query(default="newest"),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
 ) -> list[Image]:
     # `tag`/`exclude_tag` are repeatable (?tag=a&tag=b). A single ?tag=a still
     # arrives as a one-element list, so legacy single-tag callers keep working.
+    # `path` is a separator-insensitive substring match on the on-disk file path.
     return repository.list_images(
         tags=tag,
         exclude_tags=exclude_tag,
         favorite=favorite,
         rating_gte=rating_gte,
         safety=safety,
+        path=path,
         sort=sort,
         limit=limit,
         offset=offset,
@@ -102,6 +105,7 @@ def count_images(
     favorite: bool | None = Query(default=None),
     rating_gte: int | None = Query(default=None, ge=0, le=5),
     safety: list[str] | None = Query(default=None),
+    path: str | None = Query(default=None),
 ) -> CountResult:
     """Total images matching the same filters as GET /images (no sort/paging).
 
@@ -114,6 +118,7 @@ def count_images(
             favorite=favorite,
             rating_gte=rating_gte,
             safety=safety,
+            path=path,
         )
     )
 

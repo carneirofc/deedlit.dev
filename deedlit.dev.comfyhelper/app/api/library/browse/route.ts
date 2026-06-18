@@ -25,6 +25,7 @@ export async function POST(request: Request) {
       favorite: body.favorite,
       ratingGte: body.ratingGte,
       safety: body.safety,
+      path: body.path?.trim() || undefined,
       sort: body.sort,
       limit: body.limit,
       offset: body.offset,

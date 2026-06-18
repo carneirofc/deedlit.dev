@@ -164,6 +164,27 @@ def test_list_browse_sort_and_tag_filters(client) -> None:
     assert shas({"sort": "name_asc"}) == [a, c, b]
 
 
+def test_list_filter_by_path_substring(client) -> None:
+    # Separator-insensitive SUBSTRING match over file_path. The third image uses a
+    # Windows-style backslash path on purpose: a forward-slash query must match it.
+    a = _make_image(client, filepath="/lib/2024/portraits/a.png", tags=["x"])
+    b = _make_image(client, filepath="/lib/2024/landscapes/b.png", tags=["x"])
+    c = _make_image(client, filepath=r"D:\art\2023\portraits\c.png", tags=["x"])
+
+    def shas(params):
+        return {i["sha256"] for i in client.get("/images", params=params).json()}
+
+    # A folder fragment matches anywhere in the path, across separators + case.
+    assert shas({"path": "portraits"}) == {a, c}
+    assert shas({"path": "LANDSCAPES"}) == {b}
+    # A deeper fragment narrows to one tree; the backslash path matches a slash query.
+    assert shas({"path": "2024/portraits"}) == {a}
+    assert shas({"path": "2023/portraits"}) == {c}
+    # No match -> empty; count mirrors the list filter.
+    assert shas({"path": "nope_zzz"}) == set()
+    assert client.get("/images/count", params={"path": "portraits"}).json()["count"] == 2
+
+
 def test_delete_image_removes_record_refs_and_blob(client) -> None:
     sha = _sha()
     client.post(

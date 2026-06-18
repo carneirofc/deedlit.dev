@@ -709,6 +709,7 @@ def test_images_list_threads_browse_filters_into_catalog(rec, client):
         seen["exclude_tag"] = p.get_list("exclude_tag")
         seen["sort"] = p.get("sort")
         seen["rating_gte"] = p.get("rating_gte")
+        seen["path"] = p.get("path")
         return []
 
     rec.on("GET", "/images", images_handler)
@@ -721,6 +722,7 @@ def test_images_list_threads_browse_filters_into_catalog(rec, client):
             ("exclude_tag", "blurry"),
             ("sort", "rating_desc"),
             ("rating_gte", "3"),
+            ("path", "2024/portraits"),
         ],
     )
     assert r.status_code == 200
@@ -729,6 +731,7 @@ def test_images_list_threads_browse_filters_into_catalog(rec, client):
     assert seen["exclude_tag"] == ["blurry"]
     assert seen["sort"] == "rating_desc"
     assert seen["rating_gte"] == "3"
+    assert seen["path"] == "2024/portraits"
 
 
 def test_patch_image_proxies_and_passes_404(rec, client):
@@ -841,6 +844,27 @@ def test_mcp_tools_call_search_dispatches_to_search(rec, client):
     assert body["result"]["isError"] is False
     assert _bases(rec) == {clients.VISION_URL, clients.SEARCH_URL}
     assert body["result"]["structuredContent"]["results"][0]["sha256"] == "e" * 64
+
+
+def test_mcp_find_similar_forwards_offset(rec, client):
+    # find_similar_images pages by rank offset so the UI can keep loading more
+    # proximity results; the offset must reach the search service's /similar body.
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return {"hits": [{"sha256": "b" * 64, "score": 0.9}], "fusion": "dense"}
+
+    rec.on("POST", "/similar", handler)
+    r = client.post("/mcp", json={
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "find_similar_images", "arguments": {"image_id": SHA, "limit": 5, "offset": 10}},
+    })
+    assert r.status_code == 200
+    assert r.json()["result"]["isError"] is False
+    assert _bases(rec) == {clients.SEARCH_URL}
+    assert seen["body"]["offset"] == 10
+    assert seen["body"]["limit"] == 5
 
 
 def test_mcp_tools_call_details_dispatches_to_catalog(rec, client):

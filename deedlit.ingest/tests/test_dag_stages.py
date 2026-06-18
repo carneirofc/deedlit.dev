@@ -13,10 +13,28 @@ import asyncio
 import pytest
 
 import broker as broker_module
+import ledger as ledger_module
 import pipeline
 import worker as worker_module
 
 SHA = "a" * 64
+
+
+# ---------------------------------------------------------------------------
+# ledger hook (#27, perf): drop the high-frequency `running` transition and
+# fire writes off the consumer's ack path
+# ---------------------------------------------------------------------------
+def test_ledger_factory_drops_running_and_fires_async(monkeypatch):
+    recorded: list[tuple] = []
+    monkeypatch.setattr(ledger_module, "record_task_bg", lambda *a, **k: recorded.append(a))
+    on_event = worker_module._ledger_event_factory(
+        "embed.dense", {"sha256": SHA, "type": "embed.dense", "parent_op_id": "op2"}
+    )
+    on_event("running", 0, None)  # dropped — halves consumer-side ledger writes
+    on_event("done", 1, None)     # recorded (fire-and-forget)
+    assert len(recorded) == 1
+    sha, ttype, status = recorded[0][0], recorded[0][1], recorded[0][2]
+    assert (sha, ttype, status) == (SHA, "embed.dense", "done")
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +57,14 @@ def test_ingest_handler_fast_paths_then_publishes_post_ingest(monkeypatch):
     monkeypatch.setattr(pipeline, "ingest_path", lambda path: SHA)
     published: list[tuple] = []
 
-    async def fake_post(sha256, parent_op_id=None):
-        published.append((sha256, parent_op_id))
+    async def fake_post(sha256, path=None, parent_op_id=None, with_label=True):
+        published.append((sha256, path, parent_op_id, with_label))
 
     monkeypatch.setattr(broker_module, "publish_post_ingest", fake_post)
     asyncio.run(worker_module.ingest_handler({"path": "/lib/x.png", "parent_op_id": "op9"}))
-    assert published == [(SHA, "op9")]
+    # The ingest handler forwards the on-disk path so embed.dense can skip the
+    # catalog filepath lookup, and the live LLM master switch (on by default).
+    assert published == [(SHA, "/lib/x.png", "op9", True)]
 
 
 def test_ingest_handler_requires_path():
@@ -77,16 +97,38 @@ def test_store_dense_blob_writes_embedding_kind_json(monkeypatch):
     assert data == b"[1.0, 2.0]"
 
 
-def test_embed_dense_handler_publishes_index_search(monkeypatch):
+def test_embed_dense_reads_path_directly_skipping_catalog(monkeypatch):
+    """When the producer supplies ``path``, embed.dense reads the bytes off disk
+    and never does the catalog filepath lookup (the GPU-feeding hop)."""
+    read: list[str] = []
+    monkeypatch.setattr(pipeline, "_read_path_bytes", lambda p: read.append(p) or (b"bytes", "image/png"))
+
+    def boom(sha):  # the catalog lookup path must NOT be taken when path is given
+        raise AssertionError("fetch_image_bytes must not be called when path is supplied")
+
+    monkeypatch.setattr(pipeline, "fetch_image_bytes", boom)
+    monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
+    monkeypatch.setattr(pipeline, "store_dense_blob", lambda sha, v: None)
+
+    asyncio.run(pipeline.embed_dense(SHA, path="/lib/x.png"))
+    assert read == ["/lib/x.png"]
+
+
+def test_embed_dense_handler_publishes_index_search_and_forwards_path(monkeypatch):
     published: list[tuple] = []
-    monkeypatch.setattr(pipeline, "embed_dense", lambda sha: None)
+    embedded: list[tuple] = []
+    monkeypatch.setattr(pipeline, "embed_dense", lambda sha, path=None: embedded.append((sha, path)))
 
     async def fake(sha, parent_op_id=None):
         published.append((sha, parent_op_id))
 
     monkeypatch.setattr(broker_module, "publish_index_search_task", fake)
-    asyncio.run(worker_module.embed_dense_handler({"sha256": SHA, "parent_op_id": "op1"}))
+    asyncio.run(worker_module.embed_dense_handler(
+        {"sha256": SHA, "path": "/lib/x.png", "parent_op_id": "op1"}
+    ))
     assert published == [(SHA, "op1")]
+    # The handler forwards the payload path into embed_dense.
+    assert embedded == [(SHA, "/lib/x.png")]
 
 
 def test_embed_dense_handler_requires_sha():
