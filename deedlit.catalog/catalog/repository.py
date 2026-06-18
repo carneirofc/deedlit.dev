@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -686,8 +687,40 @@ def set_favorite(sha256: str, favorite: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Danbooru/A1111 emphasis weight ("tag:1.2") + balanced/stray emphasis brackets
+# ("(tag)", "((tag))", "[tag]") carry no tag identity. Stripping them so "(asd)",
+# "(asd:12)" and "asd" collapse to ONE tag (same normalized_name). Mirrors
+# deedlit.metadata.prompt_tags + deedlit.graph so every tag source agrees.
+_TAG_WEIGHT_RE = re.compile(r":\s*\d+(?:\.\d+)?")
+_TAG_LEAD_BRACKET_RE = re.compile(r"^[([{<]+")
+_TAG_TRAIL_BRACKET_RE = re.compile(r"[)\]}>]+$")
+_TAG_WS_RE = re.compile(r"\s+")
+# Booru prompts separate tags by comma, newline, or the A1111 "BREAK" keyword.
+_TAG_SPLIT_RE = re.compile(r"\bBREAK\b|[,\n\r]+")
+
+
+def _clean_tag(name: str) -> str:
+    """Cleaned DISPLAY form of a danbooru tag: drop emphasis weight + brackets,
+    collapse whitespace. "(asd)"/"(asd:12)" -> "asd" (case + spaces preserved)."""
+    t = _TAG_WEIGHT_RE.sub("", name.replace("\\", "")).strip()
+    while t and t[0] in "([{<" and t[-1] in ")]}>":
+        t = t[1:-1].strip()
+    opens = sum(t.count(c) for c in "([{")
+    closes = sum(t.count(c) for c in ")]}")
+    if opens != closes:
+        t = _TAG_TRAIL_BRACKET_RE.sub("", _TAG_LEAD_BRACKET_RE.sub("", t)).strip()
+    return _TAG_WS_RE.sub(" ", t).strip()
+
+
+def _split_tags(raw: str) -> list[str]:
+    """Split a raw tag string on commas / newlines / the BREAK keyword."""
+    return [p for p in _TAG_SPLIT_RE.split(raw) if p and p.strip()]
+
+
 def _normalize_tag(name: str) -> str:
-    return name.strip().lower().replace(" ", "_")
+    """Identity key for a tag: cleaned, lowercased, spaces -> underscores. So
+    "(asd)", "(asd:12)" and "asd" all share one normalized_name (and one tag)."""
+    return _clean_tag(name).lower().replace(" ", "_")
 
 
 def _set_tags(
@@ -703,32 +736,38 @@ def _set_tags(
             ),
             {"iid": image_id},
         )
-    for name in tags:
-        norm = _normalize_tag(name)
-        if not norm:
-            continue
-        tag_row = conn.execute(
-            text(
-                """
-                INSERT INTO tags (name, normalized_name)
-                VALUES (:name, :norm)
-                ON CONFLICT (normalized_name) DO UPDATE SET name = tags.name
-                RETURNING id
-                """
-            ),
-            {"name": name, "norm": norm},
-        ).first()
-        tag_id = tag_row[0]
-        conn.execute(
-            text(
-                """
-                INSERT INTO image_tags (image_id, tag_id, source)
-                VALUES (:iid, :tid, 'manual')
-                ON CONFLICT (image_id, tag_id, source) DO NOTHING
-                """
-            ),
-            {"iid": image_id, "tid": tag_id},
-        )
+    # Split each incoming value on comma / newline / BREAK, clean danbooru
+    # weighting/brackets, and de-dupe by the normalized identity within this call.
+    seen: set[str] = set()
+    for raw in tags:
+        for piece in _split_tags(raw):
+            norm = _normalize_tag(piece)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            display = _clean_tag(piece)
+            tag_row = conn.execute(
+                text(
+                    """
+                    INSERT INTO tags (name, normalized_name)
+                    VALUES (:name, :norm)
+                    ON CONFLICT (normalized_name) DO UPDATE SET name = tags.name
+                    RETURNING id
+                    """
+                ),
+                {"name": display, "norm": norm},
+            ).first()
+            tag_id = tag_row[0]
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO image_tags (image_id, tag_id, source)
+                    VALUES (:iid, :tid, 'manual')
+                    ON CONFLICT (image_id, tag_id, source) DO NOTHING
+                    """
+                ),
+                {"iid": image_id, "tid": tag_id},
+            )
 
 
 def _get_tags(conn: Connection, image_id: str) -> list[str]:

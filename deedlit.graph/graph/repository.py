@@ -36,6 +36,7 @@ matching/merging is always on (kind, key).
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterable
 
 from neo4j import Driver
@@ -49,6 +50,53 @@ def normalize_name(name: str) -> str:
     base = os.path.basename(name.replace("\\", "/").strip())
     root, _ext = os.path.splitext(base)
     return (root or base).strip().lower()
+
+
+# Danbooru/A1111 emphasis weight (e.g. "tag:1.2") and balanced/stray emphasis
+# brackets ("(tag)", "((tag))", "[tag]") carry no tag identity. Stripping them so
+# "(asd)", "(asd:12)" and "asd" all collapse to the SAME Tag node. Mirrors
+# deedlit.metadata.prompt_tags._clean_prompt_tag so every tag source (prompt / AI
+# labeller / manual edit) agrees on the canonical tag.
+_TAG_WEIGHT_RE = re.compile(r":\s*\d+(?:\.\d+)?")
+_TAG_LEAD_BRACKET_RE = re.compile(r"^[([{<]+")
+_TAG_TRAIL_BRACKET_RE = re.compile(r"[)\]}>]+$")
+_TAG_WS_RE = re.compile(r"\s+")
+
+
+def clean_tag(raw: str) -> str:
+    """Canonical lowercased danbooru tag: drop emphasis weight + emphasis brackets.
+
+    "(asd)", "(asd:12)", "((asd))", "[asd]" -> "asd". Empty string when nothing is
+    left. Used as the :Tag node identity so a weighted and unweighted spelling of
+    the same booru tag never split into separate nodes."""
+    t = _TAG_WEIGHT_RE.sub("", raw.replace("\\", "")).strip()
+    while t and t[0] in "([{<" and t[-1] in ")]}>":
+        t = t[1:-1].strip()
+    opens = sum(t.count(c) for c in "([{")
+    closes = sum(t.count(c) for c in ")]}")
+    if opens != closes:
+        t = _TAG_TRAIL_BRACKET_RE.sub("", _TAG_LEAD_BRACKET_RE.sub("", t)).strip()
+    return _TAG_WS_RE.sub(" ", t).strip().lower()
+
+
+# Lookup indexes the ingest MERGE path relies on. Without them every
+# MERGE (:Tag {name}) / (:Asset {kind,key}) / (:Image {sha256}) is a FULL LABEL
+# SCAN — O(nodes) per upserted tag/asset — which is the dominant write cost (and
+# the lag) once the graph grows. Created idempotently; community-edition safe
+# (plain indexes, not enterprise node-key constraints).
+_SCHEMA_STATEMENTS = (
+    "CREATE INDEX image_sha256 IF NOT EXISTS FOR (i:Image) ON (i.sha256)",
+    "CREATE INDEX tag_name IF NOT EXISTS FOR (t:Tag) ON (t.name)",
+    "CREATE INDEX asset_kind_key IF NOT EXISTS FOR (a:Asset) ON (a.kind, a.key)",
+)
+
+
+def ensure_schema() -> None:
+    """Create the MERGE lookup indexes (idempotent). Call on startup / before a
+    rebuild. Cheap when they already exist; turns the per-tag full scan into a seek."""
+    with _driver().session(database=get_database()) as session:
+        for stmt in _SCHEMA_STATEMENTS:
+            session.run(stmt).consume()
 
 
 def asset_key(ref: AssetRef) -> str:
@@ -67,7 +115,7 @@ def upsert_edges(edge: EdgeUpsert) -> dict:
     references = [
         {"kind": r.kind, "name": r.name, "key": asset_key(r)} for r in edge.references
     ]
-    tags = sorted({t.strip().lower() for t in edge.tags if t.strip()})
+    tags = sorted({c for t in edge.tags if (c := clean_tag(t))})
     lineage = [{"parent": l.parent, "kind": l.kind} for l in edge.lineage]
 
     query = """
@@ -98,20 +146,86 @@ def upsert_edges(edge: EdgeUpsert) -> dict:
     }
     RETURN size($references) AS assets, size($tags) AS tags, size($lineage) AS lineage
     """
+    params = {
+        "sha256": edge.sha256,
+        "references": references,
+        "tags": tags,
+        "lineage": lineage,
+    }
     with _driver().session(database=get_database()) as session:
-        rec = session.run(
-            query,
-            sha256=edge.sha256,
-            references=references,
-            tags=tags,
-            lineage=lineage,
-        ).single()
+        # Managed write transaction: auto-retries transient errors / deadlocks
+        # (which Neo4j throws under concurrent MERGE load) — see the driver perf
+        # guide. The result is consumed inside the tx function.
+        rec = session.execute_write(lambda tx: tx.run(query, **params).single())
         return {
             "sha256": edge.sha256,
             "assets": rec["assets"],
             "tags": rec["tags"],
             "lineage": rec["lineage"],
         }
+
+
+def _edge_payload(edge: EdgeUpsert) -> dict:
+    """Normalize one EdgeUpsert into the {sha256, references, tags, lineage} row
+    shape the batched UNWIND query consumes (same normalization as upsert_edges)."""
+    return {
+        "sha256": edge.sha256,
+        "references": [
+            {"kind": r.kind, "name": r.name, "key": asset_key(r)} for r in edge.references
+        ],
+        "tags": sorted({c for t in edge.tags if (c := clean_tag(t))}),
+        "lineage": [{"parent": ln.parent, "kind": ln.kind} for ln in edge.lineage],
+    }
+
+
+def upsert_edges_batch(edges: list[EdgeUpsert]) -> list[dict]:
+    """Upsert MANY images' edges in ONE Neo4j transaction (UNWIND over the batch).
+
+    The batch counterpart to :func:`upsert_edges`: the index.graph worker pool
+    POSTs one /edges per image, and the service's micro-batcher coalesces the
+    concurrent calls into this single transaction instead of one write tx per
+    image — the dominant Neo4j write cost during bulk ingest / rebuild / reconcile,
+    which otherwise floods Neo4j and starves the read queries the UI makes
+    (neighbors / lineage / related-tags). Returns one result dict per input edge,
+    in order. Idempotent (all MERGE), mirroring the per-image path.
+    """
+    if not edges:
+        return []
+    batch = [_edge_payload(e) for e in edges]
+    query = """
+    UNWIND $batch AS item
+    MERGE (img:Image {sha256: item.sha256})
+    WITH img, item
+    CALL (img, item) {
+        UNWIND item.references AS ref
+        MERGE (a:Asset {kind: ref.kind, key: ref.key})
+          ON CREATE SET a.name = ref.name
+        MERGE (img)-[:USES]->(a)
+    }
+    CALL (img, item) {
+        UNWIND item.tags AS tname
+        MERGE (t:Tag {name: tname})
+        MERGE (img)-[:TAGGED]->(t)
+    }
+    CALL (img, item) {
+        UNWIND item.lineage AS lin
+        MERGE (p:Image {sha256: lin.parent})
+        MERGE (img)-[d:DERIVED_FROM]->(p)
+          SET d.kind = lin.kind
+    }
+    RETURN item.sha256 AS sha256,
+           size(item.references) AS assets,
+           size(item.tags) AS tags,
+           size(item.lineage) AS lineage
+    """
+    with _driver().session(database=get_database()) as session:
+        # Managed write transaction (auto-retry transient/deadlock) for the whole
+        # coalesced batch — one round-trip + retry boundary for many images.
+        rows = session.execute_write(lambda tx: tx.run(query, batch=batch).data())
+    return [
+        {"sha256": r["sha256"], "assets": r["assets"], "tags": r["tags"], "lineage": r["lineage"]}
+        for r in rows
+    ]
 
 
 def delete_image(sha256: str) -> int:
@@ -128,7 +242,7 @@ def delete_image(sha256: str) -> int:
     RETURN count(*) AS deleted
     """
     with _driver().session(database=get_database()) as session:
-        rec = session.run(q, sha256=sha256).single()
+        rec = session.execute_write(lambda tx: tx.run(q, sha256=sha256).single())
         return int(rec["deleted"]) if rec else 0
 
 
@@ -147,7 +261,7 @@ def delete_images(sha256s: list[str]) -> int:
     RETURN count(*) AS deleted
     """
     with _driver().session(database=get_database()) as session:
-        rec = session.run(q, shas=sha256s).single()
+        rec = session.execute_write(lambda tx: tx.run(q, shas=sha256s).single())
         return int(rec["deleted"]) if rec else 0
 
 

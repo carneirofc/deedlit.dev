@@ -162,6 +162,25 @@ def test_delete_image_removes_node_and_neighbor_edges():
     assert client.delete(f"/images/{b}").json()["deleted"] == 0
 
 
+def test_clean_tag_collapses_weighting_and_brackets():
+    from graph.repository import clean_tag
+
+    for raw in ["(asd)", "(asd:12)", "(asd:1.2)", "((asd))", "[asd]", "asd", "ASD", " AsD "]:
+        assert clean_tag(raw) == "asd", raw
+    assert clean_tag("red eyes") == "red eyes"
+    assert clean_tag("(red eyes:1.1)") == "red eyes"
+
+
+def test_weighted_and_plain_tag_collapse_to_one_node():
+    a, b = sha("tcoA"), sha("tcoB")
+    # Same booru tag, weighted on one image and plain on the other -> ONE :Tag
+    # node, so the two images become tag-cooccurrence neighbors.
+    client.post("/edges", json={"sha256": a, "tags": ["(asd:1.2)"], "references": []})
+    client.post("/edges", json={"sha256": b, "tags": ["asd"], "references": []})
+    nb = client.get(f"/neighbors/{a}", params={"relation": "tag_cooccurrence"}).json()
+    assert b in [n["sha256"] for n in nb["neighbors"]]
+
+
 def test_batch_delete_removes_many_nodes():
     a, b, c = sha("bdelA"), sha("bdelB"), sha("bdelC")
     ck = {"kind": "checkpoint", "name": "batchdel.safetensors", "hash": None}

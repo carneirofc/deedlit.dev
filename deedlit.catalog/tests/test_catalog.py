@@ -244,6 +244,25 @@ def test_delete_image_removes_record_refs_and_blob(client) -> None:
     assert all(i["sha256"] != sha for i in listed)
 
 
+def test_tag_normalization_collapses_weighting_and_splits(client) -> None:
+    sha = _sha()
+    client.post("/images", json={"sha256": sha, "tags": [
+        "(asd)", "(asd:1.2)", "asd",            # danbooru weighting -> one tag
+        "red eyes, blue_hair BREAK forest",     # comma + BREAK -> three tags
+    ]})
+    tags = set(client.get(f"/images/{sha}").json()["tags"])
+    # (asd)/(asd:1.2)/asd all collapse to a single, bracket-free tag.
+    assert "asd" in tags
+    assert not any(("(" in t or ")" in t or ":" in t) for t in tags)
+    # The comma/BREAK value split into three distinct tags.
+    assert {"red eyes", "blue_hair", "forest"} <= tags
+    assert len(tags) == 4
+
+    # A filter by the WEIGHTED spelling normalizes the same way and still matches.
+    listed = {i["sha256"] for i in client.get("/images", params={"tag": "(asd:0.9)"}).json()}
+    assert sha in listed
+
+
 def test_delete_missing_image_404(client) -> None:
     assert client.delete(f"/images/{_sha()}").status_code == 404
 
