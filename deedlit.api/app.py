@@ -224,6 +224,9 @@ async def batch_delete_images(req: BatchDeleteRequest) -> dict[str, Any]:
 class SearchRequest(BaseModel):
     query: str
     limit: int = 24
+    # Rank offset for server-side pagination over the WHOLE matching set (so the
+    # UI never has to slice a fixed top-K client-side).
+    offset: int = Field(default=0, ge=0)
     filter: dict[str, Any] | None = None
 
 
@@ -232,7 +235,7 @@ async def search(req: SearchRequest) -> Any:
     # search is a pure vector store; encode the text via vision first (an empty
     # query yields an empty result rather than a vectorless query that 422s).
     try:
-        return await clients.search_by_text(req.query, req.limit, req.filter)
+        return await clients.search_by_text(req.query, req.limit, req.filter, req.offset)
     except DownstreamError as exc:
         raise HTTPException(status_code=502, detail=f"search unavailable: {exc.detail}")
 

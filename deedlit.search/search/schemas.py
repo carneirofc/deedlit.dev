@@ -32,6 +32,9 @@ class HybridQuery(BaseModel):
     )
     sparse: SparseVector | None = None
     limit: int = 24
+    # Rank offset into the result, so search paginates over the WHOLE matching set
+    # server-side rather than the client slicing a fixed top-K. 0 = the top window.
+    offset: int = Field(default=0, ge=0)
     filter: dict[str, Any] | None = None
 
 

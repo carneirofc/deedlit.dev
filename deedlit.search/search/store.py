@@ -207,12 +207,18 @@ class SearchStore:
         limit: int,
         query_filter: dict[str, Any] | None = None,
         description: list[float] | None = None,
+        offset: int = 0,
     ) -> tuple[str, list[Hit]]:
         """Run a query and return (fusion, hits).
 
         Accepts any subset of the three modalities (image ``dense``, ``description``
         text, and lexical ``sparse``). Two or more are RRF-fused over one prefetch
         each; a single modality is a plain nearest-neighbour query named after it.
+
+        ``offset`` pages into the ranked result so search can paginate over the
+        WHOLE matching set server-side (not a client-side slice of a fixed top-K).
+        For the fused path the prefetch is deepened to ``limit + offset`` so there
+        are enough fused candidates to skip past.
         """
         qfilter = self._filter(query_filter)
 
@@ -239,13 +245,16 @@ class SearchStore:
                 query=qvec,
                 using=using,
                 limit=limit,
+                offset=offset,
                 query_filter=qfilter,
                 with_payload=True,
             )
             return name, self._to_hits(result.points)
 
+        # Each prefetch must surface enough candidates that the fused result still
+        # has `limit` rows AFTER skipping `offset`, so prefetch limit = limit+offset.
         prefetch = [
-            models.Prefetch(query=qvec, using=using, limit=limit, filter=qfilter)
+            models.Prefetch(query=qvec, using=using, limit=limit + offset, filter=qfilter)
             for _, using, qvec in modalities
         ]
         result = self.client.query_points(
@@ -253,6 +262,7 @@ class SearchStore:
             prefetch=prefetch,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=limit,
+            offset=offset,
             with_payload=True,
         )
         return "rrf", self._to_hits(result.points)

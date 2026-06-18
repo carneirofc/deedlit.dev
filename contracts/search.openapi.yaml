@@ -128,6 +128,7 @@ components:
           description: CLIP text vector matched against points' description vectors.
         sparse: { $ref: "#/components/schemas/SparseVector" }
         limit: { type: integer, default: 24 }
+        offset: { type: integer, default: 0, minimum: 0, description: "Rank offset for server-side pagination over the whole matching set." }
         filter: { type: [object, "null"], additionalProperties: true }
       required: []
       description: >-

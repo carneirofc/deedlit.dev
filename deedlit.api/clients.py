@@ -250,7 +250,9 @@ def _to_qdrant_filter(facets: dict[str, Any] | None) -> dict[str, Any] | None:
     return qfilter or None
 
 
-async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) -> Any:
+async def search_by_text(
+    query: str, limit: int, filter: dict[str, Any] | None, offset: int = 0
+) -> Any:
     """Encode ``query`` via vision, then run the hybrid search on deedlit.search.
 
     An empty query has no vector to search by. Rather than returning nothing
@@ -265,8 +267,8 @@ async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) 
     """
     vectors = await encode_query(query)
     if vectors is None:
-        return await browse_catalog(limit, filter)
-    body = {**vectors, "limit": limit, "filter": _to_qdrant_filter(filter)}
+        return await browse_catalog(limit, filter, offset)
+    body = {**vectors, "limit": limit, "offset": offset, "filter": _to_qdrant_filter(filter)}
     return await search("POST", "/query", json=body)
 
 
@@ -296,16 +298,20 @@ async def search_similar(
     return await search("POST", "/similar", json=body)
 
 
-async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str, Any]:
+async def browse_catalog(
+    limit: int, filter: dict[str, Any] | None, offset: int = 0
+) -> dict[str, Any]:
     """List cataloged images as search-shaped hits (no-query browse fallback).
 
     deedlit.search is purely vector-driven and can't answer a filter-only/empty
     query, but the catalog is the source of truth and lists images directly.
     We map its rows into the ``{fusion, hits:[{sha256, score, payload}]}`` shape
     the UI already consumes, threading the supported facets (tag/favorite) into
-    catalog ``GET /images`` query params.
+    catalog ``GET /images`` query params. ``offset`` pages the catalog list.
     """
     params: dict[str, Any] = {"limit": limit}
+    if offset:
+        params["offset"] = offset
     if filter:
         # The UI sends `tags: [...]` (catalog lists by a single tag) + `favorite`.
         tags = filter.get("tags") or filter.get("tag")

@@ -171,6 +171,23 @@ def test_query_hybrid_uses_rrf_fusion():
     assert scores == sorted(scores, reverse=True)
 
 
+def test_query_offset_pages_the_ranked_result():
+    """`offset` skips the top N of the ranked result server-side, so search can
+    page over the WHOLE matching set (not a client slice of a fixed top-K)."""
+    # Single-modality (dense) offset.
+    base = client.post("/query", json={"dense": _dense(0), "limit": 10}).json()["hits"]
+    ranked = [h["sha256"] for h in base]
+    assert len(ranked) >= 3  # the seeded A/B/C
+    paged = client.post("/query", json={"dense": _dense(0), "limit": 10, "offset": 1}).json()["hits"]
+    assert [h["sha256"] for h in paged] == ranked[1:]
+
+    # Fused (dense+sparse RRF) offset — the prefetch is deepened to limit+offset.
+    hybrid = {"dense": _dense(0), "sparse": _sparse([1, 2, 3], [0.9, 0.8, 0.1]), "limit": 10}
+    fbase = [h["sha256"] for h in client.post("/query", json=hybrid).json()["hits"]]
+    fpaged = client.post("/query", json={**hybrid, "offset": 1}).json()["hits"]
+    assert [h["sha256"] for h in fpaged] == fbase[1:]
+
+
 # --- (4) /query with only dense (or only sparse) ----------------------------
 
 

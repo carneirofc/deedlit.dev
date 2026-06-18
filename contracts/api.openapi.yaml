@@ -83,7 +83,7 @@ paths:
         deedlit.vision (/embed/text + /embed/sparse) before querying search. An
         empty `query` has no vector and returns an empty result set; filter-only
         browse is not yet supported here.
-      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { query: { type: string }, limit: { type: integer, default: 24 }, filter: { type: [object, "null"], additionalProperties: true } }, required: [query] } } } }
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { query: { type: string }, limit: { type: integer, default: 24 }, offset: { type: integer, default: 0, minimum: 0 }, filter: { type: [object, "null"], additionalProperties: true } }, required: [query] } } } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } } }
   /images/count:
     get:

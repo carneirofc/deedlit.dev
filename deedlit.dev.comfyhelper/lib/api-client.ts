@@ -313,6 +313,8 @@ export async function batchDeleteImages(
 export interface GatewaySearchRequest {
   query: string;
   limit?: number;
+  /** Rank offset for server-side pagination over the whole matching set. */
+  offset?: number;
   filter?: Record<string, unknown> | null;
 }
 

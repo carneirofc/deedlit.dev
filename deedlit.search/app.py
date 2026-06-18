@@ -200,6 +200,7 @@ def query(body: HybridQuery) -> QueryResponse:
         limit=body.limit,
         query_filter=body.filter,
         description=body.description,
+        offset=body.offset,
     )
     return QueryResponse(fusion=fusion, hits=hits)
 
