@@ -62,6 +62,9 @@ def mock_publish(monkeypatch):
         calls["pub_ingest"].append(path)
 
     monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+    # No catalog in tests: "nothing cataloged" so a folder scan enqueues every
+    # file. The incremental dedup-skip path has its own test below.
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     return calls
 
 
@@ -103,22 +106,32 @@ def test_ingest_returns_job_and_enqueues_each_file(tmp_path, fresh_store, mock_p
 
 
 # ---------------------------------------------------------------------------
-# (2) re-running re-enqueues every file (no producer dedup; the worker's catalog
-# upsert is idempotent, so re-enqueuing is safe and the cheapest correct option)
+# (2c) incremental scan: files already cataloged (by path) are skipped, so a
+# scheduled re-walk / re-ingest of an unchanged library enqueues nothing — the
+# fix for the re-enqueue storm that re-embedded + re-labelled everything per scan.
 # ---------------------------------------------------------------------------
-def test_rerun_reenqueues_every_file(tmp_path, fresh_store, mock_publish):
-    _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0)])
-    with TestClient(app_module.app) as client:
-        first = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()
-        assert _wait_for(client, first["id"], {"completed"})["progress"]["done"] == 2
+def test_already_cataloged_files_are_skipped(tmp_path, fresh_store, monkeypatch):
+    paths = _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
+    # Catalog already holds the first two (forward-slash normalized, as the real
+    # boundary returns); the third is new.
+    cataloged = {str(paths[0]).replace("\\", "/"), str(paths[1]).replace("\\", "/")}
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: cataloged)
+    published: list[str] = []
 
-        second = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()
-        f2 = _wait_for(client, second["id"], {"completed"})
-        assert f2["progress"]["total"] == 2
-        assert f2["progress"]["done"] == 2
-        assert f2["progress"]["skipped"] == 0
-    # Both runs enqueued both files.
-    assert len(mock_publish["pub_ingest"]) == 4
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        published.append(path)
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+
+    with TestClient(app_module.app) as client:
+        job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
+        final = _wait_for(client, job_id, {"completed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["total"] == 3
+        assert final["progress"]["skipped"] == 2  # the two already-cataloged
+        assert final["progress"]["done"] == 1  # only the new file enqueued
+    assert len(published) == 1
+    assert published[0].replace("\\", "/") == str(paths[2]).replace("\\", "/")
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +142,7 @@ def test_broker_down_marks_files_failed(tmp_path, fresh_store, monkeypatch):
         raise RuntimeError("broker down")
 
     monkeypatch.setattr(broker_module, "publish_ingest_task", boom)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0)])
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
@@ -187,6 +201,7 @@ def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
 
     monkeypatch.setenv("INGEST_CONCURRENCY", "1")
     monkeypatch.setattr(broker_module, "publish_ingest_task", slow_publish)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]

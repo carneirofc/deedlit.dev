@@ -111,6 +111,7 @@ def test_ingest_run_sets_timestamps_and_publish_stage(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
 
     (tmp_path / "a.png").write_bytes(_png_bytes((1, 2, 3)))
     (tmp_path / "b.png").write_bytes(_png_bytes((4, 5, 6)))

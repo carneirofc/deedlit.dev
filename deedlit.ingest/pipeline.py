@@ -509,6 +509,37 @@ def list_catalog_sha256() -> list[str]:
     return out
 
 
+def list_catalog_filepaths_under(folder: str) -> set[str]:
+    """Every on-disk filepath the catalog already holds under ``folder``.
+
+    Backs the folder scan's INCREMENTAL skip: a re-scan only enqueues files whose
+    path is not already cataloged, so a scheduled re-walk (or a manual re-ingest)
+    of an unchanged library never re-runs the whole projection DAG — the bug that
+    let a 60s scan tick re-embed + re-label the entire library forever. Pages
+    catalog ``GET /images?path=<folder>`` (the separator-insensitive substring
+    filter) and returns the paths normalized to forward slashes for OS-agnostic
+    matching against the on-disk walk.
+    """
+    out: set[str] = set()
+    offset = 0
+    while True:
+        resp = httpx.get(
+            f"{CATALOG_URL}/images",
+            params={"path": folder, "limit": CATALOG_PAGE_SIZE, "offset": offset},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json() or []
+        for row in rows:
+            fp = row.get("filepath") if isinstance(row, dict) else None
+            if fp:
+                out.add(fp.replace("\\", "/"))
+        if len(rows) < CATALOG_PAGE_SIZE:
+            break
+        offset += CATALOG_PAGE_SIZE
+    return out
+
+
 async def search_has(sha256: str) -> bool:
     """Coverage probe: is ``sha256`` present in the search (Qdrant) projection?
 

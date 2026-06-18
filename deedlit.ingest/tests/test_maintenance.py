@@ -81,6 +81,8 @@ def mock_outbound(monkeypatch):
     monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("pub_sparse"))
     monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("pub_graph"))
     monkeypatch.setattr(broker_module, "publish_label_task", _record("pub_label"))
+    # No catalog in tests: "nothing cataloged" so a rescan enqueues every file.
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     return calls
 
 
@@ -228,6 +230,7 @@ def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
 
     monkeypatch.setenv("INGEST_CONCURRENCY", "1")
     monkeypatch.setattr(broker_module, "publish_ingest_task", slow_publish)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
 
     with TestClient(app_module.app) as client:
         job_id = client.post(

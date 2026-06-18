@@ -546,7 +546,7 @@ class JobStore:
         )
 
     async def _run_folder(self, job: Job) -> None:
-        """Walk the folder and PUBLISH one ``ingest`` task per file (ADR 0002).
+        """Walk the folder and PUBLISH one ``ingest`` task per NEW file (ADR 0002).
 
         The producer does no processing — it only enqueues. The ingest-worker pool
         reads the bytes, catalogs each file, and fans out the per-stage DAG, all in
@@ -554,9 +554,39 @@ class JobStore:
         in flight via a semaphore so a huge folder enqueues steadily; cancellation
         is honoured between launches (already-launched publishes finish, then the
         job settles cancelled). ``progress.done`` counts files ENQUEUED.
+
+        INCREMENTAL: files already cataloged (by on-disk path) are SKIPPED so a
+        scheduled re-walk / manual re-ingest of an unchanged library doesn't
+        re-enqueue the whole projection DAG (which would re-embed + re-label every
+        image every scan, never draining the queues). A file edited in place keeps
+        its path — re-project it explicitly via reindex.
         """
         files = _list_supported_files(job.folder_path or "")
         job.progress.total = len(files)
+        # Dedup against catalog truth (one paged read). A lookup failure degrades
+        # to enqueuing everything rather than skipping new files.
+        try:
+            cataloged = await asyncio.to_thread(
+                pipeline.list_catalog_filepaths_under, job.folder_path or ""
+            )
+        except Exception as exc:  # noqa: BLE001 — catalog down: don't drop new files
+            log.warning(
+                "folder scan %s: catalog dedup lookup failed (%s); enqueuing all",
+                job.id, exc,
+            )
+            cataloged = set()
+        new_files: list[Path] = []
+        for path in files:
+            if str(path).replace("\\", "/") in cataloged:
+                job.progress.skipped += 1
+            else:
+                new_files.append(path)
+        files = new_files
+        if files:
+            log.info(
+                "folder scan %s: %d new, %d already cataloged (skipped)",
+                job.id, len(files), job.progress.skipped,
+            )
         sem = asyncio.Semaphore(ingest_concurrency())
         tasks: list[asyncio.Task] = []
 
