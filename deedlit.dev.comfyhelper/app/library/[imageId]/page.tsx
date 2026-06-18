@@ -138,20 +138,24 @@ export default function ImageDetailPage() {
   }, [detail, imageId, ratingBusy]);
 
   // Detail load — independent of settings so the page renders immediately.
-  const load = useCallback(async () => {
+  const load = useCallback(async (signal?: AbortSignal) => {
     setError(null);
     try {
-      const res = await fetch(`/api/library/images/${imageId}`);
+      const res = await fetch(`/api/library/images/${imageId}`, { signal });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Not found");
       setDetail(json);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
       setError(e instanceof Error ? e.message : "Failed to load");
     }
   }, [imageId]);
 
   useEffect(() => {
-    load();
+    // Cancel the detail fetch if the user navigates away before it lands.
+    const ac = new AbortController();
+    load(ac.signal);
+    return () => ac.abort();
   }, [load]);
 
   // Decide whether to auto-fetch suggestions for this image.
@@ -167,6 +171,7 @@ export default function ImageDetailPage() {
       return;
     }
     let cancelled = false;
+    const ac = new AbortController();
     setSuggestLoading(true);
     fetch("/api/library/search/similar", {
       method: "POST",
@@ -176,6 +181,7 @@ export default function ImageDetailPage() {
         limit: settings.similarCount,
         minScore: settings.similarMinScore,
       }),
+      signal: ac.signal,
     })
       .then((r) => r.json())
       .then((j) => {
@@ -185,8 +191,11 @@ export default function ImageDetailPage() {
       .finally(() => {
         if (!cancelled) setSuggestLoading(false);
       });
+    // Cancel the in-flight request on unmount / dep change (navigation) so a
+    // slow similarity query never hangs after the user leaves.
     return () => {
       cancelled = true;
+      ac.abort();
     };
   }, [
     hydrated,
@@ -204,7 +213,8 @@ export default function ImageDetailPage() {
       return;
     }
     let cancelled = false;
-    fetch(`/api/library/images/${imageId}/graph?depth=${settings.graphDepth}`)
+    const ac = new AbortController();
+    fetch(`/api/library/images/${imageId}/graph?depth=${settings.graphDepth}`, { signal: ac.signal })
       .then((r) => r.json())
       .then((j) => {
         if (!cancelled) setGraph(j);
@@ -212,6 +222,7 @@ export default function ImageDetailPage() {
       .catch(() => {});
     return () => {
       cancelled = true;
+      ac.abort();
     };
   }, [hydrated, imageId, settings.showRelationshipGraph, settings.graphDepth]);
 
@@ -229,7 +240,8 @@ export default function ImageDetailPage() {
     }
     const seed = detail.tags[0].normalizedName || detail.tags[0].name;
     let cancelled = false;
-    fetch(`/api/library/tags/${encodeURIComponent(seed)}/related?limit=${settings.relatedTagsCount}`)
+    const ac = new AbortController();
+    fetch(`/api/library/tags/${encodeURIComponent(seed)}/related?limit=${settings.relatedTagsCount}`, { signal: ac.signal })
       .then((r) => r.json())
       .then((j) => {
         if (!cancelled) setRelatedTags(Array.isArray(j.related) ? j.related : []);
@@ -237,19 +249,21 @@ export default function ImageDetailPage() {
       .catch(() => {});
     return () => {
       cancelled = true;
+      ac.abort();
     };
   }, [hydrated, detail, settings.showRelatedTags, settings.relatedTagsCount]);
 
   // Load notes for this image.
   useEffect(() => {
     let alive = true;
+    const ac = new AbortController();
     setNotesLoading(true);
-    fetch(`/api/library/notes/by-image/${encodeURIComponent(imageId)}`)
+    fetch(`/api/library/notes/by-image/${encodeURIComponent(imageId)}`, { signal: ac.signal })
       .then((r) => r.ok ? r.json() : [])
       .then((j) => { if (alive) setNotes(Array.isArray(j) ? j : []); })
       .catch(() => {})
       .finally(() => { if (alive) setNotesLoading(false); });
-    return () => { alive = false; };
+    return () => { alive = false; ac.abort(); };
   }, [imageId]);
 
   const addNote = useCallback(async () => {

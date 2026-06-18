@@ -105,6 +105,9 @@ export default function DbPage() {
   const pageRef = useRef(0);
   const listScrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  // Active list request, so a new filter/page supersedes the previous one and a
+  // navigation away aborts whatever is still in flight (no hanging fetch).
+  const fetchAbortRef = useRef<AbortController | null>(null);
   const filtersRef = useRef({ tag, safety, favorite, path });
   useEffect(() => {
     filtersRef.current = { tag, safety, favorite, path };
@@ -118,9 +121,12 @@ export default function DbPage() {
     if (f.safety) sp.set("safety", f.safety);
     if (f.favorite) sp.set("favorite", "true");
     if (f.path.trim()) sp.set("path", f.path.trim());
+    fetchAbortRef.current?.abort();
+    const ac = new AbortController();
+    fetchAbortRef.current = ac;
     setLoadingMore(true);
     try {
-      const j = await fetch(`/api/library/admin/images?${sp.toString()}`).then((r) => r.json());
+      const j = await fetch(`/api/library/admin/images?${sp.toString()}`, { signal: ac.signal }).then((r) => r.json());
       const batch: CatalogImage[] = Array.isArray(j.images) ? (j.images as CatalogImage[]) : [];
       setHasMore(batch.length === PAGE_SIZE);
       if (reset) {
@@ -131,11 +137,17 @@ export default function DbPage() {
         setImages((prev) => [...prev, ...batch]);
       }
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
       setError(e instanceof Error ? e.message : "Load failed");
     } finally {
-      setLoadingMore(false);
+      // Only the current request clears the spinner (a superseded one already
+      // aborted, so its finally must not flip loading off under the new fetch).
+      if (fetchAbortRef.current === ac) setLoadingMore(false);
     }
   }, []);
+
+  // Abort the in-flight list request on unmount (navigation away).
+  useEffect(() => () => fetchAbortRef.current?.abort(), []);
 
   const load = useCallback(() => fetchPage(true), [fetchPage]);
   const loadMore = useCallback(() => fetchPage(false), [fetchPage]);

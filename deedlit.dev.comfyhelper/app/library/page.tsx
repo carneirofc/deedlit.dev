@@ -541,6 +541,16 @@ export default function LibraryPage() {
 
   const loadMore = useCallback(() => doFetch(true), [doFetch]);
 
+  // Cancel everything in flight when the user navigates away (the page unmounts):
+  // the active grid fetch AND every warmed background prefetch, so a slow search /
+  // browse never hangs holding a connection after we've left the library.
+  useEffect(() => {
+    return () => {
+      fetchController.current?.abort();
+      prefetchRef.current.controllers.forEach((c) => c.abort());
+    };
+  }, []);
+
   const openLightbox = useCallback((index: number, autoplay = false) => {
     setLightboxAutoPlay(autoplay);
     setLightboxIndex(index);
@@ -880,14 +890,15 @@ export default function LibraryPage() {
   // its own page (/admin/health, self-polling ServiceStatusBoard).
   useEffect(() => {
     if (!showIngest) return;
+    const ac = new AbortController();
     const pollJobs = () =>
-      fetch("/api/library/jobs")
+      fetch("/api/library/jobs", { signal: ac.signal })
         .then((r) => r.json())
         .then((j) => { if (j.jobs) setJobs(j.jobs); })
         .catch(() => {});
     pollJobs();
     const id = setInterval(pollJobs, 3000);
-    return () => clearInterval(id);
+    return () => { clearInterval(id); ac.abort(); };
   }, [showIngest]);
 
   // First search — wait for saved settings so pagination / filter defaults
@@ -997,12 +1008,14 @@ export default function LibraryPage() {
       offset: 0,
     };
     let alive = true;
+    const ac = new AbortController();
     const check = async () => {
       try {
         const r = await fetch("/api/library/browse", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
+          signal: ac.signal,
         });
         if (!r.ok) return;
         const j = await r.json();
@@ -1039,6 +1052,7 @@ export default function LibraryPage() {
     return () => {
       alive = false;
       clearInterval(id);
+      ac.abort(); // cancel any in-flight poll on unmount / filter change
     };
   }, [mode, query, tags, excludeTags, favorites, minRating, safety, pathFilter, settings.sortMode, invalidatePrefetchPages]);
 
@@ -1086,11 +1100,12 @@ export default function LibraryPage() {
   // input just narrows the list client-side, instead of a blind type-ahead.
   useEffect(() => {
     let alive = true;
-    fetch("/api/library/tags?limit=2000")
+    const ac = new AbortController();
+    fetch("/api/library/tags?limit=2000", { signal: ac.signal })
       .then((r) => (r.ok ? r.json() : { tags: [] }))
       .then((j) => { if (alive && Array.isArray(j.tags)) setAllTags(j.tags as string[]); })
-      .catch(() => { /* quiet — the picker just stays empty */ });
-    return () => { alive = false; };
+      .catch(() => { /* quiet — aborted on unmount or the picker stays empty */ });
+    return () => { alive = false; ac.abort(); };
   }, []);
 
   // The vector path can't sort by date/name (its rows lack them), so honour a
