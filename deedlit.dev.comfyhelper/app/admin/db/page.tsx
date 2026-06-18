@@ -248,9 +248,9 @@ export default function DbPage() {
     setConfirmingBulk(false);
   };
 
-  // Un-index every picked image (catalog + search + graph; files stay on disk),
-  // fanning the per-image delete out with bounded concurrency. Whatever actually
-  // went away is pruned from the list even on a partial failure.
+  // Un-index every picked image (catalog + search + graph; files stay on disk) in
+  // ONE batch call (a few DB round-trips, not N×3). Whatever actually went away is
+  // pruned from the list even on a partial failure.
   const excludeSelected = async () => {
     const ids = [...picked];
     if (ids.length === 0) return;

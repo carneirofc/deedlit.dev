@@ -47,6 +47,12 @@ class SimilarQuery(BaseModel):
     filter: dict[str, Any] | None = None
 
 
+class BatchDeletePoints(BaseModel):
+    """Bulk un-index body: the sha256s whose points to delete in one Qdrant call."""
+
+    sha256s: list[str] = Field(default_factory=list, max_length=1000)
+
+
 class Hit(BaseModel):
     sha256: str = Field(pattern=SHA256_PATTERN)
     score: float = Field(description="RRF-fused score when hybrid")

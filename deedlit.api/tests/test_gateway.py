@@ -314,6 +314,55 @@ def test_delete_image_502_when_catalog_errors(rec, client):
     assert _bases(rec) == {clients.CATALOG_URL}
 
 
+# Bulk un-index: catalog batch-delete FIRST, then search + graph batch-delete for
+# exactly the records that existed — one round-trip per store, not per image.
+_SHA2 = "b" * 64
+
+
+def test_batch_delete_fans_out_catalog_first_then_projections(rec, client):
+    # catalog + graph share POST /images/batch-delete; search at /points/batch-delete.
+    rec.on("POST", "/images/batch-delete", lambda r: {"deleted": [SHA, _SHA2], "missing": []})
+    rec.on("POST", "/points/batch-delete", lambda r: {"status": "ok", "count": 2})
+
+    r = client.post("/images/batch-delete", json={"sha256s": [SHA, _SHA2]})
+    assert r.status_code == 200
+    body = r.json()
+    assert sorted(body["deleted"]) == sorted([SHA, _SHA2])
+    assert body["missing"] == []
+    assert body["search"] is True and body["graph"] is True
+    assert _bases(rec) == {clients.CATALOG_URL, clients.SEARCH_URL, clients.GRAPH_URL}
+    # Catalog (the source of truth) is deleted FIRST, before the projections.
+    assert rec.calls[0][0] == clients.CATALOG_URL
+
+
+def test_batch_delete_skips_projections_when_nothing_deleted(rec, client):
+    rec.on("POST", "/images/batch-delete", lambda r: {"deleted": [], "missing": [SHA]})
+    r = client.post("/images/batch-delete", json={"sha256s": [SHA]})
+    assert r.status_code == 200
+    assert r.json()["missing"] == [SHA]
+    # No records existed -> no search/graph round-trips at all.
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
+def test_batch_delete_reports_projection_failure_but_succeeds(rec, client):
+    rec.on("POST", "/images/batch-delete", lambda r: {"deleted": [SHA], "missing": []})
+    rec.on("POST", "/points/batch-delete", lambda r: httpx.Response(500, json={"detail": "boom"}))
+
+    r = client.post("/images/batch-delete", json={"sha256s": [SHA]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted"] == [SHA]
+    assert body["search"] is False  # projection failure surfaced, not fatal
+    assert body["graph"] is True
+
+
+def test_batch_delete_502_when_catalog_errors(rec, client):
+    rec.on("POST", "/images/batch-delete", lambda r: httpx.Response(500, json={"detail": "db down"}))
+    r = client.post("/images/batch-delete", json={"sha256s": [SHA]})
+    assert r.status_code == 502
+    assert _bases(rec) == {clients.CATALOG_URL}
+
+
 def test_blob_proxy_streams_catalog_bytes(rec, client):
     # comfyhelper is UI-only and holds no object store, so the gateway proxies
     # raw image bytes from the catalog (the blob owner).

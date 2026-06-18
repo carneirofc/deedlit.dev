@@ -15,7 +15,7 @@ import json
 import os
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from catalog.db import get_engine
@@ -144,57 +144,166 @@ def _image_uuid(conn: Connection, sha256: str) -> str | None:
     return str(row[0]) if row else None
 
 
+# The full image-row column list, shared by the single-image fetch and the
+# batched browse fetch so the two never drift.
+_IMAGE_COLUMNS = """
+    id, sha256_hash, file_path, perceptual_hash, width, height,
+    source_tool, prompt, negative_prompt, rating, favorite,
+    safety, workflow_json, metadata_json, created_at, imported_at
+"""
+
+
+def _row_to_image(
+    row: Any,
+    *,
+    tags: list[str],
+    params: Params | None,
+    references: list[AssetRef],
+    description: str | None,
+) -> Image:
+    """Assemble an :class:`Image` from a raw image row + its already-loaded
+    children. The single place the row→model mapping lives, so the per-image
+    (:func:`get_image`) and batched (:func:`_hydrate_images`) paths agree."""
+    metadata = row["metadata_json"] or {}
+    api_prompt_json = (
+        metadata.get("api_prompt_json") if isinstance(metadata, dict) else None
+    )
+    return Image(
+        sha256=row["sha256_hash"],
+        filepath=row["file_path"],
+        phash=row["perceptual_hash"],
+        width=row["width"],
+        height=row["height"],
+        sourceTool=row["source_tool"],
+        prompt=row["prompt"],
+        negative=row["negative_prompt"],
+        tags=tags,
+        params=params,
+        references=references,
+        workflow_json=row["workflow_json"],
+        api_prompt_json=api_prompt_json,
+        rating=row["rating"],
+        favorite=row["favorite"],
+        safety=row["safety"],
+        description=description,
+        # created_at = captured file mtime; fall back to the import time for
+        # rows ingested before mtime capture existed (keeps it non-null).
+        created_at=row["created_at"] or row["imported_at"],
+        imported_at=row["imported_at"],
+    )
+
+
 def get_image(sha256: str) -> Image | None:
     eng = get_engine()
     with eng.connect() as conn:
         row = conn.execute(
-            text(
-                """
-                SELECT id, sha256_hash, file_path, perceptual_hash, width, height,
-                       source_tool, prompt, negative_prompt, rating, favorite,
-                       safety, workflow_json, metadata_json, created_at, imported_at
-                FROM images WHERE sha256_hash = :sha
-                """
-            ),
+            text(f"SELECT {_IMAGE_COLUMNS} FROM images WHERE sha256_hash = :sha"),
             {"sha": sha256},
         ).mappings().first()
         if row is None:
             return None
-
         image_id = str(row["id"])
-        tags = _get_tags(conn, image_id)
-        params = _get_params(conn, image_id)
-        references = _get_references(conn, sha256)
-        description = _get_description(conn, image_id)
-
-        metadata = row["metadata_json"] or {}
-        api_prompt_json = (
-            metadata.get("api_prompt_json") if isinstance(metadata, dict) else None
+        return _row_to_image(
+            row,
+            tags=_get_tags(conn, image_id),
+            params=_get_params(conn, image_id),
+            references=_get_references(conn, sha256),
+            description=_get_description(conn, image_id),
         )
 
-        return Image(
-            sha256=row["sha256_hash"],
-            filepath=row["file_path"],
-            phash=row["perceptual_hash"],
-            width=row["width"],
-            height=row["height"],
-            sourceTool=row["source_tool"],
-            prompt=row["prompt"],
-            negative=row["negative_prompt"],
-            tags=tags,
-            params=params,
-            references=references,
-            workflow_json=row["workflow_json"],
-            api_prompt_json=api_prompt_json,
-            rating=row["rating"],
-            favorite=row["favorite"],
-            safety=row["safety"],
-            description=description,
-            # created_at = captured file mtime; fall back to the import time for
-            # rows ingested before mtime capture existed (keeps it non-null).
-            created_at=row["created_at"] or row["imported_at"],
-            imported_at=row["imported_at"],
+
+def _hydrate_images(conn: Connection, rows: list[Any]) -> list[Image]:
+    """Load tags/params/references/descriptions for a PAGE of image rows in four
+    set-based queries (one per child table) instead of the per-image N+1.
+
+    ``rows`` are full image-row mappings (must include ``id`` + ``sha256_hash``),
+    in the desired output order. Children are fetched with expanding ``IN`` lists
+    — the same scalar binding the per-image helpers use — grouped in Python, then
+    stitched back onto each row. A page of 50 images goes from ~250 round-trips
+    (5 per image) to 5 total, all on this one connection.
+    """
+    if not rows:
+        return []
+    ids = [str(r["id"]) for r in rows]
+    shas = [r["sha256_hash"] for r in rows]
+
+    tag_rows = conn.execute(
+        text(
+            """
+            SELECT it.image_id AS iid, t.name AS name
+            FROM image_tags it JOIN tags t ON t.id = it.tag_id
+            WHERE it.image_id IN :ids
+            ORDER BY t.name
+            """
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": ids},
+    ).all()
+    tags_by_id: dict[str, list[str]] = {}
+    for iid, name in tag_rows:
+        tags_by_id.setdefault(str(iid), []).append(name)
+
+    param_rows = conn.execute(
+        text(
+            """
+            SELECT image_id AS iid, seed, steps, cfg_scale, sampler, scheduler,
+                   denoise, width, height, clip_skip
+            FROM generation_params WHERE image_id IN :ids
+            """
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": ids},
+    ).mappings().all()
+    params_by_id: dict[str, Params] = {
+        str(r["iid"]): Params(
+            seed=r["seed"],
+            steps=r["steps"],
+            cfg=r["cfg_scale"],
+            sampler=r["sampler"],
+            scheduler=r["scheduler"],
+            denoise=r["denoise"],
+            clipskip=r["clip_skip"],
+            width=r["width"],
+            height=r["height"],
         )
+        for r in param_rows
+    }
+
+    ref_rows = conn.execute(
+        text(
+            "SELECT sha256, kind, name, hash FROM image_references "
+            "WHERE sha256 IN :shas ORDER BY position, kind, name"
+        ).bindparams(bindparam("shas", expanding=True)),
+        {"shas": shas},
+    ).mappings().all()
+    refs_by_sha: dict[str, list[AssetRef]] = {}
+    for r in ref_rows:
+        refs_by_sha.setdefault(r["sha256"], []).append(
+            AssetRef(kind=r["kind"], name=r["name"], hash=r["hash"])
+        )
+
+    # Latest description per image (DISTINCT ON keeps the newest by created_at),
+    # mirroring _get_description's ORDER BY created_at DESC LIMIT 1.
+    desc_rows = conn.execute(
+        text(
+            """
+            SELECT DISTINCT ON (image_id) image_id AS iid, description
+            FROM image_descriptions WHERE image_id IN :ids
+            ORDER BY image_id, created_at DESC
+            """
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": ids},
+    ).all()
+    desc_by_id: dict[str, str] = {str(iid): desc for iid, desc in desc_rows}
+
+    return [
+        _row_to_image(
+            r,
+            tags=tags_by_id.get(str(r["id"]), []),
+            params=params_by_id.get(str(r["id"])),
+            references=refs_by_sha.get(r["sha256_hash"], []),
+            description=desc_by_id.get(str(r["id"])),
+        )
+        for r in rows
+    ]
 
 
 # Browse sort orders. WHITELISTED: the `sort` key is looked up here and never
@@ -323,10 +432,14 @@ def list_images(
     params.update({"limit": limit, "offset": offset})
     order_by = _ORDER_BY.get(sort, _ORDER_BY["newest"])
     with eng.connect() as conn:
+        # Select the FULL page of image rows up front (one query), then batch-load
+        # their children (tags/params/refs/descriptions) in four more — see
+        # _hydrate_images. The old per-row get_image() was an N+1: a 50-row page
+        # cost ~250 queries + 50 connection checkouts.
         rows = conn.execute(
             text(
                 f"""
-                SELECT i.sha256_hash
+                SELECT {_IMAGE_COLUMNS}
                 FROM images i
                 WHERE {where}
                 ORDER BY {order_by}
@@ -335,12 +448,7 @@ def list_images(
             ),
             params,
         ).mappings().all()
-    out: list[Image] = []
-    for r in rows:
-        img = get_image(r["sha256_hash"])
-        if img is not None:
-            out.append(img)
-    return out
+        return _hydrate_images(conn, list(rows))
 
 
 def count_images(
@@ -516,6 +624,35 @@ def delete_image(sha256: str) -> bool:
             {"sha": sha256},
         )
         return res.rowcount > 0
+
+
+def delete_images(sha256s: list[str]) -> list[str]:
+    """Hard-delete MANY images + their catalog-owned rows in ONE transaction.
+
+    The batch counterpart to :func:`delete_image`: two SET-BASED deletes (asset
+    references by sha, then the image rows — FK children cascade) instead of two
+    queries per image, so un-indexing 100 images is 2 round-trips, not 200.
+    Returns the sha256s that were actually present (``RETURNING``), so the caller
+    cleans exactly their blobs and reports the misses. Curation refs
+    (notes/collections) are left intact, mirroring :func:`delete_image`.
+    """
+    if not sha256s:
+        return []
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(
+            text("DELETE FROM image_references WHERE sha256 IN :shas").bindparams(
+                bindparam("shas", expanding=True)
+            ),
+            {"shas": sha256s},
+        )
+        rows = conn.execute(
+            text(
+                "DELETE FROM images WHERE sha256_hash IN :shas RETURNING sha256_hash"
+            ).bindparams(bindparam("shas", expanding=True)),
+            {"shas": sha256s},
+        ).all()
+    return [r[0] for r in rows]
 
 
 def set_rating(sha256: str, rating: int) -> bool:

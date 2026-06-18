@@ -47,6 +47,50 @@ services:
       POSTGRES_USER: imageapp
       POSTGRES_PASSWORD: imageapp
       POSTGRES_DB: imageapp
+    # Performance tuning over the alpine image's tiny defaults (128MB
+    # shared_buffers / 4MB work_mem) that lag under the ingest write burst + the
+    # catalog browse/count/tag-report reads. Defaults here are CONSERVATIVE so the
+    # stack boots on a small host (e.g. Docker Desktop): shared_buffers is the
+    # only real boot-time allocation, kept at 256MB. On a big box scale UP via env
+    # (shared_buffers ~= 25% RAM, effective_cache_size ~= 50-75% RAM), e.g.
+    #   POSTGRES_SHARED_BUFFERS=2GB POSTGRES_EFFECTIVE_CACHE_SIZE=6GB ...
+    # The WAL / SSD-cost / parallel knobs below cost no startup memory.
+    # synchronous_commit stays ON — Postgres is the ingest durability layer.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}"
+      - "-c"
+      - "shared_buffers=${POSTGRES_SHARED_BUFFERS:-2GB}"
+      - "-c"
+      - "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-6GB}"
+      - "-c"
+      - "maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-512MB}"
+      - "-c"
+      - "work_mem=${POSTGRES_WORK_MEM:-32MB}"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      # SSD-friendly planner costs + deeper async I/O queue.
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      # Parallel query workers (browse/count over a large catalog).
+      - "-c"
+      - "max_worker_processes=8"
+      - "-c"
+      - "max_parallel_workers=8"
+      - "-c"
+      - "max_parallel_workers_per_gather=2"
+    # /dev/shm for parallel-query + large work_mem hash/sort spills; Docker's 64MB
+    # default can throw "could not resize shared memory segment" under load.
+    shm_size: ${POSTGRES_SHM_SIZE:-512mb}
     ports:
       - "5432:5432"
     volumes:
@@ -64,6 +108,13 @@ services:
       NEO4J_AUTH: neo4j/password
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      # Memory tuning over the small community defaults (a growing graph spills to
+      # disk and lags). heap initial == max avoids GC resize pauses; pagecache
+      # should ideally hold the whole graph store. Env-overridable — shrink on a
+      # low-RAM host (NEO4J_HEAP=1G NEO4J_PAGECACHE=512M) or grow on a big box.
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-2G}
     ports:
       - "7474:7474"
       - "7687:7687"

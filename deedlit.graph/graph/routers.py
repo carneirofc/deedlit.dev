@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
 
 from graph import repository
 from graph.models import (
@@ -15,9 +16,25 @@ from graph.rebuild import rebuild_from_catalog
 router = APIRouter()
 
 
+class BatchDeleteRequest(BaseModel):
+    """Bulk un-index body: the sha256s whose nodes to remove in one Cypher call."""
+
+    sha256s: list[str] = Field(default_factory=list, max_length=1000)
+
+
 @router.post("/edges")
 def post_edges(edge: EdgeUpsert) -> dict:
     return repository.upsert_edges(edge)
+
+
+@router.post("/images/batch-delete")
+def batch_delete_images(body: BatchDeleteRequest) -> dict:
+    """Delete MANY image nodes + edges in one query (bulk un-index). Idempotent.
+
+    Called by the gateway after the catalog records are gone. Missing nodes are a
+    no-op. Returns the count of nodes removed."""
+    deleted = repository.delete_images(body.sha256s)
+    return {"status": "ok", "deleted": deleted}
 
 
 @router.delete("/images/{sha256}")

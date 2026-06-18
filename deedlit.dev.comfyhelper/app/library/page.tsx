@@ -569,9 +569,9 @@ export default function LibraryPage() {
     setConfirmingBulk(false);
   }, []);
 
-  // Un-index every selected image, fanning the per-image delete out with bounded
-  // concurrency. Whatever actually went away is pruned from the grid even on a
-  // partial failure; the rest stay selected with the reason surfaced.
+  // Un-index every selected image in ONE batch call (a few DB round-trips, not
+  // N×3). Whatever actually went away is pruned from the grid even on a partial
+  // failure; the rest stay selected with the reason surfaced.
   const deleteSelected = useCallback(async () => {
     const ids = [...selected];
     if (ids.length === 0) return;

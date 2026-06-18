@@ -34,7 +34,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import clients
 import mcp
@@ -190,6 +190,29 @@ async def delete_image(sha256: str) -> dict[str, Any]:
     except DownstreamError as exc:
         if exc.status == 404:
             raise HTTPException(status_code=404, detail="image not found") from exc
+        raise HTTPException(
+            status_code=502, detail=f"catalog unavailable: {exc.detail}"
+        ) from exc
+
+
+class BatchDeleteRequest(BaseModel):
+    """POST /images/batch-delete body — the sha256s to bulk un-index (capped)."""
+
+    sha256s: list[str] = Field(min_length=1, max_length=1000)
+
+
+@app.post("/images/batch-delete")
+async def batch_delete_images(req: BatchDeleteRequest) -> dict[str, Any]:
+    """Bulk un-index MANY images across the stores in ONE call per store.
+
+    The batch counterpart to DELETE /images/{sha256}: catalog (truth) batch-delete
+    FIRST, then the search + graph projections are cleaned for exactly the records
+    that existed (best-effort, in parallel) — a single round-trip per store instead
+    of per image. Returns the ``deleted`` + ``missing`` sha256s and per-projection
+    outcome. A catalog failure aborts with 502 before any projection is touched."""
+    try:
+        return await clients.unindex_images(req.sha256s)
+    except DownstreamError as exc:
         raise HTTPException(
             status_code=502, detail=f"catalog unavailable: {exc.detail}"
         ) from exc

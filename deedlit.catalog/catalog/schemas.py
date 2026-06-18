@@ -139,6 +139,12 @@ class FolderReport(BaseModel):
     unlabeled_count: int = 0
 
 
+class BatchDeleteRequest(BaseModel):
+    """Bulk un-index body: the sha256s to hard-delete in one call (capped)."""
+
+    sha256s: list[str] = Field(min_length=1, max_length=1000)
+
+
 class RatingBody(BaseModel):
     rating: int = Field(ge=0, le=5)
 

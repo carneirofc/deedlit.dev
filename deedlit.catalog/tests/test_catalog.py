@@ -7,7 +7,6 @@ rating, favorite, references, and blob put/get for thumbnails + embeddings.
 from __future__ import annotations
 
 import hashlib
-import os
 import secrets
 
 
@@ -185,6 +184,38 @@ def test_list_filter_by_path_substring(client) -> None:
     assert client.get("/images/count", params={"path": "portraits"}).json()["count"] == 2
 
 
+def test_list_batches_children_per_image(client) -> None:
+    # Two images with DISTINCT tags / references / params / description. The browse
+    # list batch-loads all children across the page in one query each, so this
+    # guards against mis-grouping (image A inheriting image B's children).
+    a = _sha()
+    b = _sha()
+    client.post("/images", json={
+        "sha256": a, "filepath": "/lib/batch/a.png",
+        "tags": ["alpha", "shared"],
+        "references": [{"kind": "lora", "name": "lora-a"}],
+        "params": {"seed": 11, "steps": 7},
+        "description": "desc A",
+    })
+    client.post("/images", json={
+        "sha256": b, "filepath": "/lib/batch/b.png",
+        "tags": ["beta", "shared"],
+        "references": [{"kind": "checkpoint", "name": "ckpt-b"}],
+        "params": {"seed": 22, "steps": 9},
+        "description": "desc B",
+    })
+
+    by_sha = {i["sha256"]: i for i in client.get("/images", params={"path": "/lib/batch/"}).json()}
+    assert set(by_sha) == {a, b}
+    ia, ib = by_sha[a], by_sha[b]
+    assert sorted(ia["tags"]) == ["alpha", "shared"]
+    assert sorted(ib["tags"]) == ["beta", "shared"]
+    assert [r["name"] for r in ia["references"]] == ["lora-a"]
+    assert [r["name"] for r in ib["references"]] == ["ckpt-b"]
+    assert ia["params"]["seed"] == 11 and ib["params"]["seed"] == 22
+    assert ia["description"] == "desc A" and ib["description"] == "desc B"
+
+
 def test_delete_image_removes_record_refs_and_blob(client) -> None:
     sha = _sha()
     client.post(
@@ -215,6 +246,34 @@ def test_delete_image_removes_record_refs_and_blob(client) -> None:
 
 def test_delete_missing_image_404(client) -> None:
     assert client.delete(f"/images/{_sha()}").status_code == 404
+
+
+def test_batch_delete_images(client) -> None:
+    a, b, c = _sha(), _sha(), _sha()
+    for sha in (a, b, c):
+        client.post("/images", json={"sha256": sha, "tags": ["batchdel"], "references": [{"kind": "lora", "name": "x"}]})
+    client.put(f"/blobs/{a}/thumbnail", content=b"webp", headers={"content-type": "application/octet-stream"})
+    missing = _sha()  # never created
+
+    r = client.post("/images/batch-delete", json={"sha256s": [a, b, missing]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sorted(body["deleted"]) == sorted([a, b])
+    assert body["missing"] == [missing]
+
+    # a + b are gone (record + blob), c untouched.
+    assert client.get(f"/images/{a}").status_code == 404
+    assert client.get(f"/images/{b}").status_code == 404
+    assert client.get(f"/blobs/{a}/thumbnail").status_code == 404
+    assert client.get(f"/images/{c}").status_code == 200
+    # The deleted images no longer list under their tag; c still does.
+    listed = {i["sha256"] for i in client.get("/images", params={"tag": "batchdel"}).json()}
+    assert listed == {c}
+
+
+def test_batch_delete_empty_is_rejected(client) -> None:
+    # The body requires at least one sha (min_length=1).
+    assert client.post("/images/batch-delete", json={"sha256s": []}).status_code == 422
 
 
 def test_patch_image(client) -> None:

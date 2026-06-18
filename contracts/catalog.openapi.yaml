@@ -29,6 +29,16 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }
+  /images/batch-delete:
+    post:
+      summary: Bulk hard-delete many image records (+ blobs); not the source files
+      description: >
+        The batch counterpart to DELETE /images/{sha256}: two set-based SQL deletes
+        (asset refs, then the image rows — FK children cascade) plus per-blob
+        object-store cleanup for exactly the records that existed. Returns the
+        deleted + missing sha256s.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { sha256s: { type: array, items: { $ref: "#/components/schemas/Sha256" }, minItems: 1, maxItems: 1000 } }, required: [sha256s] } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string }, deleted: { type: array, items: { $ref: "#/components/schemas/Sha256" } }, missing: { type: array, items: { $ref: "#/components/schemas/Sha256" } } } } } } } }
   /images/{sha256}:
     parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
     get: { summary: Read one image, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } }, "404": { description: Not found } } }

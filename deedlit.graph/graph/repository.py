@@ -132,6 +132,25 @@ def delete_image(sha256: str) -> int:
         return int(rec["deleted"]) if rec else 0
 
 
+def delete_images(sha256s: list[str]) -> int:
+    """Remove MANY image nodes + their edges in ONE query (DETACH DELETE).
+
+    The batch counterpart to :func:`delete_image`: a single ``WHERE sha256 IN``
+    Cypher for the whole set instead of one round-trip per image. Asset/Tag nodes
+    are left in place (still used by other images). Returns the count deleted.
+    """
+    if not sha256s:
+        return 0
+    q = """
+    MATCH (img:Image) WHERE img.sha256 IN $shas
+    DETACH DELETE img
+    RETURN count(*) AS deleted
+    """
+    with _driver().session(database=get_database()) as session:
+        rec = session.run(q, shas=sha256s).single()
+        return int(rec["deleted"]) if rec else 0
+
+
 def neighbors(sha256: str, relation: str = "any", limit: int = 24) -> list[dict]:
     """Related images by shared asset and/or tag co-occurrence (traversal)."""
     results: dict[str, dict] = {}

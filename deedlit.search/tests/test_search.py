@@ -275,3 +275,17 @@ def test_delete_point_removes_it_idempotently():
 
     # Deleting a missing point is not an error.
     assert client.delete(f"/points/{sha}").status_code == 200
+
+
+def test_batch_delete_points_removes_many_in_one_call():
+    # Throwaway points so the seeded A/B/C fixtures stay intact.
+    s1, s2 = _sha("batch-del-1"), _sha("batch-del-2")
+    _upsert(s1, _dense(201))
+    _upsert(s2, _dense(202))
+    p1, p2 = point_id_for_sha256(s1), point_id_for_sha256(s2)
+    assert store.client.retrieve(TEST_COLLECTION, ids=[p1, p2])  # both present
+
+    r = client.post("/points/batch-delete", json={"sha256s": [s1, s2, _sha("never")]})
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] == 3  # 3 ids issued; the missing one is a no-op delete
+    assert store.client.retrieve(TEST_COLLECTION, ids=[p1, p2]) == []  # both gone

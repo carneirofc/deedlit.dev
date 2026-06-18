@@ -421,6 +421,44 @@ async def unindex_image(sha256: str) -> dict[str, Any]:
     }
 
 
+async def unindex_images(sha256s: list[str]) -> dict[str, Any]:
+    """Bulk un-index MANY images across the stores in ONE call per store.
+
+    The batch counterpart to :func:`unindex_image`: catalog (truth) goes FIRST via
+    its batch-delete and reports which records actually existed; only those are
+    then cleaned from search + graph (best-effort, in parallel) — a single
+    round-trip per store instead of per image. Catalog failure propagates (the
+    caller maps it); the projection cleanups degrade to a per-store ``False``.
+    """
+    requested = list(dict.fromkeys(sha256s))  # de-dupe, keep order
+    cat = await catalog("POST", "/images/batch-delete", json={"sha256s": requested})
+    deleted = list((cat or {}).get("deleted", []))
+    missing = list((cat or {}).get("missing", []))
+
+    async def del_search() -> bool:
+        await search("POST", "/points/batch-delete", json={"sha256s": deleted})
+        return True
+
+    async def del_graph() -> bool:
+        await graph("POST", "/images/batch-delete", json={"sha256s": deleted})
+        return True
+
+    # Nothing actually deleted -> no projections to clean (skip the round-trips).
+    if deleted:
+        search_r, graph_r = await asyncio.gather(
+            del_search(), del_graph(), return_exceptions=True
+        )
+    else:
+        search_r = graph_r = True
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "missing": missing,
+        "search": search_r is True,
+        "graph": graph_r is True,
+    }
+
+
 # Service -> base URL map, for the health dashboard probe.
 SERVICES: dict[str, str] = {
     "catalog": CATALOG_URL,

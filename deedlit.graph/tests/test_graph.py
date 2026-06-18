@@ -162,6 +162,23 @@ def test_delete_image_removes_node_and_neighbor_edges():
     assert client.delete(f"/images/{b}").json()["deleted"] == 0
 
 
+def test_batch_delete_removes_many_nodes():
+    a, b, c = sha("bdelA"), sha("bdelB"), sha("bdelC")
+    ck = {"kind": "checkpoint", "name": "batchdel.safetensors", "hash": None}
+    for s in (a, b, c):
+        client.post("/edges", json={"sha256": s, "references": [ck]})
+
+    # Delete a + b in ONE call (+ a never-seen sha, which is a no-op).
+    r = client.post("/images/batch-delete", json={"sha256s": [a, b, sha("never")]})
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 2  # only a + b existed
+
+    # a + b are gone; c is untouched.
+    assert client.delete(f"/images/{a}").json()["deleted"] == 0
+    assert client.delete(f"/images/{b}").json()["deleted"] == 0
+    assert client.delete(f"/images/{c}").json()["deleted"] == 1
+
+
 # --- rebuild-from-catalog (mocked HTTP) -------------------------------------
 
 

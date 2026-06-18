@@ -27,6 +27,7 @@ from activity import install_activity
 from search.config import get_config
 from search.rebuild import rebuild_from_catalog
 from search.schemas import (
+    BatchDeletePoints,
     Health,
     HybridQuery,
     QueryResponse,
@@ -172,6 +173,18 @@ def delete_point(sha256: str) -> dict:
     store.ensure_collection()
     point_id = store.delete_point(sha256)
     return {"status": "ok", "id": point_id, "sha256": sha256.lower()}
+
+
+@app.post("/points/batch-delete")
+def delete_points(body: BatchDeletePoints) -> dict:
+    """Delete MANY points in ONE Qdrant call (bulk un-index). Idempotent.
+
+    The gateway calls this after the catalog records are gone, with the sha256s
+    that actually existed. Missing points are no-ops. Returns the deleted count."""
+    store = get_store()
+    store.ensure_collection()
+    ids = store.delete_points(body.sha256s)
+    return {"status": "ok", "count": len(ids)}
 
 
 @app.post("/query", response_model=QueryResponse)

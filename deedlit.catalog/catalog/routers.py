@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, Request, Response
 
 from catalog import object_store, repository
 from catalog.schemas import (
+    BatchDeleteRequest,
     Collection,
     CollectionImages,
     CollectionRename,
@@ -146,6 +147,26 @@ def patch_image(payload: ImagePatch, sha256: str = SHA256) -> Image:
     if img is None:
         raise HTTPException(status_code=404, detail="image not found")
     return img
+
+
+# Registered BEFORE /images/{sha256}: "batch-delete" is a literal segment, not a
+# 64-hex sha, so the parameterized route would reject it. The literal wins.
+@router.post("/images/batch-delete")
+def batch_delete_images(body: BatchDeleteRequest) -> dict:
+    """Hard-delete MANY images' catalog records + blobs in ONE call.
+
+    Two set-based SQL deletes (vs two per image) then per-blob object-store cleanup
+    for exactly the records that existed. Returns the ``deleted`` + ``missing``
+    sha256s so the caller can clean projections for the former and report the rest.
+    """
+    requested = list(dict.fromkeys(body.sha256s))  # de-dupe, keep order
+    deleted = repository.delete_images(requested)
+    for sha in deleted:
+        for kind in object_store.BLOB_KINDS:
+            object_store.delete_blob(sha, kind)
+    gone = set(deleted)
+    missing = [s for s in requested if s not in gone]
+    return {"status": "ok", "deleted": deleted, "missing": missing}
 
 
 @router.delete("/images/{sha256}")

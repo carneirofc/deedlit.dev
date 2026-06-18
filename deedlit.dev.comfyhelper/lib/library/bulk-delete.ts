@@ -1,15 +1,15 @@
 /**
- * Bulk image deletion — fans the per-image un-index route
- * (`DELETE /api/library/images/{id}`) out over a list of ids with bounded
- * concurrency. That route removes the catalog record + search vector + graph
- * node (NOT the source file on disk); doing N of them is just N calls to the
- * same already-tested fan-out, so there is no bulk backend endpoint to keep in
- * sync.
+ * Bulk image deletion — un-indexes a list of images in ONE batch call to
+ * `POST /api/library/images/batch-delete`, which proxies the gateway batch
+ * endpoint (catalog record + search vector + graph node per id — NOT the source
+ * file on disk). The gateway does a single batch op per store, so deleting N
+ * images is a handful of DB round-trips, not N×3.
  *
- * The returned promise never rejects: every id's outcome is collected so a
- * partial failure still reports which ones went away (the caller prunes those
- * from the grid) and which did not. A 404 counts as deleted — the goal state is
- * "no longer in the library", and an already-absent image satisfies it.
+ * The returned promise never rejects: a transport / non-2xx error maps every id
+ * to `failed` (so the caller can surface it), while a success splits the ids into
+ * the ones that went away and any the server reports as not-deleted. A `missing`
+ * id (already absent) counts as deleted — the goal state is "no longer in the
+ * library", which an already-gone image satisfies.
  */
 
 export interface BulkDeleteOutcome {
@@ -20,8 +20,6 @@ export interface BulkDeleteOutcome {
 }
 
 export interface BulkDeleteOptions {
-  /** Max in-flight deletes. Clamped to >= 1. Default 4. */
-  concurrency?: number;
   signal?: AbortSignal;
 }
 
@@ -29,37 +27,33 @@ export async function deleteImages(
   ids: string[],
   opts: BulkDeleteOptions = {},
 ): Promise<BulkDeleteOutcome> {
-  const deleted: string[] = [];
-  const failed: { id: string; error: string }[] = [];
-  const queue = [...ids];
+  if (ids.length === 0) return { deleted: [], failed: [] };
 
-  const deleteOne = async (id: string): Promise<void> => {
-    try {
-      const res = await fetch(`/api/library/images/${encodeURIComponent(id)}`, {
-        method: "DELETE",
-        signal: opts.signal,
-      });
-      if (res.ok || res.status === 404) {
-        deleted.push(id);
-        return;
-      }
+  const fail = (error: string): BulkDeleteOutcome => ({
+    deleted: [],
+    failed: ids.map((id) => ({ id, error })),
+  });
+
+  try {
+    const res = await fetch("/api/library/images/batch-delete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
+      signal: opts.signal,
+    });
+    if (!res.ok) {
       const body = (await res.json().catch(() => ({}))) as { error?: string };
-      failed.push({ id, error: body.error ?? `HTTP ${res.status}` });
-    } catch (e) {
-      failed.push({ id, error: e instanceof Error ? e.message : "Request failed" });
+      return fail(body.error ?? `HTTP ${res.status}`);
     }
-  };
-
-  // Each worker pulls from the shared queue until it is drained. `shift()` runs
-  // synchronously so workers never grab the same id.
-  const worker = async (): Promise<void> => {
-    for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
-      await deleteOne(id);
-    }
-  };
-
-  const lanes = Math.min(Math.max(1, opts.concurrency ?? 4), ids.length || 1);
-  await Promise.all(Array.from({ length: lanes }, worker));
-
-  return { deleted, failed };
+    const j = (await res.json()) as { deleted?: string[]; missing?: string[] };
+    // `missing` (already absent) satisfies the goal state, so count it as deleted.
+    const deleted = [...(j.deleted ?? []), ...(j.missing ?? [])];
+    const gone = new Set(deleted);
+    const failed = ids
+      .filter((id) => !gone.has(id))
+      .map((id) => ({ id, error: "not deleted" }));
+    return { deleted, failed };
+  } catch (e) {
+    return fail(e instanceof Error ? e.message : "Request failed");
+  }
 }

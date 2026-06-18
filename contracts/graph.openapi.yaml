@@ -16,6 +16,15 @@ paths:
       summary: Upsert edges for one image's references/tags/lineage
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/EdgeUpsert" } } } }
       responses: { "200": { description: Upserted } }
+  /images/batch-delete:
+    post:
+      summary: Delete many image nodes + edges in one Cypher call (bulk un-index)
+      description: >
+        The batch counterpart to DELETE /images/{sha256}: one WHERE sha256 IN
+        DETACH DELETE for the whole set instead of one round-trip per image.
+        Missing nodes are no-ops; returns the count deleted.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { sha256s: { type: array, items: { $ref: "#/components/schemas/Sha256" }, maxItems: 1000 } }, required: [sha256s] } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string }, deleted: { type: integer } } } } } } }
   /images/{sha256}:
     delete:
       summary: Delete an image node + its edges from the projection (idempotent)

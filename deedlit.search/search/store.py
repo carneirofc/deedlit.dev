@@ -166,6 +166,22 @@ class SearchStore:
         )
         return point_id
 
+    def delete_points(self, sha256s: list[str]) -> list[str]:
+        """Delete MANY points (by ``uuid5(sha256)``) in ONE Qdrant call. Idempotent.
+
+        The batch counterpart to :meth:`delete_point`: one delete-by-ids round-trip
+        for the whole set instead of one per image, so a bulk un-index is a single
+        Qdrant op. Missing ids are no-ops. Returns the derived point ids.
+        """
+        if not sha256s:
+            return []
+        point_ids = [point_id_for_sha256(s) for s in sha256s]
+        self.client.delete(
+            collection_name=self.collection,
+            points_selector=models.PointIdsList(points=point_ids),
+        )
+        return point_ids
+
     # -- reads --------------------------------------------------------------
 
     def _to_hits(self, points: list[Any]) -> list[Hit]:

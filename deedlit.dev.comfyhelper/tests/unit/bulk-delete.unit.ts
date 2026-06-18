@@ -3,59 +3,54 @@ import { test, expect } from "@playwright/test";
 import { deleteImages } from "../../lib/library/bulk-delete";
 
 // ---------------------------------------------------------------------------
-// Harness: stub fetch with a per-url reply table and record every call so we
-// can assert the fan-out hit the right per-image route with DELETE.
+// Harness: stub fetch with a single reply and record every call so we can assert
+// the bulk delete hits the ONE batch route with POST + the right body.
 // ---------------------------------------------------------------------------
 
 type Reply = { status: number; body?: unknown; throws?: boolean };
 
 const realFetch = globalThis.fetch;
+const BATCH_URL = "/api/library/images/batch-delete";
 
-function stubFetch(table: (url: string) => Reply) {
-  const calls: { url: string; method: string }[] = [];
-  let inFlight = 0;
-  let maxInFlight = 0;
+function stubFetch(reply: Reply) {
+  const calls: { url: string; method: string; ids: string[] }[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = input.toString();
-    calls.push({ url, method: init?.method ?? "GET" });
-    inFlight += 1;
-    maxInFlight = Math.max(maxInFlight, inFlight);
-    // Yield so concurrent lanes actually overlap before any resolves.
-    await Promise.resolve();
-    inFlight -= 1;
-    const r = table(url);
-    if (r.throws) throw new Error("network down");
-    return new Response(r.body === undefined ? null : JSON.stringify(r.body), {
-      status: r.status,
+    const ids = init?.body ? (JSON.parse(String(init.body)).ids ?? []) : [];
+    calls.push({ url, method: init?.method ?? "GET", ids });
+    if (reply.throws) throw new Error("network down");
+    return new Response(reply.body === undefined ? null : JSON.stringify(reply.body), {
+      status: reply.status,
       headers: { "content-type": "application/json" },
     });
   }) as typeof globalThis.fetch;
-  return { calls, maxInFlight: () => maxInFlight };
+  return { calls };
 }
 
 function restore() {
   globalThis.fetch = realFetch;
 }
 
-const path = (id: string) => `/api/library/images/${id}`;
-
 // ---------------------------------------------------------------------------
 
-test("deleteImages DELETEs each id's un-index route and reports all deleted", async () => {
-  const probe = stubFetch(() => ({ status: 200, body: { status: "ok" } }));
+test("deleteImages POSTs once to the batch route and reports all deleted", async () => {
+  const probe = stubFetch({ status: 200, body: { deleted: ["a", "b", "c"], missing: [] } });
   try {
     const out = await deleteImages(["a", "b", "c"]);
     expect(out.deleted.sort()).toEqual(["a", "b", "c"]);
     expect(out.failed).toEqual([]);
-    expect(probe.calls.every((c) => c.method === "DELETE")).toBe(true);
-    expect(probe.calls.map((c) => c.url).sort()).toEqual([path("a"), path("b"), path("c")]);
+    // ONE call (not one per id), to the batch route, with the ids in the body.
+    expect(probe.calls.length).toBe(1);
+    expect(probe.calls[0].url).toBe(BATCH_URL);
+    expect(probe.calls[0].method).toBe("POST");
+    expect(probe.calls[0].ids.sort()).toEqual(["a", "b", "c"]);
   } finally {
     restore();
   }
 });
 
-test("deleteImages treats 404 (already gone) as deleted", async () => {
-  stubFetch(() => ({ status: 404, body: { error: "image not found" } }));
+test("deleteImages treats a `missing` id (already gone) as deleted", async () => {
+  stubFetch({ status: 200, body: { deleted: [], missing: ["gone"] } });
   try {
     const out = await deleteImages(["gone"]);
     expect(out.deleted).toEqual(["gone"]);
@@ -65,36 +60,45 @@ test("deleteImages treats 404 (already gone) as deleted", async () => {
   }
 });
 
-test("deleteImages collects partial failures without dropping the successes", async () => {
-  stubFetch((url) => {
-    if (url === path("bad")) return { status: 500, body: { error: "catalog unavailable" } };
-    if (url === path("boom")) return { status: 0, throws: true };
-    return { status: 200, body: { status: "ok" } };
-  });
+test("deleteImages marks ids the server didn't delete as failed", async () => {
+  // Server removed ok1; ok2 already gone; "stuck" came back in neither list.
+  stubFetch({ status: 200, body: { deleted: ["ok1"], missing: ["ok2"] } });
   try {
-    const out = await deleteImages(["ok1", "bad", "ok2", "boom"]);
+    const out = await deleteImages(["ok1", "ok2", "stuck"]);
     expect(out.deleted.sort()).toEqual(["ok1", "ok2"]);
-    expect(out.failed.find((f) => f.id === "bad")?.error).toBe("catalog unavailable");
-    expect(out.failed.find((f) => f.id === "boom")?.error).toBe("network down");
-    expect(out.failed.length).toBe(2);
+    expect(out.failed).toEqual([{ id: "stuck", error: "not deleted" }]);
   } finally {
     restore();
   }
 });
 
-test("deleteImages never exceeds the concurrency cap", async () => {
-  const probe = stubFetch(() => ({ status: 200, body: {} }));
+test("deleteImages maps a non-2xx response to every id failing", async () => {
+  stubFetch({ status: 502, body: { error: "catalog unavailable" } });
   try {
-    await deleteImages(["a", "b", "c", "d", "e", "f"], { concurrency: 2 });
-    expect(probe.maxInFlight()).toBeLessThanOrEqual(2);
-    expect(probe.calls.length).toBe(6);
+    const out = await deleteImages(["a", "b"]);
+    expect(out.deleted).toEqual([]);
+    expect(out.failed).toEqual([
+      { id: "a", error: "catalog unavailable" },
+      { id: "b", error: "catalog unavailable" },
+    ]);
+  } finally {
+    restore();
+  }
+});
+
+test("deleteImages maps a transport error to every id failing", async () => {
+  stubFetch({ status: 0, throws: true });
+  try {
+    const out = await deleteImages(["a", "b"]);
+    expect(out.deleted).toEqual([]);
+    expect(out.failed.map((f) => f.error)).toEqual(["network down", "network down"]);
   } finally {
     restore();
   }
 });
 
 test("deleteImages on an empty list does no work", async () => {
-  const probe = stubFetch(() => ({ status: 200 }));
+  const probe = stubFetch({ status: 200, body: {} });
   try {
     const out = await deleteImages([]);
     expect(out).toEqual({ deleted: [], failed: [] });

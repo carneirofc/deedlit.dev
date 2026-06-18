@@ -275,6 +275,41 @@ export async function deleteImage(sha256: string, signal?: AbortSignal): Promise
   });
 }
 
+/** Outcome of a bulk un-index (gateway POST /images/batch-delete). */
+export interface BatchDeleteResult {
+  /** sha256s whose catalog record was removed by this call. */
+  deleted: string[];
+  /** sha256s that were not in the catalog (already gone). */
+  missing: string[];
+  /** Search points removed for the deleted set (best-effort projection cleanup). */
+  search: boolean;
+  /** Graph nodes removed for the deleted set (best-effort projection cleanup). */
+  graph: boolean;
+}
+
+/**
+ * Bulk un-index MANY images in ONE call — catalog record + search vector + graph
+ * node for each, NOT the source files on disk. Proxies the gateway POST
+ * /images/batch-delete, which does a single batch op per store (vs N per-image
+ * deletes). De-dupes server-side; capped at 1000 ids per call.
+ */
+export async function batchDeleteImages(
+  sha256s: string[],
+  signal?: AbortSignal,
+): Promise<BatchDeleteResult> {
+  const res = await request<Partial<BatchDeleteResult>>("/images/batch-delete", {
+    method: "POST",
+    body: { sha256s },
+    signal,
+  });
+  return {
+    deleted: Array.isArray(res?.deleted) ? res.deleted : [],
+    missing: Array.isArray(res?.missing) ? res.missing : [],
+    search: Boolean(res?.search),
+    graph: Boolean(res?.graph),
+  };
+}
+
 export interface GatewaySearchRequest {
   query: string;
   limit?: number;
