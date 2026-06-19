@@ -162,6 +162,11 @@ export default function LibraryPage() {
   // Results
   const [results, setResults] = useState<CompactResult[]>([]);
   const [hasMore, setHasMore] = useState(false);
+  // Live mirror of `results` so doFetch can dedupe an appended page against
+  // what's on screen WITHOUT taking `results` as a dependency (that would churn
+  // doFetch's identity and every effect keyed on it).
+  const resultsRef = useRef<CompactResult[]>([]);
+  useEffect(() => { resultsRef.current = results; });
   const pageRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const [loading, setLoading] = useState(false);
@@ -499,18 +504,23 @@ export default function LibraryPage() {
           // Drop any id already on screen. Offset paging can re-emit a boundary
           // row when the underlying set shifts between page fetches (an ingest
           // lands mid-scroll); a repeated id would collide as a React key.
-          setResults((prev) => {
-            const seen = new Set(prev.map((r) => r.imageId));
-            return [...prev, ...fresh.filter((r) => !seen.has(r.imageId))];
-          });
+          const seen = new Set(resultsRef.current.map((r) => r.imageId));
+          const novel = fresh.filter((r) => !seen.has(r.imageId));
+          if (novel.length) setResults((prev) => [...prev, ...novel]);
+          // A full page that dedupes to nothing means the offset shifted onto
+          // rows already loaded — no forward progress. Treat it as the end, or
+          // the scroll observer / lightbox auto-load re-fire against the same
+          // boundary forever (a fetch storm). Real new rows keep the server's
+          // hasMore verdict.
+          setHasMore(novel.length > 0 && more);
         } else {
           pageRef.current = 1;
           setResults(fresh);
           // Baseline the freshness poll so it only fires for images that arrive
           // AFTER this load — no redundant probe on the next poll tick.
           newestIdRef.current = fresh[0]?.imageId ?? null;
+          setHasMore(more);
         }
-        setHasMore(more);
         // Record the new depth in the address and warm the pages beyond it.
         syncPageUrl(pageRef.current);
         schedulePrefetch(s);
