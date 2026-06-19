@@ -29,6 +29,7 @@ from catalog.schemas import (
     FolderReport,
     Image,
     ImagePatch,
+    ImageSummary,
     ImageUpsert,
     Job,
     JobUpsert,
@@ -185,12 +186,24 @@ def _image_uuid(conn: Connection, sha256: str) -> str | None:
     return str(row[0]) if row else None
 
 
-# The full image-row column list, shared by the single-image fetch and the
-# batched browse fetch so the two never drift.
+# The FULL image-row column list, used by the single-image detail fetch
+# (get_image). Includes the heavy JSONB graph columns (workflow_json,
+# metadata_json) and negative_prompt.
 _IMAGE_COLUMNS = """
     id, sha256_hash, file_path, perceptual_hash, width, height,
     source_tool, prompt, negative_prompt, rating, favorite,
     safety, workflow_json, metadata_json, created_at, imported_at
+"""
+
+# The LIGHT column list for the browse list (list_images). Drops the two heavy
+# JSONB graph columns (workflow_json, metadata_json) and negative_prompt — none
+# are rendered on a grid card, and they dominate the row size (a full ComfyUI
+# workflow graph is tens-to-hundreds of KB). A browse page of these is ~1 KB/row
+# instead of ~100 KB/row. The full record (with those columns) is one
+# GET /images/{sha256} away when a detail view opens.
+_LIST_COLUMNS = """
+    id, sha256_hash, file_path, perceptual_hash, width, height,
+    source_tool, prompt, rating, favorite, safety, created_at, imported_at
 """
 
 
@@ -234,6 +247,30 @@ def _row_to_image(
     )
 
 
+def _row_to_summary(
+    row: Any, *, tags: list[str], references: list[AssetRef]
+) -> ImageSummary:
+    """Assemble the lightweight browse :class:`ImageSummary` from a ``_LIST_COLUMNS``
+    row + its (small) tag/reference children. No workflow/api-prompt/params/
+    description — those ride only the full :class:`Image` from :func:`get_image`."""
+    return ImageSummary(
+        sha256=row["sha256_hash"],
+        filepath=row["file_path"],
+        phash=row["perceptual_hash"],
+        width=row["width"],
+        height=row["height"],
+        sourceTool=row["source_tool"],
+        prompt=row["prompt"],
+        tags=tags,
+        references=references,
+        rating=row["rating"],
+        favorite=row["favorite"],
+        safety=row["safety"],
+        created_at=row["created_at"] or row["imported_at"],
+        imported_at=row["imported_at"],
+    )
+
+
 def get_image(sha256: str) -> Image | None:
     eng = get_engine()
     with eng.connect() as conn:
@@ -253,15 +290,16 @@ def get_image(sha256: str) -> Image | None:
         )
 
 
-def _hydrate_images(conn: Connection, rows: list[Any]) -> list[Image]:
-    """Load tags/params/references/descriptions for a PAGE of image rows in four
-    set-based queries (one per child table) instead of the per-image N+1.
+def _hydrate_summaries(conn: Connection, rows: list[Any]) -> list[ImageSummary]:
+    """Load the SUMMARY children (tags + references) for a PAGE of browse rows in
+    two set-based queries instead of the per-image N+1.
 
-    ``rows`` are full image-row mappings (must include ``id`` + ``sha256_hash``),
-    in the desired output order. Children are fetched with expanding ``IN`` lists
-    — the same scalar binding the per-image helpers use — grouped in Python, then
-    stitched back onto each row. A page of 50 images goes from ~250 round-trips
-    (5 per image) to 5 total, all on this one connection.
+    ``rows`` are ``_LIST_COLUMNS`` image-row mappings (must include ``id`` +
+    ``sha256_hash``), in the desired output order. Only the children a grid card
+    renders are loaded here: tags and asset references (for the checkpoint chip).
+    The per-image generation_params and image_descriptions are deliberately NOT
+    fetched — they belong to the full :class:`Image` (GET /images/{sha256}), so a
+    browse page never pays for them. A page of 50 images is two round-trips.
     """
     if not rows:
         return []
@@ -283,31 +321,6 @@ def _hydrate_images(conn: Connection, rows: list[Any]) -> list[Image]:
     for iid, name in tag_rows:
         tags_by_id.setdefault(str(iid), []).append(name)
 
-    param_rows = conn.execute(
-        text(
-            """
-            SELECT image_id AS iid, seed, steps, cfg_scale, sampler, scheduler,
-                   denoise, width, height, clip_skip
-            FROM generation_params WHERE image_id IN :ids
-            """
-        ).bindparams(bindparam("ids", expanding=True)),
-        {"ids": ids},
-    ).mappings().all()
-    params_by_id: dict[str, Params] = {
-        str(r["iid"]): Params(
-            seed=r["seed"],
-            steps=r["steps"],
-            cfg=r["cfg_scale"],
-            sampler=r["sampler"],
-            scheduler=r["scheduler"],
-            denoise=r["denoise"],
-            clipskip=r["clip_skip"],
-            width=r["width"],
-            height=r["height"],
-        )
-        for r in param_rows
-    }
-
     ref_rows = conn.execute(
         text(
             "SELECT sha256, kind, name, hash FROM image_references "
@@ -321,27 +334,11 @@ def _hydrate_images(conn: Connection, rows: list[Any]) -> list[Image]:
             AssetRef(kind=r["kind"], name=r["name"], hash=r["hash"])
         )
 
-    # Latest description per image (DISTINCT ON keeps the newest by created_at),
-    # mirroring _get_description's ORDER BY created_at DESC LIMIT 1.
-    desc_rows = conn.execute(
-        text(
-            """
-            SELECT DISTINCT ON (image_id) image_id AS iid, description
-            FROM image_descriptions WHERE image_id IN :ids
-            ORDER BY image_id, created_at DESC
-            """
-        ).bindparams(bindparam("ids", expanding=True)),
-        {"ids": ids},
-    ).all()
-    desc_by_id: dict[str, str] = {str(iid): desc for iid, desc in desc_rows}
-
     return [
-        _row_to_image(
+        _row_to_summary(
             r,
             tags=tags_by_id.get(str(r["id"]), []),
-            params=params_by_id.get(str(r["id"])),
             references=refs_by_sha.get(r["sha256_hash"], []),
-            description=desc_by_id.get(str(r["id"])),
         )
         for r in rows
     ]
@@ -451,8 +448,13 @@ def list_images(
     safety: list[str] | None = None,
     sort: str = "newest",
     path: str | None = None,
-) -> list[Image]:
+) -> list[ImageSummary]:
     """Browse the catalog with AND-combined filters and a whitelisted sort.
+
+    Returns lightweight :class:`ImageSummary` rows (no workflow/api-prompt graphs,
+    params, negative, or description) — the grid only needs the card fields, and
+    the heavy columns dominated the page size. Open one image for its full record
+    via :func:`get_image` (GET /images/{sha256}).
 
     `tags` matches images carrying EVERY listed tag; `exclude_tags` drops images
     carrying ANY of them. `path` keeps only images whose on-disk file path
@@ -473,14 +475,14 @@ def list_images(
     params.update({"limit": limit, "offset": offset})
     order_by = _ORDER_BY.get(sort, _ORDER_BY["newest"])
     with eng.connect() as conn:
-        # Select the FULL page of image rows up front (one query), then batch-load
-        # their children (tags/params/refs/descriptions) in four more — see
-        # _hydrate_images. The old per-row get_image() was an N+1: a 50-row page
-        # cost ~250 queries + 50 connection checkouts.
+        # Select the LIGHT page of image rows up front (one query — no heavy JSONB
+        # graph columns), then batch-load their summary children (tags +
+        # references) in two more — see _hydrate_summaries. The old per-row
+        # get_image() was an N+1: a 50-row page cost ~250 queries + 50 checkouts.
         rows = conn.execute(
             text(
                 f"""
-                SELECT {_IMAGE_COLUMNS}
+                SELECT {_LIST_COLUMNS}
                 FROM images i
                 WHERE {where}
                 ORDER BY {order_by}
@@ -489,7 +491,7 @@ def list_images(
             ),
             params,
         ).mappings().all()
-        return _hydrate_images(conn, list(rows))
+        return _hydrate_summaries(conn, list(rows))
 
 
 def count_images(

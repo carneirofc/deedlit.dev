@@ -15,6 +15,7 @@ from catalog.schemas import (
     FolderReport,
     Image,
     ImagePatch,
+    ImageSummary,
     ImageUpsert,
     Job,
     JobUpsert,
@@ -45,7 +46,7 @@ def create_image(payload: ImageUpsert) -> Image:
     return repository.upsert_image(payload)
 
 
-@router.get("/images", response_model=list[Image])
+@router.get("/images", response_model=list[ImageSummary])
 def list_images(
     tag: list[str] | None = Query(default=None),
     exclude_tag: list[str] | None = Query(default=None),
@@ -56,7 +57,7 @@ def list_images(
     sort: str = Query(default="newest"),
     limit: int = Query(default=50),
     offset: int = Query(default=0),
-) -> list[Image]:
+) -> list[ImageSummary]:
     # `tag`/`exclude_tag` are repeatable (?tag=a&tag=b). A single ?tag=a still
     # arrives as a one-element list, so legacy single-tag callers keep working.
     # `path` is a separator-insensitive substring match on the on-disk file path.

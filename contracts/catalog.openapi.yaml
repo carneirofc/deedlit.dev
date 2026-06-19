@@ -28,7 +28,7 @@ paths:
         - { name: sort, in: query, description: "Server-side ordering for the browse grid.", schema: { type: string, enum: [newest, oldest, rating_desc, rating_asc, name_asc, name_desc], default: newest } }
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }
+      responses: { "200": { description: "OK — lightweight summaries (basic card fields only; no workflow/api-prompt graphs, params, negative, or description). Fetch the full record via GET /images/{sha256}.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ImageSummary" } } } } } }
   /images/batch-delete:
     post:
       summary: Bulk hard-delete many image records (+ blobs); not the source files
@@ -292,6 +292,31 @@ components:
             rating: { type: [integer, "null"] }
             favorite: { type: boolean }
             created_at: { type: string, format: date-time }
+    ImageSummary:
+      description: >-
+        Lightweight browse row returned by GET /images (one per grid card). A
+        deliberate SUBSET of Image: only the fields a card renders. The heavy
+        workflow_json / api_prompt_json ComfyUI graphs (tens-to-hundreds of KB
+        each) plus the detail-only negative / params / description are OMITTED so
+        a browse page (and its auto-refresh poll) stays small. Fetch the full
+        record via GET /images/{sha256}.
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        filepath: { type: [string, "null"] }
+        phash: { type: [string, "null"] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        sourceTool: { type: [string, "null"] }
+        prompt: { type: [string, "null"] }
+        tags: { type: array, items: { type: string } }
+        references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        rating: { type: [integer, "null"] }
+        favorite: { type: boolean }
+        safety: { type: [string, "null"], enum: [sfw, nsfw, explicit, null] }
+        created_at: { type: [string, "null"], format: date-time }
+        imported_at: { type: [string, "null"], format: date-time }
+      required: [sha256]
     ImagePatch:
       type: object
       properties:

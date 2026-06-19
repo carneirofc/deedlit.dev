@@ -69,6 +69,37 @@ class Image(ImageUpsert):
     imported_at: datetime | None = None
 
 
+class ImageSummary(BaseModel):
+    """Lightweight browse row returned by GET /images (one per grid card).
+
+    Deliberately a SUBSET of :class:`Image`: it carries only what the library
+    grid renders (label/prompt, tags, checkpoint reference, rating, safety,
+    dimensions). The heavy ``workflow_json`` / ``api_prompt_json`` ComfyUI graphs
+    — tens-to-hundreds of KB EACH — plus the detail-only ``negative`` /
+    ``params`` / ``description`` are OMITTED. A 50-image page otherwise dragged 50
+    full workflow graphs across catalog→gateway→UI on every (auto-refresh) poll,
+    which serialised slowly server-side and froze the browser. Fetch the full
+    record (those fields included) via GET /images/{sha256} only when a detail
+    view is actually opened.
+    """
+
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    filepath: str | None = None
+    phash: str | None = None
+    width: int | None = None
+    height: int | None = None
+    sourceTool: str | None = None
+    prompt: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    references: list[AssetRef] = Field(default_factory=list)
+    rating: int | None = None
+    favorite: bool = False
+    safety: Safety | None = None
+    # Best-known creation time (captured file mtime, falling back to import time).
+    created_at: datetime | None = None
+    imported_at: datetime | None = None
+
+
 class ImagePatch(BaseModel):
     rating: int | None = None
     favorite: bool | None = None

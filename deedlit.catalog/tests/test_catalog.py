@@ -185,9 +185,9 @@ def test_list_filter_by_path_substring(client) -> None:
 
 
 def test_list_batches_children_per_image(client) -> None:
-    # Two images with DISTINCT tags / references / params / description. The browse
-    # list batch-loads all children across the page in one query each, so this
-    # guards against mis-grouping (image A inheriting image B's children).
+    # Two images with DISTINCT tags / references. The browse list batch-loads the
+    # SUMMARY children (tags + references) across the page in one query each, so
+    # this guards against mis-grouping (image A inheriting image B's children).
     a = _sha()
     b = _sha()
     client.post("/images", json={
@@ -212,8 +212,17 @@ def test_list_batches_children_per_image(client) -> None:
     assert sorted(ib["tags"]) == ["beta", "shared"]
     assert [r["name"] for r in ia["references"]] == ["lora-a"]
     assert [r["name"] for r in ib["references"]] == ["ckpt-b"]
-    assert ia["params"]["seed"] == 11 and ib["params"]["seed"] == 22
-    assert ia["description"] == "desc A" and ib["description"] == "desc B"
+
+    # The lightweight browse row OMITS the heavy graphs and the detail-only
+    # params / negative / description — those would bloat every page.
+    for field in ("params", "description", "negative", "workflow_json", "api_prompt_json"):
+        assert field not in ia, f"summary row should not carry {field!r}"
+
+    # They remain available on the FULL record fetched on demand per image.
+    full_a = client.get(f"/images/{a}").json()
+    full_b = client.get(f"/images/{b}").json()
+    assert full_a["params"]["seed"] == 11 and full_b["params"]["seed"] == 22
+    assert full_a["description"] == "desc A" and full_b["description"] == "desc B"
 
 
 def test_delete_image_removes_record_refs_and_blob(client) -> None:
