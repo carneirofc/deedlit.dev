@@ -15,6 +15,11 @@ export function getRedisClient(): Redis | null {
     // Cap the TCP handshake so an unreachable host doesn't block the event loop
     // for the OS-level timeout (~30 s).
     connectTimeout: 3000,
+    // Do NOT queue commands while connecting — return an error immediately so
+    // callers fall through to the live data source. Without this, every
+    // concurrent request blocks until the connection is established (can be
+    // minutes on Windows Docker networking).
+    enableOfflineQueue: false,
   });
   _client.on("error", () => {/* best-effort cache — ignore connection errors */});
   return _client;
