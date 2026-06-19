@@ -195,6 +195,21 @@ async def declare_topology(channel: Any, queues: "tuple[str, ...] | list[str]") 
         await channel.declare_queue(q, durable=True)
 
 
+async def queue_depth(queue: str) -> int:
+    """Ready-message count for ``queue`` right now, via a PASSIVE declare.
+
+    A passive declare never mutates topology — it just reads the broker's counter
+    for an already-declared queue. Backs the folder-scan scheduler's backpressure
+    gate (``jobs.folder_scan_scheduler``): it skips re-walking the configured
+    folders while ``ingest`` is already deep, the runaway that let a 60s scan tick
+    re-enqueue not-yet-cataloged files without bound. A missing queue / broker hiccup
+    raises; the caller treats that as "unknown, don't gate".
+    """
+    channel = await get_channel()
+    q = await channel.declare_queue(queue, durable=True, passive=True)
+    return int(getattr(q.declaration_result, "message_count", 0) or 0)
+
+
 async def close() -> None:
     """Close the cached connection (used on worker shutdown / test cleanup)."""
     global _connection, _channel

@@ -246,3 +246,46 @@ def test_label_backfill_tick_enqueues_job(fresh_store):
     job = jobs_module.run_label_backfill_tick(fresh_store)
     assert job.type == "label-backfill"
     assert fresh_store.get(job.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# (8) backpressure: the scheduler skips a tick while `ingest` is already deep.
+#
+# Drives exactly ONE loop iteration of folder_scan_scheduler by faking sleep to
+# cancel on its second call, with run_folder_scan_tick / broker.queue_depth
+# stubbed. A deep queue must NOT call the tick; a shallow one must.
+# ---------------------------------------------------------------------------
+def _drive_one_scheduler_tick(monkeypatch, *, depth: int, ceiling: int) -> list:
+    import asyncio as aio
+
+    ran: list = []
+    monkeypatch.setattr(jobs_module, "folder_scan_tick_seconds", lambda: 1)
+    monkeypatch.setattr(jobs_module, "folder_scan_max_ingest_backlog", lambda: ceiling)
+    monkeypatch.setattr(jobs_module, "run_folder_scan_tick", lambda store: ran.append(store) or [])
+
+    async def fake_depth(_queue: str) -> int:
+        return depth
+
+    monkeypatch.setattr(broker_module, "queue_depth", fake_depth)
+
+    n = {"i": 0}
+
+    async def fake_sleep(_seconds) -> None:
+        n["i"] += 1
+        if n["i"] >= 2:  # let one full iteration run, then break the while True
+            raise aio.CancelledError()
+
+    monkeypatch.setattr(jobs_module.asyncio, "sleep", fake_sleep)
+    with pytest.raises(aio.CancelledError):
+        aio.run(jobs_module.folder_scan_scheduler(object()))
+    return ran
+
+
+def test_scheduler_skips_tick_when_ingest_backlog_over_ceiling(monkeypatch):
+    ran = _drive_one_scheduler_tick(monkeypatch, depth=10_000, ceiling=5_000)
+    assert ran == []  # backpressure: deep queue -> no new wave published
+
+
+def test_scheduler_runs_tick_when_ingest_backlog_under_ceiling(monkeypatch):
+    ran = _drive_one_scheduler_tick(monkeypatch, depth=10, ceiling=5_000)
+    assert len(ran) == 1  # shallow queue -> scan proceeds normally

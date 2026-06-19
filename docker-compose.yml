@@ -343,6 +343,10 @@ services:
       # periodically relabels images missing an AI description.
       FOLDER_SCAN_TICK_SECONDS: ${FOLDER_SCAN_TICK_SECONDS:-60}
       LABEL_BACKFILL_INTERVAL_SECONDS: ${LABEL_BACKFILL_INTERVAL_SECONDS:-0}
+      # Backpressure: a folder-scan tick is skipped while `ingest` already holds
+      # this many ready tasks, so the producer can't outrun a down/slow worker and
+      # pile up unbounded duplicate ingest tasks (0 disables the gate).
+      FOLDER_SCAN_MAX_INGEST_BACKLOG: ${FOLDER_SCAN_MAX_INGEST_BACKLOG:-5000}
       # Browser-reachable base URL of the comfyhelper UI. Embedded into each
       # search point's payload as image_url/thumbnail_url (the image proxy
       # endpoints), so override it to the real public URL in deployment.

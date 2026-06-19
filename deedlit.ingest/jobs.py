@@ -910,6 +910,24 @@ def folder_scan_tick_seconds() -> int:
         return 0
 
 
+def folder_scan_max_ingest_backlog() -> int:
+    """Backpressure ceiling: skip a folder-scan tick while ``ingest`` already holds
+    at least this many ready tasks (0/unset disables the gate).
+
+    The folder scan's INCREMENTAL skip only dedups against the CATALOG (already
+    ingested files). A file that is queued-but-not-yet-cataloged — because the
+    worker is down, or simply slower than the tick — is NOT skipped, so each tick
+    re-enqueues it and ``ingest`` grows without bound (observed: tens of thousands
+    of duplicate ingest tasks, zero consumers). Gating the producer on live queue
+    depth caps that runaway: when the backlog is already deep, stop publishing more
+    and let the worker catch up first.
+    """
+    try:
+        return int(os.getenv("FOLDER_SCAN_MAX_INGEST_BACKLOG", "5000"))
+    except ValueError:
+        return 5000
+
+
 def _folder_due(folder: dict[str, Any], now: datetime) -> bool:
     """True when an enabled folder is past its per-folder scan interval (or has
     never been scanned)."""
@@ -970,13 +988,32 @@ async def folder_scan_scheduler(store: "JobStore") -> None:
 
     No-op when FOLDER_SCAN_TICK_SECONDS is 0/unset, so importing the app or
     running tests never starts a real scheduler.
+
+    Backpressure: each tick first checks the live ``ingest`` queue depth and skips
+    publishing a fresh wave while it is already at/over
+    ``FOLDER_SCAN_MAX_INGEST_BACKLOG`` — without this gate the scheduler re-enqueues
+    not-yet-cataloged files every tick and the queue runs away unbounded.
     """
     tick = folder_scan_tick_seconds()
     if tick <= 0:
         return
+    ceiling = folder_scan_max_ingest_backlog()
     while True:
         await asyncio.sleep(tick)
         try:
+            if ceiling > 0:
+                try:
+                    depth = await broker.queue_depth(broker.INGEST_QUEUE)
+                except Exception as exc:  # noqa: BLE001 — broker down / queue absent
+                    log.debug("folder scan backpressure probe failed (%s); not gating", exc)
+                    depth = 0
+                if depth >= ceiling:
+                    log.warning(
+                        "folder scan tick skipped: ingest backlog %d >= %d (backpressure); "
+                        "let the worker drain before enqueuing more",
+                        depth, ceiling,
+                    )
+                    continue
             run_folder_scan_tick(store)
         except Exception:
             continue
