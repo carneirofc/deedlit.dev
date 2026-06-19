@@ -87,6 +87,10 @@ export default function DbPage() {
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<CatalogImage | null>(null);
+  // The sha currently open in the editor — tracked in a ref so the async
+  // full-record fetch in `select` can tell whether the user has since moved on
+  // before its response lands (avoids a stale detail clobbering a newer pick).
+  const selectedShaRef = useRef<string | null>(null);
   const [edit, setEdit] = useState<EditState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -173,11 +177,34 @@ export default function DbPage() {
     return () => ob.disconnect();
   }, [hasMore, loadingMore, loadMore]);
 
-  const select = (img: CatalogImage) => {
+  const select = async (img: CatalogImage) => {
+    // Show the lightweight list row immediately so the editor is responsive.
     setSelected(img);
     setEdit(editFrom(img));
     setNotice(null);
     setError(null);
+    selectedShaRef.current = img.sha256;
+
+    // The browse list is now lightweight — it omits the heavy workflow_json /
+    // api_prompt_json graphs plus negative / params / description. Pull the FULL
+    // record on demand so the raw-JSON panels and the negative-prompt field
+    // populate, without dragging those fields through every list page.
+    try {
+      const full = (await fetch(`/api/library/images/${img.sha256}/raw`).then((r) => {
+        if (!r.ok) throw new Error(`detail fetch failed (${r.status})`);
+        return r.json();
+      })) as CatalogImage;
+      // Ignore the response if the user has since opened a different image.
+      if (selectedShaRef.current !== img.sha256) return;
+      setSelected((cur) => (cur && cur.sha256 === img.sha256 ? { ...cur, ...full } : cur));
+      setEdit(editFrom({ ...img, ...full }));
+    } catch (e) {
+      // Non-fatal: the light fields still render; only the raw-JSON panels stay
+      // empty and the negative field falls back to the (absent) list value.
+      if (selectedShaRef.current === img.sha256) {
+        setError(e instanceof Error ? e.message : "Failed to load full record.");
+      }
+    }
   };
 
   const save = async () => {
