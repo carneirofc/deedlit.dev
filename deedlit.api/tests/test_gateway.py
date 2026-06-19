@@ -783,6 +783,65 @@ def test_images_list_threads_browse_filters_into_catalog(rec, client):
     assert seen["path"] == "2024/portraits"
 
 
+def test_mcp_browse_images_paginates_by_filepath(rec, client):
+    # The browse_images MCP tool queries + pages the catalog by file path: one
+    # offset window from GET /images plus the matching total from
+    # GET /images/count, both threaded with the path fragment + sort.
+    seen = {}
+
+    def images_handler(request: httpx.Request):
+        p = request.url.params
+        seen["path"] = p.get("path")
+        seen["sort"] = p.get("sort")
+        seen["limit"] = p.get("limit")
+        seen["offset"] = p.get("offset")
+        return [{"sha256": SHA, "file_path": "/data/2024/portraits/a.png"}]
+
+    def count_handler(request: httpx.Request):
+        seen["count_path"] = request.url.params.get("path")
+        return {"count": 42}
+
+    rec.on("GET", "/images", images_handler)
+    rec.on("GET", "/images/count", count_handler)
+
+    r = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "browse_images",
+                "arguments": {"path": "2024/portraits", "limit": 1, "offset": 20, "sort": "name_asc"},
+            },
+        },
+    )
+    assert r.status_code == 200
+    payload = r.json()["result"]
+    assert payload["isError"] is False
+    body = payload["structuredContent"]
+    assert body == {
+        "results": [{"sha256": SHA, "file_path": "/data/2024/portraits/a.png"}],
+        "total": 42,
+        "limit": 1,
+        "offset": 20,
+        "has_more": True,
+    }
+    # Both catalog calls carried the same path fragment + sort; only catalog hit.
+    assert _bases(rec) == {clients.CATALOG_URL}
+    assert seen["path"] == "2024/portraits"
+    assert seen["count_path"] == "2024/portraits"
+    assert seen["sort"] == "name_asc"
+    assert seen["limit"] == "1" and seen["offset"] == "20"
+
+
+def test_mcp_browse_images_lists_browse_tool(rec, client):
+    # The tool is advertised in tools/list so an MCP client can discover it.
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = {t["name"] for t in r.json()["result"]["tools"]}
+    assert "browse_images" in names
+
+
 def test_patch_image_proxies_and_passes_404(rec, client):
     rec.on("PATCH", f"/images/{SHA}", lambda r: {"sha256": SHA, "safety": "nsfw"})
     r = client.patch(f"/images/{SHA}", json={"safety": "nsfw"})

@@ -7,9 +7,10 @@ In the monolith each tool called a repository/service that talked to the DB
 directly. In the decomposed topology the gateway has NO database, so every tool
 DISPATCHES over HTTP to the owning service:
 
-    catalog  -> get_image_details, get_image (thumbnail bytes), get_library_stats,
-                list_collections, get_image_collections, create_collection,
-                set_collection_images, list_image_notes
+    catalog  -> browse_images (query + paginate by file path), get_image_details,
+                get_image (thumbnail bytes), get_library_stats, list_collections,
+                get_image_collections, create_collection, set_collection_images,
+                list_image_notes
     search   -> search_images, semantic_image_search, find_similar_images
     graph    -> get_image_graph, find_image_lineage, find_related_tags
     ingest   -> ingest_folder, reindex_image, list_jobs, browse_folders
@@ -37,8 +38,11 @@ JSON-RPC dispatch (initialize / tools/list / tools/call / ping) mirrors
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any, Awaitable, Callable
+
+from pydantic import BaseModel, Field
 
 import clients
 
@@ -65,6 +69,26 @@ class ToolContent:
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "comfyhelper-image-library", "version": "0.1.0"}
+
+
+# ---------------------------------------------------------------------------
+# Typed tool payloads (labeled Pydantic models, not ad-hoc dicts) so the agent-
+# facing API has a declared, validated shape. A tool may return one of these and
+# the dispatcher serialises it; see :func:`handle_message`.
+# ---------------------------------------------------------------------------
+class BrowseImagesPage(BaseModel):
+    """One offset window of a path/facet browse over the catalog, plus the totals
+    an agent needs to page the whole matching set.
+
+    ``results`` are the catalog's own canonical image records (already validated
+    by deedlit.catalog — passed through verbatim rather than re-modelled here, the
+    gateway being a thin proxy that does not own the image schema)."""
+
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
 
 # Tools that have no owning service in the current decomposition and therefore
 # return a structured stub instead of dispatching. Documented for the report.
@@ -115,6 +139,68 @@ async def _semantic_image_search(args: dict[str, Any]) -> Any:
         _pick_filters(args.get("filters")) or None,
     )
     return {"results": (res or {}).get("hits", [])}
+
+
+def _catalog_browse_params(args: dict[str, Any]) -> dict[str, Any]:
+    """Map the snake_case browse args onto catalog ``GET /images`` query params.
+
+    ``tags``/``exclude_tags``/``safety`` are repeatable params (httpx serialises a
+    list value as repeated keys); ``path`` is the separator-insensitive file-path
+    substring filter; the rest are scalar facets. Only present values are sent so
+    an unspecified facet stays unfiltered.
+    """
+    params: dict[str, Any] = {"sort": args.get("sort", "newest")}
+    path = (args.get("path") or "").strip()
+    if path:
+        params["path"] = path
+    if args.get("tags"):
+        params["tag"] = args["tags"]
+    if args.get("exclude_tags"):
+        params["exclude_tag"] = args["exclude_tags"]
+    if args.get("favorite") is not None:
+        params["favorite"] = args["favorite"]
+    if args.get("rating_gte") is not None:
+        params["rating_gte"] = args["rating_gte"]
+    if args.get("safety"):
+        params["safety"] = args["safety"]
+    return params
+
+
+async def _browse_images(args: dict[str, Any]) -> Any:
+    """Query + paginate cataloged images by on-disk file PATH (and the standard
+    browse facets), straight from the catalog source of truth.
+
+    The vector ``search_images`` path can't answer a path/filter-only browse, so
+    this dispatches to catalog ``GET /images`` for one offset window AND
+    ``GET /images/count`` for the matching total — fetched in parallel — so an
+    agent can walk the whole matching set page by page. ``path`` is a
+    separator-insensitive substring match on the file path (e.g. ``2024/portraits``
+    or ``_upscaled``); ``sort`` is the same whitelist the browse grid uses.
+    """
+    limit = args.get("limit", 50)
+    offset = args.get("offset", 0)
+    facets = _catalog_browse_params(args)
+    rows_r, count_r = await asyncio.gather(
+        clients.catalog("GET", "/images", params={**facets, "limit": limit, "offset": offset}),
+        clients.catalog("GET", "/images/count", params=facets),
+        return_exceptions=True,
+    )
+    if isinstance(rows_r, Exception):
+        raise rows_r
+    rows = rows_r if isinstance(rows_r, list) else []
+    # The count is a sizing aid — degrade to a best-effort estimate if it fails so
+    # a transient count error never sinks the page the agent actually asked for.
+    if isinstance(count_r, dict):
+        total = int(count_r.get("count", 0))
+    else:
+        total = offset + len(rows)
+    return BrowseImagesPage(
+        results=rows,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=offset + len(rows) < total,
+    )
 
 
 async def _find_similar_images(args: dict[str, Any]) -> Any:
@@ -307,6 +393,40 @@ MCP_TOOLS: list[dict[str, Any]] = [
             "required": ["image_id"],
         },
         "handler": _find_similar_images,
+    },
+    {
+        "name": "browse_images",
+        "description": (
+            "Query + paginate the library by on-disk file PATH (and the standard "
+            "browse facets) from the catalog source of truth. `path` is a "
+            "separator-insensitive substring match on the file path (folder or "
+            "filename fragment, e.g. '2024/portraits' or '_upscaled'); page the "
+            "whole matching set with `limit`/`offset` (the reply carries `total` "
+            "and `has_more`). Use this — not the vector search — when you want to "
+            "walk images under a folder."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File-path fragment to match (any separator)."},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "exclude_tags": {"type": "array", "items": {"type": "string"}},
+                "favorite": {"type": "boolean"},
+                "rating_gte": {"type": "integer", "minimum": 0, "maximum": 5},
+                "safety": {"type": "array", "items": {"type": "string", "enum": ["sfw", "nsfw", "explicit"]}},
+                "sort": {
+                    "type": "string",
+                    "enum": [
+                        "newest", "oldest", "created_desc", "created_asc",
+                        "rating_desc", "rating_asc", "name_asc", "name_desc",
+                    ],
+                    "default": "newest",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+            },
+        },
+        "handler": _browse_images,
     },
     {
         "name": "compare_images",
@@ -599,6 +719,10 @@ async def handle_message(message: dict[str, Any]) -> dict[str, Any] | None:
                 if result.structured is not None:
                     payload["structuredContent"] = result.structured
                 return _ok(rpc_id, payload)
+            if isinstance(result, BaseModel):
+                # Labeled Pydantic payload -> JSON so _to_text + structuredContent
+                # (both plain-JSON serialised downstream) carry its declared shape.
+                result = result.model_dump(mode="json")
             return _ok(rpc_id, {
                 "content": [{"type": "text", "text": _to_text(result)}],
                 "structuredContent": result,

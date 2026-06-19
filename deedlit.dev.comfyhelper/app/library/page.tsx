@@ -1010,6 +1010,11 @@ export default function LibraryPage() {
     let alive = true;
     const ac = new AbortController();
     const check = async () => {
+      // Skip the network while the tab is hidden — the user can't see the grid,
+      // so there's nothing to splice in. The visibilitychange handler below fires
+      // an immediate catch-up check the moment they return, so on-screen freshness
+      // is unchanged.
+      if (typeof document !== "undefined" && document.hidden) return;
       try {
         const r = await fetch("/api/library/browse", {
           method: "POST",
@@ -1049,9 +1054,14 @@ export default function LibraryPage() {
       }
     };
     const id = setInterval(check, 4000);
+    // Catch up the instant the tab regains focus, so returning users see fresh
+    // arrivals immediately rather than waiting out the interval.
+    const onVisible = () => { if (!document.hidden) void check(); };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       alive = false;
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
       ac.abort(); // cancel any in-flight poll on unmount / filter change
     };
   }, [mode, query, tags, excludeTags, favorites, minRating, safety, pathFilter, settings.sortMode, invalidatePrefetchPages]);
@@ -1615,6 +1625,11 @@ export default function LibraryPage() {
           items={displayResults}
           getKey={(r) => r.imageId}
           viewMode={settings.viewMode}
+          // Gallery always renders a sliding window (~5 pages: current ±2) instead
+          // of every loaded card, so paging deep never jams the grid while results
+          // / lightbox keep the full set. We only tune it here: pageSize mirrors the
+          // real fetch page so the window tracks actual pages.
+          windowing={{ pageSize: Math.max(1, limit), pages: 5 }}
           gridClassName={`grid ${gridColumnsClass(settings.gridDensity)} gap-3`}
           masonryClassName={`${masonryColumnsClass(settings.gridDensity)} gap-3`}
           cardClassName={
