@@ -13,8 +13,8 @@ procs:
   ui:
     shell: "npm run dev:dev"        # Next landing app  -> :3001
   comfyhelper:
-    #shell: "npm run dev:comfyhelper" # Next comfyhelper -> :3000
-    shell: "npm run start:comfyhelper" # Next comfyhelper -> :3000
+    shell: "npm run dev:comfyhelper" # Next comfyhelper -> :3000
+    # shell: "npm run start:comfyhelper" # Next comfyhelper -> :3000
   api:
     shell: "npm run dev:api"        # BFF gateway       -> :8088
   catalog:
