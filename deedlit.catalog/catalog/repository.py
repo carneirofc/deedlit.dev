@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
-from typing import Any
+import time
+from typing import Any, Callable, TypeVar
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import OperationalError
 
 from catalog.db import get_engine
 from catalog.schemas import (
@@ -45,6 +48,43 @@ from catalog.schemas import (
 )
 
 # ---------------------------------------------------------------------------
+# transaction helpers
+# ---------------------------------------------------------------------------
+
+_T = TypeVar("_T")
+
+# Transient transaction failures worth retrying: deadlock_detected (40P01) and
+# serialization_failure (40001). On both, Postgres has already rolled the whole
+# transaction back, so re-running the unit of work from a fresh begin() is safe
+# and normally succeeds once the contending transaction has committed.
+_RETRYABLE_SQLSTATES = {"40P01", "40001"}
+
+
+def _run_in_tx(fn: Callable[[Connection], _T], *, attempts: int = 5) -> _T:
+    """Run ``fn(conn)`` inside one transaction, retrying the WHOLE transaction
+    on a transient deadlock/serialization failure with exponential backoff.
+
+    The callable must be idempotent across retries (every catalog upsert here is
+    ``ON CONFLICT``-based, so it is). Concurrent tag ingest is ordered to avoid
+    deadlocks in the first place (see ``_set_tags``); this is the backstop for
+    any residual contention under heavy parallel ingest.
+    """
+    eng = get_engine()
+    backoff = 0.05
+    for attempt in range(1, attempts + 1):
+        try:
+            with eng.begin() as conn:
+                return fn(conn)
+        except OperationalError as exc:
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            if sqlstate not in _RETRYABLE_SQLSTATES or attempt == attempts:
+                raise
+            time.sleep(backoff + random.uniform(0, backoff))
+            backoff *= 2
+    raise AssertionError("unreachable")  # loop returns or raises above
+
+
+# ---------------------------------------------------------------------------
 # images
 # ---------------------------------------------------------------------------
 
@@ -60,8 +100,7 @@ def _basename(path: str) -> str:
 
 
 def upsert_image(payload: ImageUpsert) -> Image:
-    eng = get_engine()
-    with eng.begin() as conn:
+    def _tx(conn: Connection) -> None:
         conn.execute(
             text(
                 """
@@ -132,6 +171,7 @@ def upsert_image(payload: ImageUpsert) -> Image:
         if payload.description:
             _set_description(conn, payload.sha256, payload.description)
 
+    _run_in_tx(_tx)
     img = get_image(payload.sha256)
     assert img is not None
     return img
@@ -569,10 +609,9 @@ def tag_report(*, prefix: str = "", limit: int, offset: int) -> TagReport:
 
 
 def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
-    eng = get_engine()
-    with eng.begin() as conn:
+    def _tx(conn: Connection) -> bool:
         if _image_uuid(conn, sha256) is None:
-            return None
+            return False
         sets = []
         params: dict[str, Any] = {"sha": sha256}
         if patch.rating is not None:
@@ -600,6 +639,10 @@ def patch_image(sha256: str, patch: ImagePatch) -> Image | None:
             )
         if patch.tags is not None:
             _set_tags(conn, sha256, patch.tags, replace=True)
+        return True
+
+    if not _run_in_tx(_tx):
+        return None
     return get_image(sha256)
 
 
@@ -737,37 +780,53 @@ def _set_tags(
             {"iid": image_id},
         )
     # Split each incoming value on comma / newline / BREAK, clean danbooru
-    # weighting/brackets, and de-dupe by the normalized identity within this call.
-    seen: set[str] = set()
+    # weighting/brackets, and de-dupe by the normalized identity within this call,
+    # keeping the first display form seen for each normalized name.
+    pairs: dict[str, str] = {}
     for raw in tags:
         for piece in _split_tags(raw):
             norm = _normalize_tag(piece)
-            if not norm or norm in seen:
+            if not norm or norm in pairs:
                 continue
-            seen.add(norm)
-            display = _clean_tag(piece)
-            tag_row = conn.execute(
-                text(
-                    """
-                    INSERT INTO tags (name, normalized_name)
-                    VALUES (:name, :norm)
-                    ON CONFLICT (normalized_name) DO UPDATE SET name = tags.name
-                    RETURNING id
-                    """
-                ),
-                {"name": display, "norm": norm},
-            ).first()
-            tag_id = tag_row[0]
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO image_tags (image_id, tag_id, source)
-                    VALUES (:iid, :tid, 'manual')
-                    ON CONFLICT (image_id, tag_id, source) DO NOTHING
-                    """
-                ),
-                {"iid": image_id, "tid": tag_id},
-            )
+            pairs[norm] = _clean_tag(piece)
+    if not pairs:
+        return
+    # Sort by normalized_name so every concurrent ingest transaction acquires
+    # tag row/index locks in the SAME global order. Two workers upserting an
+    # overlapping set of brand-new tags in opposite orders is exactly what
+    # deadlocked here (Postgres 40P01); a deterministic order breaks the cycle.
+    norms = sorted(pairs)
+    names = [pairs[n] for n in norms]
+    # One ordered batch upsert. DO NOTHING (not a no-op DO UPDATE) so already
+    # existing tag rows are not needlessly row-locked. ORDER BY makes the insert
+    # follow the sorted order inside the statement too.
+    conn.execute(
+        text(
+            """
+            INSERT INTO tags (name, normalized_name)
+            SELECT name, normalized_name
+            FROM unnest(cast(:names AS text[]), cast(:norms AS text[]))
+                 AS t(name, normalized_name)
+            ORDER BY normalized_name
+            ON CONFLICT (normalized_name) DO NOTHING
+            """
+        ),
+        {"names": names, "norms": norms},
+    )
+    # Link every (now-guaranteed-present) tag to the image in one statement,
+    # resolving ids by normalized_name rather than round-tripping per tag.
+    conn.execute(
+        text(
+            """
+            INSERT INTO image_tags (image_id, tag_id, source)
+            SELECT :iid, t.id, 'manual'
+            FROM tags t
+            WHERE t.normalized_name = ANY(cast(:norms AS text[]))
+            ON CONFLICT (image_id, tag_id, source) DO NOTHING
+            """
+        ),
+        {"iid": image_id, "norms": norms},
+    )
 
 
 def _get_tags(conn: Connection, image_id: str) -> list[str]:
