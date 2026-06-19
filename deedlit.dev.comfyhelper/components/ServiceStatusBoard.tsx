@@ -106,14 +106,19 @@ function relativeTime(iso: string): string {
  * offline indicator + per-component dependency readiness AND a live "what is it
  * doing right now" line (busy/idle, in-flight count, throughput, current op).
  *
- * Two polls on different cadences: health every `pollMs` (default 5s, drives
- * status + dependencies) and activity every `activityPollMs` (default 2s, the
+ * Two polls on different cadences: health every `pollMs` (default 10s, drives
+ * status + dependencies) and activity every `activityPollMs` (default 4s, the
  * fast "who's working now" signal). Activity degrades silently — when it is
  * unavailable the board still shows health.
+ *
+ * Each poll fans out gateway -> every backend service, so the cadence is the
+ * dominant source of idle inter-service chatter (and trace volume to Tempo).
+ * These defaults are deliberately conservative; both pause while the tab is
+ * hidden and catch up on return.
  */
 export function ServiceStatusBoard({
-  pollMs = 5000,
-  activityPollMs = 2000,
+  pollMs = 10000,
+  activityPollMs = 4000,
 }: {
   pollMs?: number;
   activityPollMs?: number;
@@ -132,8 +137,17 @@ export function ServiceStatusBoard({
 
   useEffect(() => {
     refresh();
-    const id = setInterval(refresh, pollMs);
-    return () => clearInterval(id);
+    // Pause the background poll while the tab is hidden; resume + catch up the
+    // moment it's visible again. The manual Refresh button still calls `refresh`
+    // unconditionally, so explicit user action is never gated.
+    const tick = () => { if (!document.hidden) refresh(); };
+    const id = setInterval(tick, pollMs);
+    const onVisible = () => { if (!document.hidden) refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [refresh, pollMs]);
 
   // Fast, independent poll for the live per-service work line. Keyed by service
@@ -150,10 +164,16 @@ export function ServiceStatusBoard({
         .catch(() => {});
     };
     pollActivity();
-    const id = setInterval(pollActivity, activityPollMs);
+    // Skip activity probes while the tab is hidden (this poll fans out to every
+    // service); catch up immediately on return so the board is never stale on-screen.
+    const tick = () => { if (!document.hidden) pollActivity(); };
+    const id = setInterval(tick, activityPollMs);
+    const onVisible = () => { if (!document.hidden) pollActivity(); };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [activityPollMs]);
 
