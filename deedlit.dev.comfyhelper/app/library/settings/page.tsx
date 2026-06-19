@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+
+import { CodeBlock, CopyButton } from "@deedlit.dev/ui";
 
 import { getIngestConfig, updateIngestConfig, type IngestConfig } from "@/lib/api-client";
 import {
@@ -271,6 +273,149 @@ function IngestSettingsSection() {
           </p>
         </>
       )}
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent access (MCP) — connection details for pointing an AI agent at this
+// library over the Model Context Protocol. This app is UI-only; it proxies a
+// JSON-RPC MCP server (POST /api/mcp -> deedlit.api gateway POST /mcp) that
+// exposes search / retrieval / graph / ingest tools. GET /api/mcp lists them.
+// ---------------------------------------------------------------------------
+
+type McpTool = { name: string; description: string };
+
+function McpAccessSection() {
+  // Absolute, browser-reachable endpoint. Resolved on the client so the copied
+  // URL/config is something an external MCP client can actually dial.
+  const [endpoint, setEndpoint] = useState("/api/mcp");
+  const [tools, setTools] = useState<McpTool[] | null>(null);
+  const [toolsState, setToolsState] = useState<"idle" | "loading" | "error">("idle");
+  const [copied, setCopied] = useState<"url" | "config" | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") setEndpoint(`${window.location.origin}/api/mcp`);
+  }, []);
+
+  // Ready-to-paste MCP client config (Claude Desktop / Claude Code `mcpServers`
+  // block, HTTP transport). Server name mirrors the gateway's serverInfo.
+  const config = useMemo(
+    () =>
+      JSON.stringify(
+        { mcpServers: { "comfyhelper-image-library": { type: "http", url: endpoint } } },
+        null,
+        2,
+      ),
+    [endpoint],
+  );
+
+  const copy = useCallback((text: string, which: "url" | "config") => {
+    navigator.clipboard
+      ?.writeText(text)
+      .then(() => {
+        setCopied(which);
+        setTimeout(() => setCopied((c) => (c === which ? null : c)), 1500);
+      })
+      .catch(() => {});
+  }, []);
+
+  const loadTools = useCallback(async () => {
+    setToolsState("loading");
+    try {
+      const res = await fetch("/api/mcp");
+      if (!res.ok) throw new Error(String(res.status));
+      const data = (await res.json()) as { tools?: McpTool[] };
+      setTools(data.tools ?? []);
+      setToolsState("idle");
+    } catch {
+      setToolsState("error");
+    }
+  }, []);
+
+  return (
+    <Section
+      title="Agent access (MCP)"
+      hint="Connect an AI agent (Claude, etc.) to this library over the Model Context Protocol. The app exposes a JSON-RPC MCP server with search, retrieval, graph and ingest tools."
+    >
+      <div className="flex items-center justify-between gap-4 py-2.5">
+        <div className="min-w-0">
+          <p className="text-ui-sm text-ui-ink">Endpoint</p>
+          <p className="truncate font-mono text-ui-2xs text-ui-ink-muted" title={endpoint}>
+            {endpoint}
+          </p>
+        </div>
+        <CopyButton
+          copied={copied === "url"}
+          onClick={() => copy(endpoint, "url")}
+          aria-label="Copy MCP endpoint URL"
+          data-testid="mcp-copy-url"
+        />
+      </div>
+
+      <div className="py-2.5">
+        <div className="mb-2 flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-ui-sm text-ui-ink">Client config</p>
+            <p className="text-ui-2xs text-ui-ink-muted">
+              Add to your MCP client (e.g. Claude Desktop / Claude Code), then restart it.
+            </p>
+          </div>
+          <CopyButton
+            copied={copied === "config"}
+            onClick={() => copy(config, "config")}
+            aria-label="Copy MCP client config"
+            data-testid="mcp-copy-config"
+          />
+        </div>
+        <CodeBlock maxHeight="max-h-48" testId="mcp-config">
+          {config}
+        </CodeBlock>
+        <p className="mt-2 text-ui-2xs text-ui-ink-muted">
+          Claude Code CLI:{" "}
+          <code className="font-mono text-ui-ink">
+            claude mcp add --transport http comfyhelper {endpoint}
+          </code>
+        </p>
+      </div>
+
+      <div className="py-2.5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-ui-sm text-ui-ink">Available tools</p>
+            <p className="text-ui-2xs text-ui-ink-muted">
+              The tool surface the agent can call. Served by the gateway; needs it running.
+            </p>
+          </div>
+          <button
+            type="button"
+            className={cls.btn}
+            onClick={loadTools}
+            disabled={toolsState === "loading"}
+            data-testid="mcp-load-tools"
+          >
+            {toolsState === "loading" ? "Loading…" : tools ? "Refresh" : "List tools"}
+          </button>
+        </div>
+        {toolsState === "error" && (
+          <p className="mt-2 text-ui-2xs text-error-ink">
+            Couldn’t reach the MCP server — is the deedlit.api gateway up?
+          </p>
+        )}
+        {tools && tools.length > 0 && (
+          <ul className="mt-3 flex flex-col gap-1.5" data-testid="mcp-tools">
+            {tools.map((t) => (
+              <li key={t.name} className="text-ui-2xs">
+                <code className="font-mono text-accent-cyan">{t.name}</code>
+                <span className="text-ui-ink-muted"> — {t.description}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {tools && tools.length === 0 && (
+          <p className="mt-2 text-ui-2xs text-ui-ink-muted">No tools advertised.</p>
+        )}
+      </div>
     </Section>
   );
 }
@@ -577,6 +722,9 @@ export default function SettingsPage() {
 
       {/* Ingest & indexing (server-backed, not localStorage) */}
       <IngestSettingsSection />
+
+      {/* Agent access (MCP) — connection details, not stored settings */}
+      <McpAccessSection />
       </div>
     </div>
   );

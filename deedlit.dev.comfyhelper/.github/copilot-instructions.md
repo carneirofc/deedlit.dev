@@ -22,6 +22,12 @@ This package is the Next.js application for browsing and managing local ComfyUI 
 - The event bus is schema-validated and history-backed. New event kinds should extend the current channels and payload schemas rather than introducing loosely typed envelopes.
 - `/api/events` already implements snapshot, replay, live subscription, and heartbeat behavior. Extend that contract carefully instead of adding separate realtime endpoints for the same data.
 
+## MCP Server
+- The library's agent-facing tools are exposed as an MCP (JSON-RPC 2.0 over HTTP) server. The tool surface itself lives in the gateway (`deedlit.api/mcp.py`, served at `POST /mcp`), not in this package.
+- This app is UI-only. It connects to the application MCP server through the thin proxy route `app/api/mcp/route.ts`, which forwards JSON-RPC bodies via `mcpRpc(...)` in `lib/api-client.ts` to the gateway at `DEEDLIT_API_URL` (default `http://localhost:8088`). `GET /api/mcp` returns the discovery listing of tools.
+- To connect an MCP client to this app, point it at `/api/mcp` (the app proxy) or directly at the gateway's `POST /mcp`. Gate availability behind `MCP_ENABLED`.
+- Do not reimplement MCP tools in this package. To add or change a tool, edit `deedlit.api/mcp.py` and keep tool names / argument shapes aligned; the proxy relays whatever the gateway advertises.
+
 ## Database And Persistence
 - Prisma + SQLite back the app configuration and persisted state.
 - Keep schema changes in `prisma/schema.prisma` and follow them with a migration.
