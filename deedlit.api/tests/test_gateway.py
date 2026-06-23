@@ -243,6 +243,95 @@ def test_search_empty_query_browses_catalog_without_calling_search(rec, client):
     assert "limit=10" in seen["url"]
 
 
+# ---------------------------------------------------------------------------
+# (4a) POST /search/by-image — reverse-image search from an uploaded image
+# ---------------------------------------------------------------------------
+def test_search_by_image_embeds_then_queries(rec, client):
+    seen = {}
+
+    def embed_handler(request: httpx.Request):
+        # The image rides as multipart; assert the model preset is pinned.
+        seen["embed_ct"] = request.headers.get("content-type", "")
+        return {"model_preset": "vit_h", "dim": 3, "embedding": [0.4, 0.5, 0.6]}
+
+    def query_handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return {"hits": [{"sha256": "e" * 64, "score": 0.8}], "fusion": "dense"}
+
+    rec.on("POST", "/embed/image", embed_handler)
+    rec.on("POST", "/query", query_handler)
+
+    r = client.post(
+        "/search/by-image",
+        files={"file": ("query.png", b"\x89PNGfake", "image/png")},
+        data={"limit": "12", "offset": "0"},
+    )
+    assert r.status_code == 200
+    assert r.json()["hits"][0]["sha256"] == "e" * 64
+    # The upload is embedded via vision, then the dense vector queries search.
+    assert _bases(rec) == {clients.VISION_URL, clients.SEARCH_URL}
+    assert "multipart/form-data" in seen["embed_ct"]
+    assert seen["body"]["dense"] == [0.4, 0.5, 0.6]
+    assert seen["body"]["limit"] == 12
+    # A single dense modality — no text/sparse vectors on the by-image path.
+    assert "sparse" not in seen["body"] or seen["body"]["sparse"] is None
+
+
+def test_search_by_image_translates_facets_to_qdrant_filter(rec, client):
+    seen = {}
+
+    rec.on("POST", "/embed/image", lambda r: {"embedding": [0.1, 0.2, 0.3]})
+
+    def query_handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return {"hits": [], "fusion": "dense"}
+
+    rec.on("POST", "/query", query_handler)
+
+    r = client.post(
+        "/search/by-image",
+        files={"file": ("q.png", b"img", "image/png")},
+        data={
+            "limit": "24",
+            "filter": json.dumps(
+                {"tags": ["knight"], "excludeTags": ["blurry"], "safety": ["sfw"], "modelFamily": "sdxl"}
+            ),
+        },
+    )
+    assert r.status_code == 200
+    qfilter = seen["body"]["filter"]
+    # Payload-backed facets translate; the catalog-only modelFamily is dropped.
+    assert qfilter["must"] == [
+        {"key": "tags", "match": {"any": ["knight"]}},
+        {"key": "safety", "match": {"any": ["sfw"]}},
+    ]
+    assert qfilter["must_not"] == [{"key": "tags", "match": {"any": ["blurry"]}}]
+
+
+def test_search_by_image_502_when_vision_down(rec, client):
+    rec.on("POST", "/embed/image", lambda r: httpx.Response(500, json={"detail": "gpu oom"}))
+    r = client.post(
+        "/search/by-image",
+        files={"file": ("q.png", b"img", "image/png")},
+        data={"limit": "10"},
+    )
+    assert r.status_code == 502
+    assert "vision" in r.json()["detail"]
+    # Vision failed before any search call was made.
+    assert _bases(rec) == {clients.VISION_URL}
+
+
+def test_search_by_image_rejects_empty_upload(rec, client):
+    r = client.post(
+        "/search/by-image",
+        files={"file": ("empty.png", b"", "image/png")},
+        data={"limit": "10"},
+    )
+    assert r.status_code == 400
+    # Nothing downstream is touched for an empty upload.
+    assert rec.calls == []
+
+
 def test_browse_threads_safety_into_catalog_params(rec, client):
     # No-query browse with a content-safety filter threads it into catalog
     # GET /images as repeated ?safety= params (catalog lists by the set).

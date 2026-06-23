@@ -26,6 +26,7 @@ from catalog.db import get_engine
 from catalog.schemas import (
     AssetRef,
     Collection,
+    DirectoryCount,
     FolderReport,
     Image,
     ImagePatch,
@@ -100,17 +101,29 @@ def _basename(path: str) -> str:
     return os.path.basename(path.replace("\\", "/")) or path
 
 
+def _dirname(path: str) -> str:
+    """Parent directory of a path, OS-agnostic (separators normalized to '/').
+
+    Mirrors :func:`_basename`: ingest may pass Windows paths while the catalog
+    runs on Linux. The catalog stores this as ``images.directory`` (the
+    split-by-source-directory grouping key); SQL backfill in migration 0006 uses
+    the same rule. Returns '' when the path has no separator."""
+    norm = path.replace("\\", "/")
+    idx = norm.rfind("/")
+    return norm[:idx] if idx > 0 else ""
+
+
 def upsert_image(payload: ImageUpsert) -> Image:
     def _tx(conn: Connection) -> None:
         conn.execute(
             text(
                 """
                 INSERT INTO images (
-                    file_path, filename, sha256_hash, perceptual_hash,
+                    file_path, filename, directory, sha256_hash, perceptual_hash,
                     width, height, source_tool, prompt, negative_prompt,
                     workflow_json, metadata_json, safety, created_at
                 ) VALUES (
-                    :file_path, :filename, :sha256, :phash,
+                    :file_path, :filename, :directory, :sha256, :phash,
                     :width, :height, :source_tool, :prompt, :negative,
                     CAST(:workflow_json AS JSONB), CAST(:metadata_json AS JSONB), :safety,
                     :created_at
@@ -139,6 +152,10 @@ def upsert_image(payload: ImageUpsert) -> Image:
                 # — which has no original path — never clobbers the real one.
                 "file_path": payload.filepath or f"s3://images/{payload.sha256}",
                 "filename": _basename(payload.filepath) if payload.filepath else payload.sha256,
+                # Parent directory grouping key. Derived from filepath, INSERT-only
+                # (absent from the ON CONFLICT update above) like file_path/filename
+                # so a reindex with no path never clobbers it.
+                "directory": _dirname(payload.filepath) if payload.filepath else "",
                 "sha256": payload.sha256,
                 "phash": payload.phash,
                 "width": payload.width,
@@ -202,8 +219,22 @@ _IMAGE_COLUMNS = """
 # instead of ~100 KB/row. The full record (with those columns) is one
 # GET /images/{sha256} away when a detail view opens.
 _LIST_COLUMNS = """
-    id, sha256_hash, file_path, perceptual_hash, width, height,
+    id, sha256_hash, file_path, directory, perceptual_hash, width, height,
     source_tool, prompt, rating, favorite, safety, created_at, imported_at
+"""
+
+# The LIGHT single-image column list (get_image light=True). Same as
+# _IMAGE_COLUMNS but WITHOUT the two heavy JSONB graph columns (workflow_json,
+# metadata_json/api_prompt_json). It keeps every curated scalar the detail panels
+# render — including negative_prompt — plus the small tag/params/refs/description
+# children. The Lightbox details panel, the detail page, and the per-image ingest
+# stages read those light fields but never the workflow graphs, so they pull this
+# instead of paying the ~100 KB JSONB on every (per-navigation) read. The full
+# GET /images/{sha256} still serves the graphs for the raw-JSON inspector/export.
+_DETAIL_LIGHT_COLUMNS = """
+    id, sha256_hash, file_path, perceptual_hash, width, height,
+    source_tool, prompt, negative_prompt, rating, favorite,
+    safety, created_at, imported_at
 """
 
 
@@ -218,7 +249,9 @@ def _row_to_image(
     """Assemble an :class:`Image` from a raw image row + its already-loaded
     children. The single place the row→model mapping lives, so the per-image
     (:func:`get_image`) and batched (:func:`_hydrate_images`) paths agree."""
-    metadata = row["metadata_json"] or {}
+    # `.get()` (not `[...]`) so this also assembles a LIGHT row that omitted the
+    # two heavy JSONB columns — there they read as None (see _DETAIL_LIGHT_COLUMNS).
+    metadata = row.get("metadata_json") or {}
     api_prompt_json = (
         metadata.get("api_prompt_json") if isinstance(metadata, dict) else None
     )
@@ -234,7 +267,7 @@ def _row_to_image(
         tags=tags,
         params=params,
         references=references,
-        workflow_json=row["workflow_json"],
+        workflow_json=row.get("workflow_json"),
         api_prompt_json=api_prompt_json,
         rating=row["rating"],
         favorite=row["favorite"],
@@ -256,6 +289,7 @@ def _row_to_summary(
     return ImageSummary(
         sha256=row["sha256_hash"],
         filepath=row["file_path"],
+        directory=row["directory"],
         phash=row["perceptual_hash"],
         width=row["width"],
         height=row["height"],
@@ -271,11 +305,20 @@ def _row_to_summary(
     )
 
 
-def get_image(sha256: str) -> Image | None:
+def get_image(sha256: str, *, light: bool = False) -> Image | None:
+    """Fetch one image's full record (the source of truth).
+
+    ``light=True`` skips the two heavy JSONB graph columns (workflow_json,
+    metadata_json/api_prompt_json) — see :data:`_DETAIL_LIGHT_COLUMNS` — for
+    callers that render only curated fields (the detail panels) or read a couple
+    of light fields (ingest projection), so a per-navigation detail fetch doesn't
+    drag ~100 KB of workflow graph it never uses. The small tag/params/refs/
+    description children are loaded either way."""
     eng = get_engine()
+    columns = _DETAIL_LIGHT_COLUMNS if light else _IMAGE_COLUMNS
     with eng.connect() as conn:
         row = conn.execute(
-            text(f"SELECT {_IMAGE_COLUMNS} FROM images WHERE sha256_hash = :sha"),
+            text(f"SELECT {columns} FROM images WHERE sha256_hash = :sha"),
             {"sha": sha256},
         ).mappings().first()
         if row is None:
@@ -523,6 +566,39 @@ def count_images(
             text(f"SELECT count(*) AS n FROM images i WHERE {where}"), params
         ).first()
     return int(row[0]) if row else 0
+
+
+def list_directories(*, limit: int = 2000) -> list[DirectoryCount]:
+    """Distinct source directories with per-directory live-image counts.
+
+    Backs the library's split-by-source-directory view: the grid groups its
+    loaded page by ``directory`` but needs the TRUE total per folder for the
+    section headers, which only a server-side aggregate can give. Soft-deleted
+    rows are excluded (matching browse); the synthetic object-store fallback
+    bucket (empty directory) is dropped. Ordered biggest-first so the most
+    populated folders head the list, capped to bound the payload.
+    """
+    eng = get_engine()
+    with eng.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT directory, count(*) AS image_count
+                FROM images
+                WHERE deleted = false
+                  AND directory IS NOT NULL
+                  AND directory <> ''
+                GROUP BY directory
+                ORDER BY image_count DESC, directory ASC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).mappings().all()
+    return [
+        DirectoryCount(directory=r["directory"], image_count=int(r["image_count"]))
+        for r in rows
+    ]
 
 
 def suggest_tags(*, prefix: str, limit: int) -> list[str]:
@@ -1279,10 +1355,11 @@ def _folder_counts(conn: Connection, path: str) -> tuple[int, int]:
             SELECT
               count(*) AS image_count,
               count(*) FILTER (
-                WHERE EXISTS (
-                  SELECT 1 FROM image_descriptions d
-                  WHERE d.image_id = i.id AND d.provider = :provider
-                )
+                WHERE i.safety IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM image_descriptions d
+                    WHERE d.image_id = i.id AND d.provider = :provider
+                  )
               ) AS labeled_count
             FROM images i
             WHERE i.deleted = false
@@ -1492,16 +1569,19 @@ def library_stats() -> StatsReport:
             unclassified=counts.get("unclassified", 0),
         )
 
-        # Labeled = has a labelagent description; the rest of the live set is the
-        # backfill work (mirrors list_unlabeled_sha256 / folder coverage).
+        # Labeled = has a labelagent description AND a safety class. Mirrors the
+        # backfill work set (list_unlabeled_sha256 = missing EITHER), so the
+        # labeled/unlabeled split here stays consistent with what the sweep targets.
         labeled = conn.execute(
             text(
                 """
                 SELECT count(*) FROM images i
-                WHERE i.deleted = false AND EXISTS (
+                WHERE i.deleted = false
+                  AND i.safety IS NOT NULL
+                  AND EXISTS (
                     SELECT 1 FROM image_descriptions d
                     WHERE d.image_id = i.id AND d.provider = :provider
-                )
+                  )
                 """
             ),
             {"provider": _DESCRIPTION_PROVIDER},
@@ -1630,9 +1710,16 @@ def get_task(task_id: str) -> Task | None:
 
 
 def list_unlabeled_sha256(limit: int, offset: int) -> list[str]:
-    """sha256 of cataloged images with no labelagent description — the set the
-    label-backfill sweep relabels. Newest-first so a backfill prioritizes recent
-    imports; paged like list_images."""
+    """sha256 of cataloged images that need (re)labeling by the AI agent.
+
+    Targets images that are missing EITHER a description OR a safety class — the
+    two fields the labelagent is responsible for. Using OR means:
+      - images never labeled (no description, no safety) → new backfill work
+      - images labeled before safety was added (0002 migration) that have a
+        description but NULL safety → get relabeled to fill the gap
+
+    Newest-first so a backfill prioritizes recent imports; paged like list_images.
+    """
     eng = get_engine()
     with eng.connect() as conn:
         rows = conn.execute(
@@ -1641,9 +1728,12 @@ def list_unlabeled_sha256(limit: int, offset: int) -> list[str]:
                 SELECT i.sha256_hash
                 FROM images i
                 WHERE i.deleted = false
-                  AND NOT EXISTS (
-                    SELECT 1 FROM image_descriptions d
-                    WHERE d.image_id = i.id AND d.provider = :provider
+                  AND (
+                    i.safety IS NULL
+                    OR NOT EXISTS (
+                      SELECT 1 FROM image_descriptions d
+                      WHERE d.image_id = i.id AND d.provider = :provider
+                    )
                   )
                 ORDER BY i.imported_at DESC
                 LIMIT :limit OFFSET :offset

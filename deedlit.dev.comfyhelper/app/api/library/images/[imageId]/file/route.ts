@@ -1,6 +1,6 @@
 import { handleRoute, jsonError } from "@/lib/library/http";
 import { blobUrl } from "@/lib/api-client";
-import { getCachedImage, setCachedImage } from "@/lib/library/image-cache";
+import { getCachedImage, setCachedImage, IMAGE_CACHE_CONTROL } from "@/lib/library/image-cache";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,15 +16,26 @@ type RouteContext = { params: Promise<{ imageId: string }> };
  * otherwise.
  * TODO(#17): serve originals once the gateway/catalog expose original bytes.
  */
-export async function GET(_request: Request, context: RouteContext) {
+export async function GET(request: Request, context: RouteContext) {
   return handleRoute(async () => {
     const { imageId } = await context.params;
+
+    // Content-addressed by sha256 -> immutable. A matching If-None-Match returns
+    // a 0-byte 304 without touching Redis or the gateway.
+    const etag = `"${imageId}-orig"`;
+    if (request.headers.get("if-none-match") === etag) {
+      return new Response(null, {
+        status: 304,
+        headers: { "cache-control": IMAGE_CACHE_CONTROL, etag },
+      });
+    }
 
     const cached = await getCachedImage(imageId, "orig");
     if (cached) {
       return new Response(cached.data as unknown as BodyInit, {
         headers: {
-          "cache-control": "public, max-age=86400",
+          "cache-control": IMAGE_CACHE_CONTROL,
+          etag,
           "content-type": cached.contentType,
         },
       });
@@ -43,7 +54,8 @@ export async function GET(_request: Request, context: RouteContext) {
 
     return new Response(buf as unknown as BodyInit, {
       headers: {
-        "cache-control": "public, max-age=86400",
+        "cache-control": IMAGE_CACHE_CONTROL,
+        etag,
         "content-type": ct,
       },
     });

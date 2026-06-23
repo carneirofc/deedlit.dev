@@ -161,6 +161,13 @@ REBUILD_THUMBNAILS = "rebuild-thumbnails"
 # the eventual-consistency guarantees of the fan-out write model.
 RECONCILE = "reconcile"
 
+# Prune graph orphans (Neo4j cleanup): remove the structurally-orphaned
+# :Asset/:Tag nodes that image deletes leave behind (delete_image keeps the
+# Asset/Tag a deleted image pointed at, since other images may still use it; one
+# left with NO remaining edge is dead weight). Drives graph POST /prune; runnable
+# on-demand via POST /jobs and on the opt-in periodic schedule below.
+PRUNE_GRAPH_ORPHANS = "prune-graph-orphans"
+
 # Label backfill (configured-folders feature): find cataloged images with no
 # labelagent description and re-run the pipeline so they get one (+ safety +
 # AI tags), then re-project. The work set comes from catalog
@@ -508,6 +515,8 @@ class JobStore:
                 await self._run_reconcile(job)
             elif job.type == LABEL_BACKFILL:
                 await self._run_label_backfill(job)
+            elif job.type == PRUNE_GRAPH_ORPHANS:
+                await self._run_prune_orphans(job)
             elif job.type in REBUILD_FUNCS:
                 await self._run_rebuild(job)
             else:
@@ -812,6 +821,24 @@ class JobStore:
                 job.progress.failed += 1
         job.status = COMPLETED
 
+    async def _run_prune_orphans(self, job: Job) -> None:
+        """Prune structurally-orphaned graph nodes (graph ``POST /prune``).
+
+        A single opaque unit of work owned by deedlit.graph: the orphan
+        :Asset/:Tag nodes left behind by image deletes are swept in one call.
+        Progress is 1/1; the per-type deletion counts land in ``job.report`` so
+        the UI can show how much was removed. Reuses the in-memory Job model so
+        it reports progress + is cancellable like every other maintenance job.
+        """
+        job.progress.total = 1
+        if job.cancel_requested:
+            job.status = CANCELLED
+            return
+        result = await asyncio.to_thread(pipeline.prune_graph_orphans)
+        job.report = result if isinstance(result, dict) else None
+        job.progress.done += 1
+        job.status = COMPLETED
+
     async def _process_one(self, job: Job, path: Path) -> None:
         """Enqueue ONE ``ingest`` task for a file — no inline processing (ADR 0002).
 
@@ -1053,5 +1080,49 @@ async def label_backfill_scheduler(store: "JobStore") -> None:
             ):
                 continue
             run_label_backfill_tick(store)
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Graph orphan-prune scheduler (Neo4j cleanup)
+#
+# Periodically enqueue a single prune-graph-orphans job (sweep the orphaned
+# :Asset/:Tag nodes that image deletes leave behind). Opt-in via
+# ORPHAN_PRUNE_INTERVAL_SECONDS; skips a tick when one is already queued/running
+# so prunes never stack. Disabled (silent in tests) when 0/unset.
+# ---------------------------------------------------------------------------
+def orphan_prune_interval_seconds() -> int:
+    """Graph orphan-prune schedule interval in seconds; 0/unset disables it."""
+    try:
+        return int(os.getenv("ORPHAN_PRUNE_INTERVAL_SECONDS", "0"))
+    except ValueError:
+        return 0
+
+
+def run_orphan_prune_tick(store: "JobStore") -> Job:
+    """Enqueue one prune-graph-orphans job (tests call this directly)."""
+    return store.create_maintenance_job(PRUNE_GRAPH_ORPHANS)
+
+
+async def orphan_prune_scheduler(store: "JobStore") -> None:
+    """Background loop: enqueue a graph orphan-prune sweep every interval (opt-in).
+
+    No-op when ORPHAN_PRUNE_INTERVAL_SECONDS is 0/unset, so importing the app or
+    running tests never starts a real scheduler. Skips a tick while a prune is
+    already queued/running so they never stack; a hiccup is swallowed and retried
+    next tick (matches the other schedulers)."""
+    interval = orphan_prune_interval_seconds()
+    if interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if any(
+                j.type == PRUNE_GRAPH_ORPHANS and j.status in (QUEUED, RUNNING)
+                for j in store.list()
+            ):
+                continue
+            run_orphan_prune_tick(store)
         except Exception:
             continue

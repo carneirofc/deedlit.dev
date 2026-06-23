@@ -16,6 +16,9 @@ export type BrowseMode = "browse" | "semantic" | "image";
 export type ViewMode = "grid" | "list" | "masonry";
 export type GridDensity = "compact" | "comfortable" | "spacious";
 export type ImageFit = "contain" | "cover";
+/** How browse results are sectioned. `none` = one flat grid; `folder` = split
+ *  into collapsible sections by source directory (browse path only). */
+export type GroupByMode = "none" | "folder";
 
 /** AI content-safety class. Mirrors the catalog/labelagent `safety` enum. */
 export type SafetyClass = "sfw" | "nsfw" | "explicit";
@@ -72,6 +75,10 @@ export interface LibrarySettings {
   /** Result ordering. Defaults to newest-first for browse; relevance is applied
    * automatically when a text/image query is active. */
   sortMode: SortMode;
+  /** Split browse results into collapsible sections by source directory.
+   * `none` = one flat grid (default). Only applies on the filter-only browse
+   * path; the vector-search results have no directory to group by. */
+  groupBy: GroupByMode;
   /** Card size / column count for grid & masonry views. */
   gridDensity: GridDensity;
   /** Show the similarity-score chip on cards. */
@@ -131,6 +138,7 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   infiniteScroll: false,
   viewMode: "grid",
   sortMode: "newest",
+  groupBy: "none",
   gridDensity: "comfortable",
   showScores: true,
   showCardMeta: true,
@@ -193,6 +201,7 @@ function mergeSettings(raw: unknown): LibrarySettings {
     infiniteScroll: bool("infiniteScroll"),
     viewMode: oneOf("viewMode", ["grid", "list", "masonry"] as const),
     sortMode: oneOf("sortMode", SORT_MODES),
+    groupBy: oneOf("groupBy", ["none", "folder"] as const),
     gridDensity: oneOf("gridDensity", ["compact", "comfortable", "spacious"] as const),
     showScores: bool("showScores"),
     showCardMeta: bool("showCardMeta"),

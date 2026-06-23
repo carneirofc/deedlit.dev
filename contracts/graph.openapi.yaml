@@ -54,6 +54,17 @@ paths:
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { tag: { type: string }, weight: { type: number } }, required: [tag] } } } } } }
   /rebuild:
     post: { summary: Rebuild the graph from catalog, responses: { "202": { description: Rebuild started } } }
+  /prune:
+    post:
+      summary: Remove structurally-orphaned Asset/Tag nodes (no incoming USES/TAGGED)
+      description: >
+        Sweeps the orphans that image deletes leave behind: :Asset nodes with no
+        incoming :USES and :Tag nodes with no incoming :TAGGED. Both are
+        unambiguous (an Asset/Tag only exists via an edge from an Image).
+        :Image nodes are never touched — reconciling them against catalog truth
+        is the /rebuild path. Idempotent. With dry_run it only counts.
+      requestBody: { required: false, content: { application/json: { schema: { type: object, properties: { dry_run: { type: boolean, default: false } } } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string }, assets_deleted: { type: integer }, tags_deleted: { type: integer }, dry_run: { type: boolean } } } } } } }
   /activity:
     get:
       summary: Live work snapshot (in-flight count, throughput, current op)

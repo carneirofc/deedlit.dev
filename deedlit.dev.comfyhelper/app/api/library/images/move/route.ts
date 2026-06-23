@@ -2,7 +2,7 @@ import { rename } from "node:fs/promises";
 import path from "node:path";
 
 import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
-import { getDetail, imageToUiDetail } from "@/lib/api-client";
+import { getImage, imageToUiDetail } from "@/lib/api-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -33,8 +33,8 @@ export async function POST(request: Request) {
 
     for (const imageId of imageIds) {
       try {
-        const detail = await getDetail(imageId);
-        const ui = imageToUiDetail(detail.image);
+        // Only the filepath is needed — a light catalog read (no /detail fan-out).
+        const ui = imageToUiDetail(await getImage(imageId, { light: true }));
         if (!ui.filePath) {
           failed.push({ id: imageId, error: "No file path in catalog." });
           continue;

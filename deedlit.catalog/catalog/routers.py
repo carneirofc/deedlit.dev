@@ -11,6 +11,7 @@ from catalog.schemas import (
     CollectionRename,
     CollectionUpsert,
     CountResult,
+    DirectoryCount,
     FavoriteBody,
     FolderReport,
     Image,
@@ -77,9 +78,15 @@ def list_images(
 @router.get("/tags", response_model=list[str])
 def suggest_tags(
     prefix: str = Query(default=""),
-    limit: int = Query(default=10, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=2000),
 ) -> list[str]:
-    """Tag-name autocomplete: names matching ``prefix``, most-used first."""
+    """Tag-name autocomplete: names matching ``prefix``, most-used first.
+
+    The cap is high (2000, not a tight type-ahead bound) on purpose: the filter
+    UI fetches the WHOLE tag catalog with an empty prefix to populate its
+    "popular tags" cloud + full picker. A low cap here previously made that
+    catalog-wide request fail validation, so the picker silently fell back to a
+    ~10-item type-ahead. ``/tags/report`` remains the paged inventory surface."""
     return repository.suggest_tags(prefix=prefix, limit=limit)
 
 
@@ -134,9 +141,30 @@ def list_unlabeled(
     return {"sha256": repository.list_unlabeled_sha256(limit=limit, offset=offset)}
 
 
+# Registered BEFORE /images/{sha256}: "directories" is a literal segment, not a
+# 64-hex sha, so the parameterized route would 422 it. The literal wins.
+@router.get("/images/directories", response_model=list[DirectoryCount])
+def list_directories(
+    limit: int = Query(default=2000, ge=1, le=10000),
+) -> list[DirectoryCount]:
+    """Distinct source directories with per-directory live-image counts.
+
+    Backs the library's split-by-source-directory section headers (true totals
+    per folder, not just the loaded page). Biggest folder first."""
+    return repository.list_directories(limit=limit)
+
+
 @router.get("/images/{sha256}", response_model=Image)
-def read_image(sha256: str = SHA256) -> Image:
-    img = repository.get_image(sha256)
+def read_image(
+    sha256: str = SHA256,
+    fields: str | None = Query(default=None),
+) -> Image:
+    """Full catalog record for one image. ``?fields=light`` omits the heavy
+    workflow_json/api_prompt_json graphs (they come back null) for callers that
+    render only curated fields — the per-navigation detail panels — so they don't
+    transfer ~100 KB of workflow graph they never use. Omit it for the raw-JSON
+    inspector / export, which need the graphs."""
+    img = repository.get_image(sha256, light=(fields == "light"))
     if img is None:
         raise HTTPException(status_code=404, detail="image not found")
     return img
@@ -202,16 +230,31 @@ def set_favorite(payload: FavoriteBody, sha256: str = SHA256) -> dict:
 
 # --- blobs -----------------------------------------------------------------
 
+# Blobs are content-addressed by sha256, so a given (sha256, kind) is immutable:
+# its bytes never change. That lets us cache forever and revalidate with a 0-byte
+# 304, so a repeat view never re-streams the bytes through the chain.
+_BLOB_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
 
 @router.get("/blobs/{sha256}/{kind}")
-def get_blob(sha256: str = SHA256, kind: str = Path(...)) -> Response:
+def get_blob(
+    request: Request, sha256: str = SHA256, kind: str = Path(...)
+) -> Response:
     if kind not in object_store.BLOB_KINDS:
         raise HTTPException(status_code=422, detail="invalid blob kind")
+    # Strong ETag over (sha, kind): immutable content, so a matching
+    # If-None-Match short-circuits to 304 before the object-store read.
+    etag = f'"{sha256}-{kind}"'
+    cache_headers = {"Cache-Control": _BLOB_CACHE_CONTROL, "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=cache_headers)
     data = object_store.get_blob(sha256, kind)
     if data is None:
         raise HTTPException(status_code=404, detail="blob not found")
     return Response(
-        content=data, media_type=object_store.content_type_for(kind)
+        content=data,
+        media_type=object_store.content_type_for(kind),
+        headers=cache_headers,
     )
 
 

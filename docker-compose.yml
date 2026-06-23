@@ -181,16 +181,30 @@ services:
       timeout: 5s
       retries: 20
 
-  # Redis: image-bytes cache (thumbnail + original). comfyhelper proxy routes
-  # check here before hitting the blob service, and eagerly warm originals when
-  # thumbnails are loaded. REDIS_URL=redis://localhost:6379 in comfyhelper .env.
+  # Redis: a BOUNDED, ephemeral hot shield for image bytes in front of RustFS.
+  # It is NOT the primary cache — image responses are content-addressed by sha256
+  # and served with `Cache-Control: immutable` + an ETag, so the browser/CDN do
+  # the heavy lifting; Redis only spares RustFS on cold-browser repeat loads.
+  # maxmemory + allkeys-lru cap it so a large library can never grow it toward
+  # host RAM (the old config had no limit and a 7-day TTL -> unbounded). No
+  # persistence: it's a throwaway cache, so don't write image bytes to disk.
+  # REDIS_URL=redis://localhost:6379 in comfyhelper .env.
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    mem_limit: 640m
     ports:
       - "6379:6379"
-    volumes:
-      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -340,9 +354,11 @@ services:
       INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-4}
       # Background schedulers (0/unset disables each). Folder scan re-walks the
       # configured-folder registry on each folder's own interval; label backfill
-      # periodically relabels images missing an AI description.
+      # periodically relabels images missing an AI description; orphan prune
+      # periodically sweeps orphaned Asset/Tag nodes from Neo4j (graph POST /prune).
       FOLDER_SCAN_TICK_SECONDS: ${FOLDER_SCAN_TICK_SECONDS:-60}
       LABEL_BACKFILL_INTERVAL_SECONDS: ${LABEL_BACKFILL_INTERVAL_SECONDS:-0}
+      ORPHAN_PRUNE_INTERVAL_SECONDS: ${ORPHAN_PRUNE_INTERVAL_SECONDS:-0}
       # Backpressure: a folder-scan tick is skipped while `ingest` already holds
       # this many ready tasks, so the producer can't outrun a down/slow worker and
       # pile up unbounded duplicate ingest tasks (0 disables the gate).
@@ -431,11 +447,27 @@ services:
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
       INGEST_URL: http://ingest:8000
+      # Text search encodes the query via vision before hitting search, and the
+      # status dashboard probes vision+metadata, so the gateway must reach both.
+      # Inside the compose network they are the `vision`/`metadata` hosts, NOT
+      # localhost (the clients.py defaults are for the bare-metal dev layout).
+      # NB: vision is profile-gated ([vision]/[full]) — bring the stack up with
+      # `--profile vision` (or full) for gateway text search to work.
+      VISION_URL: http://vision:8000
+      METADATA_URL: http://metadata:8000
+      # RabbitMQ management HTTP API — backs the in-app queue-visualization page
+      # (#29). The gateway is the ONLY thing that talks to the management API
+      # (creds stay server-side). Inside the compose network the broker is the
+      # `rabbitmq` host, not localhost.
+      RABBITMQ_MGMT_URL: ${RABBITMQ_MGMT_URL:-http://rabbitmq:15672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-deedlit}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-deedlit}
     depends_on:
       catalog: { condition: service_healthy }
       search: { condition: service_healthy }
       graph: { condition: service_healthy }
       ingest: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
     healthcheck: *app-healthcheck
 
   # --- GPU vision (profile-gated; needs NVIDIA runtime) ------------------
@@ -552,7 +584,6 @@ volumes:
   rustfs_data:
   rustfs_logs:
   rabbitmq_data:
-  redis_data:
   loki_data:
   tempo_data:
   alloy_data:

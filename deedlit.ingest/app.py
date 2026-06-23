@@ -55,6 +55,8 @@ from jobs import (
     folder_scan_tick_seconds,
     label_backfill_interval_seconds,
     label_backfill_scheduler,
+    orphan_prune_interval_seconds,
+    orphan_prune_scheduler,
     reconcile_interval_seconds,
     reconcile_scheduler,
 )
@@ -89,6 +91,7 @@ async def lifespan(app: FastAPI):
     #   - reconcile sweep (#21)
     #   - folder scan (per-folder cadence over the configured-folder registry)
     #   - label backfill (relabel images missing an AI description)
+    #   - graph orphan prune (sweep orphaned Asset/Tag nodes from Neo4j)
     schedulers: list[asyncio.Task] = []
     if reconcile_interval_seconds() > 0:
         schedulers.append(asyncio.create_task(reconcile_scheduler(store)))
@@ -96,6 +99,8 @@ async def lifespan(app: FastAPI):
         schedulers.append(asyncio.create_task(folder_scan_scheduler(store)))
     if label_backfill_interval_seconds() > 0:
         schedulers.append(asyncio.create_task(label_backfill_scheduler(store)))
+    if orphan_prune_interval_seconds() > 0:
+        schedulers.append(asyncio.create_task(orphan_prune_scheduler(store)))
     try:
         yield
     finally:
@@ -162,6 +167,7 @@ class MaintenanceRequest(BaseModel):
         "rebuild-thumbnails",
         "reconcile",
         "label-backfill",
+        "prune-graph-orphans",
     ]
     sha256: str | None = None
     folderPath: str | None = None

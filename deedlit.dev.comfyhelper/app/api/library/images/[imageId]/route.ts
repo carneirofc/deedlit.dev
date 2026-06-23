@@ -1,6 +1,6 @@
 import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
 import {
-  getDetail,
+  getImage,
   imageToUiDetail,
   deleteImage,
   patchImage,
@@ -17,9 +17,12 @@ export async function GET(_request: Request, context: RouteContext) {
   return handleRoute(async () => {
     const { imageId } = await context.params;
     try {
-      const detail = await getDetail(imageId);
-      if (!detail?.image) return jsonError("Image not found.", 404);
-      return jsonOk(imageToUiDetail(detail.image));
+      // Light catalog passthrough — the panel/detail page render only curated
+      // fields, so skip the /detail fan-out (search+graph) AND the heavy
+      // workflow_json/api_prompt_json graphs. Similar/neighbors, when shown, are
+      // fetched by their own routes.
+      const image = await getImage(imageId, { light: true });
+      return jsonOk(imageToUiDetail(image));
     } catch (e) {
       if (e instanceof GatewayError && e.status === 404) {
         return jsonError("Image not found.", 404);

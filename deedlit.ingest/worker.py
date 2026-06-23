@@ -188,6 +188,26 @@ def _queues_from_env() -> list[str]:
     return [q.strip() for q in raw.split(",") if q.strip()]
 
 
+async def _config_refresh_loop(interval: float = 30.0) -> None:
+    """Re-read persisted config overrides so UI changes take effect without restart.
+
+    The ingest API and the worker are separate processes with separate in-memory
+    config dicts. A PUT /config from the UI updates the API process and writes to
+    the catalog settings KV, but the worker never sees the API's memory. Polling
+    the same catalog key every ``interval`` seconds keeps the worker in sync within
+    one poll cycle (~30 s by default).
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            overrides = await settings_client.load()
+            if overrides:
+                config.update(overrides)
+                log.debug("refreshed ingest config from catalog: %s", overrides)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("config refresh skipped: %s", exc)
+
+
 def _install_thread_pool() -> None:
     """Size the default executor for the CPU-bound pixel offload (ADR 0002 perf).
 
@@ -227,9 +247,11 @@ async def main() -> None:
         log.error("no consumable queues from QUEUES=%r; nothing to do", requested)
         return
     log.info("starting ingest worker for queues=%s (amqp=%s)", queues, broker.AMQP_URL)
+    refresh_task = asyncio.create_task(_config_refresh_loop())
     try:
         await broker.run_worker(queues, HANDLERS, on_event_factory=_ledger_event_factory)
     finally:
+        refresh_task.cancel()
         await pipeline.aclose()
         await ledger.aclose()
         await broker.close()

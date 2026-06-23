@@ -37,6 +37,7 @@ paths:
               type: object
               properties:
                 file: { type: string, format: binary }
+                model: { type: string, enum: [vit_h, big_g], description: "Model preset; omit for the server default (vit_h, 1024-dim)." }
               required: [file]
       responses:
         "200":
@@ -106,11 +107,16 @@ components:
       required: [text]
     DenseEmbedding:
       type: object
+      description: >
+        L2-normalized dense embedding. Field names match the live FastAPI
+        EmbeddingResponse; the vector is `embedding` (not `vector`).
       properties:
-        model: { type: string }
+        model_preset: { type: string, description: "Configured preset (vit_h or big_g)." }
+        model_name: { type: string, description: "OpenCLIP architecture name." }
+        device: { type: string, description: "Torch device (cpu or cuda)." }
         dim: { type: integer, default: 1024 }
-        vector: { type: array, items: { type: number } }
-      required: [dim, vector]
+        embedding: { type: array, items: { type: number } }
+      required: [dim, embedding]
     SparseEmbedding:
       type: object
       properties:

@@ -1,5 +1,5 @@
 import { handleRoute, jsonError, jsonOk } from "@/lib/library/http";
-import { getDetail, GatewayError } from "@/lib/api-client";
+import { getImage, GatewayError } from "@/lib/api-client";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -18,9 +18,11 @@ export async function GET(_request: Request, context: RouteContext) {
   return handleRoute(async () => {
     const { imageId } = await context.params;
     try {
-      const detail = await getDetail(imageId);
-      if (!detail?.image) return jsonError("Image not found.", 404);
-      return jsonOk(detail.image);
+      // Full catalog record (incl. workflow_json/api_prompt_json) for the raw-JSON
+      // inspector — but a pure catalog read, not the /detail fan-out, so opening a
+      // row no longer fires an unused search /similar + graph /neighbors query.
+      const image = await getImage(imageId);
+      return jsonOk(image);
     } catch (e) {
       if (e instanceof GatewayError && e.status === 404) {
         return jsonError("Image not found.", 404);

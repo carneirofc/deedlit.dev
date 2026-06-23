@@ -1,9 +1,20 @@
 import { getRedisClient } from "@/lib/library/db/redis";
-import { blobUrl } from "@/lib/api-client";
 
 const TTL = 7 * 24 * 60 * 60; // 7 days
 
-type ImageKind = "thumb" | "orig";
+/**
+ * Cache-Control for image-byte responses. Blobs are content-addressed by sha256,
+ * so a given image URL is immutable: cache for a year and mark immutable so the
+ * browser/CDN never revalidates a fresh asset. Paired with a per-route ETag this
+ * makes repeat views free (browser cache) and revalidations a 0-byte 304. This,
+ * not Redis, is the primary cache — Redis is only a hot shield in front of RustFS.
+ */
+export const IMAGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
+// "grid" = the small (~512px) WebP card tile, derived on demand from the larger
+// "thumbnail" blob (see the /grid route). "thumb" = the ~1080-1600px preview the
+// lightbox uses; "orig" reserved for a true original (not served today).
+type ImageKind = "thumb" | "orig" | "grid";
 
 export interface CachedImage {
   data: Buffer;
@@ -31,7 +42,7 @@ export async function getCachedImage(sha256: string, kind: ImageKind): Promise<C
     const data = results[0][1] as Buffer | null;
     const ct = results[1][1] as string | null;
     if (!data) return null;
-    return { data, contentType: ct ?? (kind === "thumb" ? "image/webp" : "image/jpeg") };
+    return { data, contentType: ct ?? (kind === "orig" ? "image/jpeg" : "image/webp") };
   } catch {
     return null;
   }
@@ -49,24 +60,4 @@ export async function setCachedImage(sha256: string, kind: ImageKind, data: Buff
   } catch {
     // best-effort
   }
-}
-
-/**
- * Fire-and-forget: fetch the original image and store it in cache.
- * Called when serving a thumbnail so the original is hot when the user opens the full view.
- */
-export function warmOriginal(sha256: string): void {
-  const upstream = blobUrl(sha256, "original");
-  if (!upstream) return;
-  getCachedImage(sha256, "orig")
-    .then((cached) => {
-      if (cached) return;
-      return fetch(upstream, { cache: "no-store" }).then(async (res) => {
-        if (!res.ok) return;
-        const ct = res.headers.get("content-type") ?? "image/jpeg";
-        const buf = Buffer.from(await res.arrayBuffer());
-        return setCachedImage(sha256, "orig", buf, ct);
-      });
-    })
-    .catch(() => {/* fire-and-forget — silent on error */});
 }

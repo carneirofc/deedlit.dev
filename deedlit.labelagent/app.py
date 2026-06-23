@@ -11,6 +11,7 @@ Run (matches the sibling services): ``uvicorn app:app --port 8006``. AgentOS's
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -174,7 +175,14 @@ async def describe(
 ) -> ImageLabel:
     """Label + describe one uploaded image for semantic indexing."""
     data = await file.read()
-    result = run_label(data, _format_for(file.content_type), prompt_hint)
+    # run_label drives a BLOCKING, synchronous vision-LLM call (agent.run) that can
+    # take many seconds. Offload it to a worker thread so a slow llama-server
+    # inference can't stall the event loop — otherwise this service can't answer
+    # /health (the dashboard/HEALTHCHECK poll) or a concurrent /describe while one
+    # image is being labeled.
+    result = await asyncio.to_thread(
+        run_label, data, _format_for(file.content_type), prompt_hint
+    )
     return ImageLabel(**result)
 
 

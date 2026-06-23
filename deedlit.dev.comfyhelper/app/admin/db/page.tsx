@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { CopyButton } from "@deedlit.dev/ui";
+
 import { deleteImages } from "@/lib/library/bulk-delete";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +55,13 @@ interface EditState {
   favorite: boolean;
 }
 
+/** Originating on-disk path of the source file, captured at ingest. The catalog
+ * serialises it as `filepath`; tolerate the other casings any producer might use. */
+function sourcePath(img: CatalogImage): string {
+  const v = img.filepath ?? img.file_path ?? img.filePath;
+  return typeof v === "string" ? v : "";
+}
+
 function editFrom(img: CatalogImage): EditState {
   return {
     prompt: img.prompt ?? "",
@@ -95,6 +104,8 @@ export default function DbPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Transient "Copied" state for the source-file path copy button.
+  const [pathCopied, setPathCopied] = useState(false);
 
   // Bulk selection for exclusion (un-index many at once). Separate from
   // `selected` (the single row open in the editor): a checkbox toggles a row into
@@ -531,6 +542,39 @@ export default function DbPage() {
                   </button>
                 </div>
               </div>
+
+              {/* Originating filesystem path, captured at ingest. The cross-service
+                  id is the opaque sha256, so this is the only trace back to the
+                  source file on disk — show it in full and copyable. */}
+              {sourcePath(selected) && (
+                <div className="rounded-lg border border-ui-border/40 bg-ui-bg p-2">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <span className="text-ui-2xs font-medium uppercase tracking-wide text-ui-ink-muted">
+                      Source file
+                    </span>
+                    <CopyButton
+                      copied={pathCopied}
+                      aria-label="Copy source file path"
+                      onClick={() => {
+                        navigator.clipboard
+                          ?.writeText(sourcePath(selected))
+                          .then(() => {
+                            setPathCopied(true);
+                            setTimeout(() => setPathCopied(false), 1500);
+                          })
+                          .catch(() => {});
+                      }}
+                    />
+                  </div>
+                  <p
+                    className="break-all font-mono text-ui-2xs text-ui-ink"
+                    title={sourcePath(selected)}
+                    data-testid="db-filepath"
+                  >
+                    {sourcePath(selected)}
+                  </p>
+                </div>
+              )}
 
               <label className="text-ui-xs text-ui-ink-muted">
                 prompt

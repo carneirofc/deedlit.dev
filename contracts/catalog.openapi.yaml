@@ -92,6 +92,16 @@ paths:
         - { name: limit, in: query, schema: { type: integer, default: 500 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { sha256: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [sha256] } } } } }
+  /images/directories:
+    get:
+      summary: Distinct source directories with per-directory image counts
+      description: >
+        The distinct images.directory values with live-image totals, biggest
+        folder first. Backs the library's split-by-source-directory section
+        headers (true folder totals, not just the loaded page).
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 2000, minimum: 1, maximum: 10000 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/DirectoryCount" } } } } } }
   /tags:
     get:
       summary: Tag-name autocomplete (names matching prefix, most-used first)
@@ -193,6 +203,13 @@ components:
       type: object
       properties: { count: { type: integer } }
       required: [count]
+    DirectoryCount:
+      type: object
+      description: "One source directory + how many live images live directly under it (split-by-source-directory section header)."
+      properties:
+        directory: { type: string }
+        image_count: { type: integer }
+      required: [directory, image_count]
     TagCount:
       type: object
       properties:
@@ -304,6 +321,7 @@ components:
       properties:
         sha256: { $ref: "#/components/schemas/Sha256" }
         filepath: { type: [string, "null"] }
+        directory: { type: [string, "null"], description: "Parent directory of filepath (separators normalized to '/') — the split-by-source-directory grouping key." }
         phash: { type: [string, "null"] }
         width: { type: [integer, "null"] }
         height: { type: [integer, "null"] }

@@ -152,6 +152,40 @@ def get_related_tags(
     return [RelatedTag(**r) for r in rows]
 
 
+@router.get("/entities", response_model=list[str])
+def list_entities(
+    type: str = Query(..., description="tag | checkpoint | lora | embedding | vae | controlnet | upscaler"),
+    prefix: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[str]:
+    """Distinct entity names of ``type`` matching ``prefix``, most-used first.
+
+    Backs the graph-filter value autocomplete: ``type=tag`` lists :Tag names,
+    any other value lists :Asset names of that ``kind``. Empty prefix returns the
+    most-used entities of the type."""
+    return repository.suggest_entities(type, prefix=prefix, limit=limit)
+
+
 @router.post("/rebuild", status_code=202)
 def post_rebuild() -> dict:
     return rebuild_from_catalog()
+
+
+class PruneRequest(BaseModel):
+    """POST /prune body. ``dry_run`` reports the counts that WOULD be removed
+    without deleting (admin "preview impact"); default runs the deletion."""
+
+    dry_run: bool = False
+
+
+@router.post("/prune")
+def post_prune(body: PruneRequest | None = None) -> dict:
+    """Remove structurally-orphaned :Asset / :Tag nodes (no incoming USES /
+    TAGGED) left behind by image deletes. Idempotent. :Image nodes are never
+    touched — reconciling them against catalog truth is the rebuild path.
+
+    Backs the on-demand admin "Prune graph orphans" action, the ingest
+    ``prune-graph-orphans`` maintenance job, and the opt-in periodic sweep.
+    With ``dry_run`` it only counts, for a preview before the real run."""
+    result = repository.prune_orphans(dry_run=(body.dry_run if body else False))
+    return {"status": "ok", **result}

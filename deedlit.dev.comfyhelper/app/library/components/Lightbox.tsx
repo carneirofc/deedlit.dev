@@ -640,6 +640,7 @@ export function Lightbox({
           key={current.imageId + (fullResolution ? "-hd" : "")}
           src={bigSrc(current, fullResolution)}
           alt={current.summary}
+          decoding="async"
           onLoad={() => setImgLoaded(true)}
           className={`max-h-full max-w-full object-contain transition-opacity duration-200 ${imgLoaded ? "opacity-100" : "opacity-0"}`}
         />

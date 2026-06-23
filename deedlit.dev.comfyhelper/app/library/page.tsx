@@ -41,12 +41,17 @@ interface CompactResult {
   imageId: string;
   score?: number | null;
   thumbnailUrl: string;
+  /** Small grid-tile URL (~512px WebP); falls back to thumbnailUrl when absent. */
+  gridUrl?: string;
   summary: string;
   tags: string[];
   model?: string | null;
   checkpoint?: string | null;
   rating?: number | null;
   safety?: SafetyClass | null;
+  /** Parent directory of the source file — the split-by-source-directory
+   * grouping key. Present on the browse path; absent on vector-search hits. */
+  directory?: string | null;
 }
 
 interface JobSummary {
@@ -1106,7 +1111,7 @@ export default function LibraryPage() {
   // empty prefix returns the most-used tags. Failures go quiet (empty list).
   const fetchTagSuggestions = useCallback(async (q: string): Promise<string[]> => {
     try {
-      const r = await fetch(`/api/library/tags?prefix=${encodeURIComponent(q)}&limit=10`);
+      const r = await fetch(`/api/library/tags?prefix=${encodeURIComponent(q)}&limit=50`);
       if (!r.ok) return [];
       const j = await r.json();
       return Array.isArray(j.tags) ? (j.tags as string[]) : [];
@@ -1143,6 +1148,72 @@ export default function LibraryPage() {
     );
   }, [results, browsePath, sortValue]);
 
+  // --- Split by source directory -------------------------------------------
+  // Group the loaded browse results into collapsible per-folder sections. Only
+  // the filter-only browse path carries a `directory` (the vector path's hits
+  // don't), so grouping is gated to it.
+  const grouping = browsePath && settings.groupBy === "folder";
+
+  // Sections in first-appearance order under the current sort, each with its
+  // start offset into the flattened list below (for lightbox index mapping).
+  const groupSections = useMemo(() => {
+    if (!grouping) return [] as Array<{ key: string; items: CompactResult[]; startOffset: number }>;
+    const map = new Map<string, CompactResult[]>();
+    for (const r of displayResults) {
+      const key = r.directory ?? "";
+      const arr = map.get(key);
+      if (arr) arr.push(r);
+      else map.set(key, [r]);
+    }
+    let offset = 0;
+    return Array.from(map, ([key, items]) => {
+      const startOffset = offset;
+      offset += items.length;
+      return { key, items, startOffset };
+    });
+  }, [grouping, displayResults]);
+
+  // Flat list backing the lightbox + keyboard nav. When grouped it is the
+  // sections concatenated in display order (so a global index addresses the same
+  // card the grid shows); otherwise it is displayResults unchanged.
+  const galleryItems = useMemo(
+    () => (grouping ? groupSections.flatMap((g) => g.items) : displayResults),
+    [grouping, groupSections, displayResults],
+  );
+
+  // True per-folder totals (the whole library, not just the loaded page) for the
+  // section headers. Fetched when grouping is on; failures leave the map empty
+  // (headers then show only the loaded count).
+  const [dirTotals, setDirTotals] = useState<Map<string, number>>(new Map());
+  useEffect(() => {
+    if (!grouping) return;
+    let alive = true;
+    const ac = new AbortController();
+    fetch("/api/library/directories", { signal: ac.signal })
+      .then((r) => (r.ok ? r.json() : { directories: [] }))
+      .then((j) => {
+        if (!alive) return;
+        const m = new Map<string, number>();
+        for (const d of (j.directories ?? []) as Array<{ directory: string; image_count: number }>) {
+          if (d && typeof d.directory === "string") m.set(d.directory, Number(d.image_count) || 0);
+        }
+        setDirTotals(m);
+      })
+      .catch(() => { /* quiet — headers fall back to the loaded count */ });
+    return () => { alive = false; ac.abort(); };
+  }, [grouping]);
+
+  // Collapsed folder sections (by directory key).
+  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+  const toggleDir = useCallback((key: string) => {
+    setCollapsedDirs((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
   const changeSort = (next: SortMode) => {
     setKey("sortMode", next);
     // Browse ordering lives on the server, so a change must re-page from the top;
@@ -1156,15 +1227,109 @@ export default function LibraryPage() {
   // and it still isn't here — we don't chase pages beyond the restored depth.
   useEffect(() => {
     const want = pendingViewRef.current;
-    if (!want || displayResults.length === 0) return;
-    const i = displayResults.findIndex((r) => r.imageId === want);
+    if (!want || galleryItems.length === 0) return;
+    const i = galleryItems.findIndex((r) => r.imageId === want);
     if (i !== -1) {
       pendingViewRef.current = null;
       openLightbox(i);
     } else if (!loading && !hasMore) {
       pendingViewRef.current = null; // fully loaded and absent — abandon
     }
-  }, [displayResults, openLightbox, loading, hasMore]);
+  }, [galleryItems, openLightbox, loading, hasMore]);
+
+  // One result grid. Rendered once for the flat list, or once per folder section
+  // when grouping is on; `baseOffset` maps a section-local card index back to the
+  // global galleryItems index so the lightbox/slideshow open the right image.
+  const renderResultGallery = (galleryRows: CompactResult[], baseOffset: number) => (
+    <Gallery
+      items={galleryRows}
+      getKey={(r) => r.imageId}
+      viewMode={settings.viewMode}
+      // Gallery always renders a sliding window (~5 pages: current ±2) instead
+      // of every loaded card, so paging deep never jams the grid while results
+      // / lightbox keep the full set. We only tune it here: pageSize mirrors the
+      // real fetch page so the window tracks actual pages.
+      windowing={{ pageSize: Math.max(1, limit), pages: 5 }}
+      gridClassName={`grid ${gridColumnsClass(settings.gridDensity)} gap-3`}
+      masonryClassName={`${masonryColumnsClass(settings.gridDensity)} gap-3`}
+      cardClassName={
+        settings.viewMode === "list"
+          ? "rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-2 transition hover:border-accent-cyan"
+          : "overflow-hidden rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 transition hover:border-accent-cyan"
+      }
+      mediaClassName={selectMode ? "cursor-pointer" : "cursor-zoom-in"}
+      getHref={(r) => `/library/${r.imageId}`}
+      onOpen={(i) => openLightbox(baseOffset + i)}
+      selectMode={selectMode}
+      isSelected={(r) => selected.has(r.imageId)}
+      onToggleSelect={(r) => toggleSelect(r.imageId)}
+      selectOnCtrlClick
+      renderMedia={(r, ctx) => (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={r.gridUrl ?? r.thumbnailUrl}
+          alt={r.summary}
+          loading="lazy"
+          decoding="async"
+          className={
+            ctx.viewMode === "list"
+              ? "h-16 w-16 rounded-lg object-cover sm:h-20 sm:w-20"
+              : ctx.viewMode === "masonry"
+                ? "w-full object-cover"
+                : "aspect-square w-full object-cover"
+          }
+        />
+      )}
+      renderMeta={(r, ctx) => {
+        if (ctx.viewMode === "list") {
+          return (
+            <>
+              <a
+                href={`/library/${r.imageId}`}
+                onClick={(e) => {
+                  if (ctx.selectMode) {
+                    e.preventDefault();
+                    ctx.open();
+                    return;
+                  }
+                  // Ctrl/Cmd+click selects (mirrors the media click); other
+                  // modified / middle clicks open the detail page normally.
+                  if (e.ctrlKey || e.metaKey) {
+                    e.preventDefault();
+                    ctx.toggleSelect();
+                    return;
+                  }
+                  if (e.shiftKey || e.altKey || e.button !== 0) return;
+                  e.preventDefault();
+                  ctx.open();
+                }}
+                className={`block ${ctx.selectMode ? "cursor-pointer" : "cursor-zoom-in"}`}
+              >
+                <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
+              </a>
+              {settings.showCardMeta && <CardMeta r={r} showScores={settings.showScores} />}
+            </>
+          );
+        }
+        if (!settings.showCardMeta) return null;
+        return (
+          <div className="p-2">
+            <p className="line-clamp-2 text-ui-xs text-ui-ink">{r.summary}</p>
+            <CardMeta r={r} showScores={settings.showScores} />
+          </div>
+        );
+      }}
+      renderOverlay={(r) => (
+        <button
+          onClick={() => findSimilar(r.imageId, r.thumbnailUrl, r.summary)}
+          className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
+          title="Find similar images"
+        >
+          Similar
+        </button>
+      )}
+    />
+  );
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-6">
@@ -1207,6 +1372,23 @@ export default function LibraryPage() {
             </svg>
             Slideshow
           </button>
+          {browsePath && (
+            <button
+              onClick={() => setKey("groupBy", settings.groupBy === "folder" ? "none" : "folder")}
+              aria-pressed={settings.groupBy === "folder"}
+              className={`flex items-center gap-1.5 rounded-lg border bg-ui-bg px-2.5 py-1.5 text-ui-2xs font-medium transition ${
+                settings.groupBy === "folder"
+                  ? "border-accent-cyan text-accent-cyan"
+                  : "border-ui-border/60 text-ui-ink-muted hover:border-accent-cyan hover:text-accent-cyan"
+              }`}
+              title="Split results into collapsible sections by source directory"
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+              </svg>
+              {settings.groupBy === "folder" ? "Grouped" : "Group"}
+            </button>
+          )}
           <label className="flex items-center gap-1.5 rounded-lg border border-ui-border/60 bg-ui-bg px-2 py-1 text-ui-2xs text-ui-ink-muted">
             <span className="hidden sm:inline">Sort</span>
             <select
@@ -1506,6 +1688,7 @@ export default function LibraryPage() {
                   onChange={setExcludeTags}
                   onCommit={(next) => doFetch(false, { excludeTags: next })}
                   fetchSuggestions={fetchTagSuggestions}
+                  maxSuggestions={50}
                   placeholder="tags to hide…"
                   variant="exclude"
                 />
@@ -1630,95 +1813,42 @@ export default function LibraryPage() {
         </div>
       )}
 
-      {results.length > 0 && (
-        <Gallery
-          items={displayResults}
-          getKey={(r) => r.imageId}
-          viewMode={settings.viewMode}
-          // Gallery always renders a sliding window (~5 pages: current ±2) instead
-          // of every loaded card, so paging deep never jams the grid while results
-          // / lightbox keep the full set. We only tune it here: pageSize mirrors the
-          // real fetch page so the window tracks actual pages.
-          windowing={{ pageSize: Math.max(1, limit), pages: 5 }}
-          gridClassName={`grid ${gridColumnsClass(settings.gridDensity)} gap-3`}
-          masonryClassName={`${masonryColumnsClass(settings.gridDensity)} gap-3`}
-          cardClassName={
-            settings.viewMode === "list"
-              ? "rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 p-2 transition hover:border-accent-cyan"
-              : "overflow-hidden rounded-xl border border-ui-border/60 bg-ui-bg-soft/40 transition hover:border-accent-cyan"
-          }
-          mediaClassName={selectMode ? "cursor-pointer" : "cursor-zoom-in"}
-          getHref={(r) => `/library/${r.imageId}`}
-          onOpen={(i) => openLightbox(i)}
-          selectMode={selectMode}
-          isSelected={(r) => selected.has(r.imageId)}
-          onToggleSelect={(r) => toggleSelect(r.imageId)}
-          selectOnCtrlClick
-          renderMedia={(r, ctx) => (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={r.thumbnailUrl}
-              alt={r.summary}
-              loading="lazy"
-              className={
-                ctx.viewMode === "list"
-                  ? "h-16 w-16 rounded-lg object-cover sm:h-20 sm:w-20"
-                  : ctx.viewMode === "masonry"
-                    ? "w-full object-cover"
-                    : "aspect-square w-full object-cover"
-              }
-            />
-          )}
-          renderMeta={(r, ctx) => {
-            if (ctx.viewMode === "list") {
+      {results.length > 0 &&
+        (grouping ? (
+          <div className="flex flex-col gap-5">
+            {groupSections.map((g) => {
+              const collapsed = collapsedDirs.has(g.key);
+              const total = dirTotals.get(g.key);
+              const label = g.key || "No directory";
               return (
-                <>
-                  <a
-                    href={`/library/${r.imageId}`}
-                    onClick={(e) => {
-                      if (ctx.selectMode) {
-                        e.preventDefault();
-                        ctx.open();
-                        return;
-                      }
-                      // Ctrl/Cmd+click selects (mirrors the media click); other
-                      // modified / middle clicks open the detail page normally.
-                      if (e.ctrlKey || e.metaKey) {
-                        e.preventDefault();
-                        ctx.toggleSelect();
-                        return;
-                      }
-                      if (e.shiftKey || e.altKey || e.button !== 0) return;
-                      e.preventDefault();
-                      ctx.open();
-                    }}
-                    className={`block ${ctx.selectMode ? "cursor-pointer" : "cursor-zoom-in"}`}
+                <section key={g.key || "__none"} className="flex min-w-0 flex-col gap-2">
+                  <button
+                    onClick={() => toggleDir(g.key)}
+                    aria-expanded={!collapsed}
+                    className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-ui-border/50 bg-ui-bg-soft/40 px-3 py-2 text-left transition hover:border-accent-cyan/60"
+                    title={label}
                   >
-                    <p className="line-clamp-2 text-ui-sm text-ui-ink">{r.summary}</p>
-                  </a>
-                  {settings.showCardMeta && <CardMeta r={r} showScores={settings.showScores} />}
-                </>
+                    <svg viewBox="0 0 24 24" className={`h-3.5 w-3.5 shrink-0 text-ui-ink-muted transition-transform ${collapsed ? "" : "rotate-90"}`} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M9 6l6 6-6 6" />
+                    </svg>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4 shrink-0 text-ui-ink-muted" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                    </svg>
+                    <span className="min-w-0 flex-1 truncate text-ui-sm font-medium text-ui-ink">{label}</span>
+                    <span className="shrink-0 rounded-full bg-ui-bg px-2 py-0.5 text-ui-2xs text-ui-ink-muted">
+                      {total != null && total !== g.items.length
+                        ? `${g.items.length} of ${total}`
+                        : g.items.length}
+                    </span>
+                  </button>
+                  {!collapsed && renderResultGallery(g.items, g.startOffset)}
+                </section>
               );
-            }
-            if (!settings.showCardMeta) return null;
-            return (
-              <div className="p-2">
-                <p className="line-clamp-2 text-ui-xs text-ui-ink">{r.summary}</p>
-                <CardMeta r={r} showScores={settings.showScores} />
-              </div>
-            );
-          }}
-          renderOverlay={(r) => (
-            <button
-              onClick={() => findSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-              className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
-              title="Find similar images"
-            >
-              Similar
-            </button>
-          )}
-        />
-      )}
+            })}
+          </div>
+        ) : (
+          renderResultGallery(displayResults, 0)
+        ))}
 
       {/* Infinite-scroll sentinel + manual "Load more" fallback */}
       {hasMore && (
@@ -1798,9 +1928,9 @@ export default function LibraryPage() {
       </section>
 
       {/* Fullscreen viewer / slideshow */}
-      {lightboxIndex !== null && displayResults[lightboxIndex] && (
+      {lightboxIndex !== null && galleryItems[lightboxIndex] && (
         <Lightbox
-          items={displayResults}
+          items={galleryItems}
           initialIndex={lightboxIndex}
           fullResolution={settings.viewerFullResolution}
           slideshow={{

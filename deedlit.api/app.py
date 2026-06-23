@@ -28,10 +28,11 @@ if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
     del _otel_initialize
 
 import asyncio
+import json
 import logging
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -238,6 +239,54 @@ async def search(req: SearchRequest) -> Any:
         return await clients.search_by_text(req.query, req.limit, req.filter, req.offset)
     except DownstreamError as exc:
         raise HTTPException(status_code=502, detail=f"search unavailable: {exc.detail}")
+
+
+# ---------------------------------------------------------------------------
+# POST /search/by-image — reverse-image search from an uploaded image
+# ---------------------------------------------------------------------------
+@app.post("/search/by-image")
+async def search_by_image(
+    file: UploadFile = File(...),
+    limit: int = Form(24),
+    offset: int = Form(0),
+    filter: str | None = Form(None),
+) -> Any:
+    """Reverse-image search: embed an uploaded image, then dense-query search.
+
+    comfyhelper is UI-only and may not call vision/search directly, so this
+    upload-search hop lives in the gateway: the bytes are encoded via
+    deedlit.vision ``/embed/image`` (pinned to the 1024-dim ``vit_h`` preset) and
+    the resulting dense vector queried against deedlit.search. ``filter`` is the
+    UI's JSON facet object (tags / excludeTags / safety), applied as the SAME
+    Qdrant payload filter as text search. Returns the search QueryResponse
+    (``{fusion: "dense", hits: [...]}``). A vision/search failure degrades to a
+    502 naming the downstream that was unavailable.
+    """
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty image upload")
+
+    facets: dict[str, Any] | None = None
+    if filter:
+        try:
+            parsed = json.loads(filter)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="filter must be a JSON object") from exc
+        facets = parsed if isinstance(parsed, dict) else None
+
+    try:
+        return await clients.search_by_image_upload(
+            raw,
+            file.filename or "upload",
+            file.content_type,
+            limit=limit,
+            offset=offset,
+            filter=facets,
+        )
+    except DownstreamError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"{exc.service} unavailable: {exc.detail}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +821,22 @@ async def count_images(
     return res if isinstance(res, dict) else {"count": 0}
 
 
+@app.get("/images/directories")
+async def list_directories(limit: int = 2000) -> Any:
+    """Distinct source directories with per-directory image counts (catalog
+    proxy). Backs the library's split-by-source-directory section headers — true
+    folder totals, not just the loaded page. Registered before /images/{sha256}
+    so the literal segment wins. Degrades to [] when catalog is down."""
+    from urllib.parse import urlencode
+
+    qs = urlencode({"limit": str(int(limit))})
+    try:
+        res = await clients.catalog("GET", f"/images/directories?{qs}")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
+
+
 @app.get("/tags")
 async def suggest_tags(prefix: str = "", limit: int = 10) -> Any:
     """Tag-name autocomplete for the filter UI — proxies catalog GET /tags.
@@ -802,6 +867,45 @@ async def tags_report(prefix: str = "", limit: int = 200, offset: int = 0) -> An
     except DownstreamError:
         return {"total": 0, "items": []}
     return res if isinstance(res, dict) else {"total": 0, "items": []}
+
+
+@app.get("/graph/entities")
+async def graph_entities(type: str, prefix: str = "", limit: int = 50) -> Any:
+    """Graph entity-name autocomplete (a :Tag, or an :Asset of a given kind),
+    proxied to deedlit.graph. Backs the graph-filter value picker so every node
+    type offers options instead of a blind free-text field. Degrades to an empty
+    list when graph is unreachable so the picker just goes quiet."""
+    from urllib.parse import urlencode
+
+    params = urlencode({"type": type, "prefix": prefix, "limit": int(limit)})
+    try:
+        res = await clients.graph("GET", f"/entities?{params}")
+    except DownstreamError:
+        return []
+    return res if isinstance(res, list) else []
+
+
+# Registered AFTER the literal GET /images, /images/count, /images/unlabeled
+# above so those win the match; a 64-hex sha can't collide with them anyway.
+@app.get("/images/{sha256}")
+async def read_image(sha256: str, fields: str | None = None) -> Any:
+    """Read ONE image's catalog record directly — a pure catalog passthrough.
+
+    Unlike GET /detail/{sha256} (which ALSO fans out a search /similar + a graph
+    /neighbors query), this hits only catalog, for callers that need just the
+    image record: the Lightbox details panel, the detail page, the admin raw-JSON
+    inspector, and bulk export. ``?fields=light`` is forwarded to catalog to drop
+    the heavy workflow_json/api_prompt_json graphs for the panels that render none
+    of them. A catalog 404 surfaces as 404; any other failure as 502."""
+    params = {"fields": fields} if fields else None
+    try:
+        return await clients.catalog("GET", f"/images/{sha256}", params=params)
+    except DownstreamError as exc:
+        if exc.status == 404:
+            raise HTTPException(status_code=404, detail="image not found") from exc
+        raise HTTPException(
+            status_code=502, detail=f"catalog unavailable: {exc.detail}"
+        ) from exc
 
 
 @app.patch("/images/{sha256}")
@@ -839,7 +943,18 @@ async def relabel_image(sha256: str) -> JSONResponse:
 # every image renders broken.
 # ---------------------------------------------------------------------------
 @app.get("/blobs/{sha256}/{kind}")
-async def get_blob(sha256: str, kind: str) -> Response:
+async def get_blob(request: Request, sha256: str, kind: str) -> Response:
+    # Content-addressed by sha256 -> immutable. Compute the ETag here so a
+    # revalidation (browser or CDN) gets a 0-byte 304 WITHOUT a catalog/RustFS
+    # round trip, and emit a year-long immutable Cache-Control so a fresh asset
+    # is never re-requested at all.
+    etag = f'"{sha256}-{kind}"'
+    cache_headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": etag,
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=cache_headers)
     try:
         data, content_type = await clients.request_bytes(
             "catalog", "GET", clients.CATALOG_URL, f"/blobs/{sha256}/{kind}"
@@ -848,7 +963,7 @@ async def get_blob(sha256: str, kind: str) -> Response:
         if exc.status == 404:
             raise HTTPException(status_code=404, detail="blob not found") from exc
         raise HTTPException(status_code=502, detail=f"catalog unavailable: {exc.detail}") from exc
-    return Response(content=data, media_type=content_type)
+    return Response(content=data, media_type=content_type, headers=cache_headers)
 
 
 # ---------------------------------------------------------------------------

@@ -99,14 +99,26 @@ export const CompactResultSchema = z.object({
   imageId: z.string(),
   score: z.number().nullable().optional(),
   thumbnailUrl: z.string(),
+  /** Small grid-tile URL (~512px WebP). Falls back to thumbnailUrl when absent. */
+  gridUrl: z.string().optional(),
   summary: z.string(),
   tags: z.array(z.string()),
   model: z.string().nullable().optional(),
   checkpoint: z.string().nullable().optional(),
   rating: z.number().nullable().optional(),
   safety: SafetySchema.nullable().optional(),
+  /** Parent directory of the source file — the split-by-source-directory grouping
+   * key. Present on the catalog browse path; null/absent on vector-search hits. */
+  directory: z.string().nullable().optional(),
 });
 export type CompactResult = z.infer<typeof CompactResultSchema>;
+
+/** One source directory + its live-image total (gateway GET /images/directories). */
+export const DirectoryCountSchema = z.object({
+  directory: z.string(),
+  image_count: z.number(),
+});
+export type DirectoryCount = z.infer<typeof DirectoryCountSchema>;
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -131,8 +143,12 @@ export type SearchFilters = z.infer<typeof SearchFiltersSchema>;
  * image ids.  Either scope from a hub node (e.g. all images sharing Model X) or
  * from an image's neighbourhood (images reachable within `hops`).
  */
+// The node types that actually exist in the Neo4j projection: a :Tag, or an
+// :Asset of one of these kinds (see deedlit.graph repository GRAPH MODEL). Each
+// is autocomplete-backed by GET /graph/entities. ("Model"/"Folder" were dropped:
+// neither is a graph node — folders live only in the catalog/path filter.)
 export const GraphNodeRefSchema = z.object({
-  type: z.enum(["Tag", "Model", "Checkpoint", "LoRA", "Folder"]),
+  type: z.enum(["Tag", "Checkpoint", "LoRA", "Embedding", "VAE", "ControlNet", "Upscaler"]),
   value: z.string().min(1),
 });
 export type GraphNodeRef = z.infer<typeof GraphNodeRefSchema>;

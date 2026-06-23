@@ -250,6 +250,75 @@ def _to_qdrant_filter(facets: dict[str, Any] | None) -> dict[str, Any] | None:
     return qfilter or None
 
 
+# Reverse-image search uses the same 1024-dim CLIP image preset the shared Qdrant
+# `dense` vector is sized for. `big_g` (1280-dim) would not fit the collection, so
+# the query embedding is pinned here and the model is NOT exposed to the UI.
+SEARCH_BY_IMAGE_MODEL = os.getenv("SEARCH_BY_IMAGE_MODEL", "vit_h")
+
+
+async def embed_image_bytes(
+    data: bytes, filename: str, content_type: str | None = None
+) -> list[float]:
+    """Encode raw image bytes into the dense CLIP vector search expects.
+
+    The reverse-image-search counterpart to :func:`encode_query` (which encodes a
+    text query): an uploaded image is POSTed to deedlit.vision ``/embed/image`` as
+    multipart, pinned to the 1024-dim ``vit_h`` preset (see
+    ``SEARCH_BY_IMAGE_MODEL``). The vision call is multipart, so it bypasses the
+    JSON :func:`request` helper and posts through :func:`make_async_client`
+    directly (still monkeypatched in tests). Raises :class:`DownstreamError` on a
+    transport error / non-2xx / missing embedding so the route maps it to a 502.
+    """
+    files = {"file": (filename or "upload", data, content_type or "application/octet-stream")}
+    try:
+        async with make_async_client() as client:
+            resp = await client.post(
+                f"{VISION_URL}/embed/image",
+                files=files,
+                data={"model": SEARCH_BY_IMAGE_MODEL},
+            )
+    except httpx.HTTPError as exc:  # connect/timeout/transport
+        raise DownstreamError("vision", None, str(exc)) from exc
+    if resp.status_code >= 400:
+        raise DownstreamError("vision", resp.status_code, _safe_detail(resp))
+    body = resp.json() if resp.content else {}
+    # The live service returns ``embedding``; tolerate ``vector`` for parity with
+    # the ingest pipeline's reader (both shapes have appeared across versions).
+    embedding = (body or {}).get("embedding") or (body or {}).get("vector")
+    if not embedding:
+        raise DownstreamError("vision", resp.status_code, "embed/image returned no embedding")
+    return embedding
+
+
+async def search_by_image_upload(
+    data: bytes,
+    filename: str,
+    content_type: str | None,
+    *,
+    limit: int,
+    offset: int = 0,
+    filter: dict[str, Any] | None = None,
+) -> Any:
+    """Embed an uploaded image via vision, then run a dense vector search.
+
+    The image-upload counterpart to :func:`search_by_text`: the bytes are encoded
+    to a dense CLIP vector (vision ``/embed/image``), then handed to deedlit.search
+    ``POST /query`` as a single dense modality (so the response ``fusion`` is
+    ``"dense"``). The UI's flat camelCase facet object is translated into a Qdrant
+    payload filter (tags / excludeTags / safety — see :func:`_to_qdrant_filter`) and
+    forwarded, so reverse-image results honour the same safety/tag filter as text
+    search. ``offset`` pages deeper into the ranked results.
+    """
+    dense = await embed_image_bytes(data, filename, content_type)
+    body = {
+        "dense": dense,
+        "limit": limit,
+        "offset": offset,
+        "filter": _to_qdrant_filter(filter),
+    }
+    return await search("POST", "/query", json=body)
+
+
 async def search_by_text(
     query: str, limit: int, filter: dict[str, Any] | None, offset: int = 0
 ) -> Any:

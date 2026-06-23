@@ -218,6 +218,44 @@ def test_rebuild_search_graph_bulk_reproject(fresh_store, monkeypatch, rtype):
 
 
 # ---------------------------------------------------------------------------
+# (3b) prune-graph-orphans drives graph POST /prune + reports counts
+# ---------------------------------------------------------------------------
+def test_prune_graph_orphans_drives_graph_prune(fresh_store, monkeypatch):
+    """prune-graph-orphans is a single opaque unit owned by deedlit.graph: it
+    calls graph POST /prune once and stashes the deletion counts in the report."""
+    triggered: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "prune_graph_orphans",
+        lambda: triggered.append("prune")
+        or {"status": "ok", "assets_deleted": 3, "tags_deleted": 5, "dry_run": False},
+    )
+
+    with TestClient(app_module.app) as client:
+        r = client.post("/jobs", json={"type": "prune-graph-orphans"})
+        assert r.status_code == 202
+        body = r.json()
+        assert body["type"] == "prune-graph-orphans"
+        job_id = body["id"]
+        final = _wait_for(client, job_id, {"completed", "failed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["total"] == 1
+        assert final["progress"]["done"] == 1
+        # The graph's deletion counts surface in the job report for the UI.
+        assert final["report"]["assets_deleted"] == 3
+        assert final["report"]["tags_deleted"] == 5
+
+    assert triggered == ["prune"]
+
+
+def test_prune_orphan_tick_enqueues_job(fresh_store):
+    """The opt-in scheduler's tick enqueues exactly one prune-graph-orphans job."""
+    job = jobs_module.run_orphan_prune_tick(fresh_store)
+    assert job.type == "prune-graph-orphans"
+    assert fresh_store.get(job.id) is not None
+
+
+# ---------------------------------------------------------------------------
 # (4) maintenance job cancellable mid-run
 # ---------------------------------------------------------------------------
 def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):

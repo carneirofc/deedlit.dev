@@ -85,6 +85,11 @@ class ImageSummary(BaseModel):
 
     sha256: str = Field(pattern=SHA256_PATTERN)
     filepath: str | None = None
+    # Parent directory of ``filepath`` (separators normalized to '/'), the
+    # grouping key for the library's split-by-source-directory view. Derived +
+    # stored by the catalog (images.directory); None for legacy rows not yet
+    # backfilled. Distinct from the unanchored ``path`` browse filter.
+    directory: str | None = None
     phash: str | None = None
     width: int | None = None
     height: int | None = None
@@ -120,6 +125,18 @@ class CountResult(BaseModel):
     """The total number of images matching a filter set (GET /images/count)."""
 
     count: int
+
+
+class DirectoryCount(BaseModel):
+    """One source directory + how many live images live directly under it.
+
+    Backs the library's split-by-source-directory view: GET /images/directories
+    returns the distinct ``images.directory`` values with per-directory totals so
+    the grid can render folder section headers with true counts (not just the
+    counts of the currently-loaded page)."""
+
+    directory: str
+    image_count: int
 
 
 class TagCount(BaseModel):

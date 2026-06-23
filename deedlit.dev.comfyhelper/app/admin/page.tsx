@@ -110,6 +110,12 @@ const MAINTENANCE_ACTIONS: MaintenanceAction[] = [
     endpoint: "/api/library/maintenance/rebuild-neo4j",
   },
   {
+    key: "prune-graph-orphans",
+    label: "Prune graph orphans",
+    description: "Remove orphaned tag/model nodes left behind by deleted images.",
+    endpoint: "/api/library/maintenance/prune-graph-orphans",
+  },
+  {
     key: "regenerate-thumbnails",
     label: "Regenerate thumbnails",
     description: "Generate thumbnails for images missing one.",

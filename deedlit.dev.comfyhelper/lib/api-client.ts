@@ -25,6 +25,7 @@
  */
 import type {
   CompactResult,
+  DirectoryCount,
   Graph,
   GenerationParams,
   ImageTag,
@@ -186,6 +187,8 @@ export interface CatalogImage {
   references?: Array<{ kind: string; name: string; hash?: string | null }>;
   rating?: number | null;
   favorite?: boolean;
+  /** Parent directory of the source file (split-by-source-directory grouping key). */
+  directory?: string | null;
   /** AI-generated description (deedlit.labelagent), persisted by the catalog. */
   description?: string | null;
   created_at?: string;
@@ -247,6 +250,26 @@ export interface ActivityResponse {
 
 export async function getDetail(sha256: string, signal?: AbortSignal): Promise<DetailResponse> {
   return request<DetailResponse>(`/detail/${encodeURIComponent(sha256)}`, { signal });
+}
+
+/**
+ * Read ONE image's catalog record directly via the gateway GET /images/{sha256}
+ * — a pure catalog passthrough. Unlike {@link getDetail}, it does NOT run the
+ * detail fan-out (no search /similar, no graph /neighbors), so callers that only
+ * need the image record (detail panels, admin raw inspector, export, move) don't
+ * pay two extra downstream queries per read. Pass `light: true` to also drop the
+ * heavy workflow_json/api_prompt_json graphs (the panels render none of them) via
+ * ?fields=light. Throws a {@link GatewayError} with status 404 when absent.
+ */
+export async function getImage(
+  sha256: string,
+  opts: { light?: boolean } = {},
+  signal?: AbortSignal,
+): Promise<CatalogImage> {
+  return request<CatalogImage>(`/images/${encodeURIComponent(sha256)}`, {
+    query: opts.light ? { fields: "light" } : undefined,
+    signal,
+  });
 }
 
 /** Per-store outcome of un-indexing an image (DELETE /images/{sha256}). */
@@ -321,6 +344,61 @@ export interface GatewaySearchRequest {
 export async function search(req: GatewaySearchRequest, signal?: AbortSignal): Promise<SearchResponse> {
   const res = await request<SearchResponse>("/search", { method: "POST", body: req, signal });
   return { fusion: res?.fusion, hits: Array.isArray(res?.hits) ? res.hits : [] };
+}
+
+export interface GatewayImageSearchOptions {
+  limit: number;
+  /** Rank offset for server-side pagination over the whole matching set. */
+  offset?: number;
+  /** Cleaned camelCase facet object (tags/excludeTags/safety) the gateway translates to a Qdrant filter. */
+  filter?: Record<string, unknown> | null;
+}
+
+/**
+ * Reverse-image search: forward an uploaded image to the gateway's multipart
+ * POST /search/by-image (which embeds it via deedlit.vision, then dense-queries
+ * deedlit.search). The body is multipart so it can't ride the JSON `request()`
+ * helper; the base URL + error mapping mirror it here.
+ */
+export async function searchByImageUpload(
+  file: Blob,
+  filename: string,
+  opts: GatewayImageSearchOptions,
+  signal?: AbortSignal,
+): Promise<SearchResponse> {
+  const base = getGatewayBaseUrl();
+  const fd = new FormData();
+  fd.append("file", file, filename);
+  fd.append("limit", String(opts.limit));
+  if (opts.offset) fd.append("offset", String(opts.offset));
+  if (opts.filter) fd.append("filter", JSON.stringify(opts.filter));
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}/search/by-image`, {
+      method: "POST",
+      body: fd,
+      signal,
+      cache: "no-store",
+    });
+  } catch (cause) {
+    throw new GatewayError(`gateway unreachable at ${base} (POST /search/by-image)`, 503, cause);
+  }
+  if (!res.ok) {
+    let detail: unknown;
+    try {
+      detail = await res.json();
+    } catch {
+      detail = await res.text().catch(() => undefined);
+    }
+    const msg =
+      (detail && typeof detail === "object" && "detail" in detail
+        ? String((detail as { detail: unknown }).detail)
+        : undefined) ?? `gateway POST /search/by-image -> ${res.status}`;
+    throw new GatewayError(msg, res.status, detail);
+  }
+  const body = (await res.json()) as SearchResponse;
+  return { fusion: body?.fusion, hits: Array.isArray(body?.hits) ? body.hits : [] };
 }
 
 export async function getStats(signal?: AbortSignal): Promise<StatsResponse> {
@@ -664,6 +742,23 @@ export async function listCatalogImages(
 }
 
 /**
+ * Distinct source directories with per-directory image counts (gateway GET
+ * /images/directories). Backs the library's split-by-source-directory section
+ * headers — true folder totals, not just the loaded page. Biggest folder first;
+ * degrades to [] when the gateway/catalog is unavailable.
+ */
+export async function listDirectories(
+  limit = 2000,
+  signal?: AbortSignal,
+): Promise<DirectoryCount[]> {
+  const res = await request<unknown>("/images/directories", {
+    query: { limit },
+    signal,
+  });
+  return Array.isArray(res) ? (res as DirectoryCount[]) : [];
+}
+
+/**
  * Tag-name autocomplete (gateway GET /tags) — names matching `prefix`, ranked
  * most-used first. Backs the live type-ahead in the library tag filter. An empty
  * prefix returns the globally most-used tags; the gateway degrades to [].
@@ -674,6 +769,27 @@ export async function suggestTags(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const res = await request<unknown>("/tags", { query: { prefix, limit }, signal });
+  return Array.isArray(res) ? (res as string[]) : [];
+}
+
+/**
+ * Graph entity-name autocomplete (gateway GET /graph/entities -> deedlit.graph),
+ * ranked most-used first. `type` is "tag" (a :Tag) or an asset kind
+ * (checkpoint/lora/embedding/vae/controlnet/upscaler → an :Asset of that kind).
+ * Backs the graph-filter value picker so every node type offers options instead
+ * of a blind free-text field. An empty prefix returns the most-used entities of
+ * the type; the gateway degrades to [].
+ */
+export async function suggestGraphEntities(
+  type: string,
+  prefix: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const res = await request<unknown>("/graph/entities", {
+    query: { type, prefix, limit },
+    signal,
+  });
   return Array.isArray(res) ? (res as string[]) : [];
 }
 
@@ -870,9 +986,17 @@ export async function callMcpTool(
 // Mappers — adapt gateway/downstream shapes to the UI shapes
 // ---------------------------------------------------------------------------
 
-/** Local proxy URL for an image's thumbnail bytes (served by /api/library). */
+/** Local proxy URL for an image's thumbnail bytes (served by /api/library). The
+ * thumbnail doubles as the lightbox preview (~1080-1600px). */
 export function thumbnailUrl(sha256: string): string {
   return `/api/library/images/${sha256}/thumbnail`;
+}
+
+/** Local proxy URL for an image's small grid-tile bytes (~512px WebP, derived on
+ * demand from the thumbnail). Use this for grid cards to avoid downloading the
+ * full preview into tiny cells. */
+export function gridUrl(sha256: string): string {
+  return `/api/library/images/${sha256}/grid`;
 }
 
 /** Local proxy URL for an image's full-resolution bytes. */
@@ -908,6 +1032,7 @@ export function hitToCompactResult(hit: SearchHit): CompactResult {
     // Prefer a payload-provided URL; otherwise route bytes through the local proxy.
     thumbnailUrl:
       str(p.thumbnail_url) ?? str(p.thumbnailUrl) ?? thumbnailUrl(hit.sha256),
+    gridUrl: gridUrl(hit.sha256),
     summary: summarizePayload(p, hit.sha256),
     tags: stringArray(p.tags),
     model: str(p.model) ?? str(p.checkpoint),
@@ -935,6 +1060,11 @@ export function catalogImageToCompactResult(image: CatalogImage): CompactResult 
   const prompt = str(image.prompt);
   const filePath = str(image.filepath) ?? str(image.filePath) ?? str(image.file_path);
   const filename = filePath ? filePath.replace(/^.*[/\\]/, "") : null;
+  // Prefer the catalog's stored directory; fall back to deriving the parent dir
+  // from the path (separators normalized to '/') for any row not yet backfilled.
+  const directory =
+    str(image.directory) ??
+    (filePath ? filePath.replace(/\\/g, "/").replace(/\/[^/]*$/, "") : null);
   const summary =
     (prompt ? prompt.replace(/\s+/g, " ").trim().slice(0, 140) : null) ??
     (tags.length ? tags.slice(0, 8).join(", ") : null) ??
@@ -945,6 +1075,7 @@ export function catalogImageToCompactResult(image: CatalogImage): CompactResult 
     imageId: image.sha256,
     score: null,
     thumbnailUrl: thumbnailUrl(image.sha256),
+    gridUrl: gridUrl(image.sha256),
     summary,
     tags,
     model: checkpoint ?? str(image.model),
@@ -954,6 +1085,7 @@ export function catalogImageToCompactResult(image: CatalogImage): CompactResult 
       image.safety === "sfw" || image.safety === "nsfw" || image.safety === "explicit"
         ? image.safety
         : null,
+    directory,
   };
 }
 

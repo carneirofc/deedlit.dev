@@ -105,10 +105,12 @@ CATALOG_PAGE_SIZE = int(os.getenv("RECONCILE_CATALOG_PAGE_SIZE", "500"))
 
 SUPPORTED_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
 
-# Thumbnail geometry: keep the SHORTER edge at >= this many px (true "1080p"
-# class), downscaling ONLY — a smaller source is kept untouched (never upscaled).
-# These double as the viewer image.
-THUMBNAIL_MIN_EDGE = int(os.getenv("INGEST_THUMBNAIL_MIN_EDGE", "1080"))
+# Thumbnail geometry: keep the SHORTER edge at >= this many px, downscaling ONLY
+# — a smaller source is kept untouched (never upscaled). This blob doubles as the
+# lightbox PREVIEW (the small grid tile is derived from it on demand by the UI's
+# /grid route), so it is sized ~1600px for a crisp full-screen view; the true
+# original is never served over HTTP (stays off the slow read-only FS).
+THUMBNAIL_MIN_EDGE = int(os.getenv("INGEST_THUMBNAIL_MIN_EDGE", "1600"))
 # WebP encode tuning. Default is LOSSY: a viewer thumbnail does not need a
 # lossless encode, and lossless WebP at high effort was the single most expensive
 # CPU op in the pipeline — it dominated ingest CPU and starved the GPU (which sits
@@ -429,14 +431,19 @@ async def _read_path_bytes(path: str) -> tuple[bytes, str]:
 
 
 async def fetch_image_record(sha256: str) -> dict[str, Any] | None:
-    """GET the full catalog record (the source of truth) for ``sha256``, or None.
+    """GET the catalog record (the source of truth) for ``sha256``, or None.
 
     Used by the index task (to project from catalog truth — description/safety/
     tags/filepath) and the label task (to read the existing tags to merge into).
+    Both read only light scalar/array fields — never the heavy workflow_json/
+    api_prompt_json graphs — so this requests ``?fields=light`` to avoid dragging
+    ~100 KB of workflow graph across the wire on every per-image stage.
     Best-effort: any read failure degrades to None rather than failing the repair.
     """
     try:
-        resp = await get_client().get(f"{CATALOG_URL}/images/{sha256}")
+        resp = await get_client().get(
+            f"{CATALOG_URL}/images/{sha256}", params={"fields": "light"}
+        )
         resp.raise_for_status()
         body = resp.json()
         return body if isinstance(body, dict) else None
@@ -587,6 +594,21 @@ def rebuild_search() -> dict[str, Any]:
 def rebuild_graph() -> dict[str, Any]:
     """Rebuild the graph projection from catalog (graph ``POST /rebuild``)."""
     resp = httpx.post(f"{GRAPH_URL}/rebuild", timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def prune_graph_orphans() -> dict[str, Any]:
+    """Prune structurally-orphaned graph nodes (graph ``POST /prune``).
+
+    Sweeps the orphan :Asset/:Tag nodes that image deletes leave behind (an
+    :Asset/:Tag with no remaining USES/TAGGED edge). Returns the deletion counts
+    the graph service reports. Backs the ``prune-graph-orphans`` maintenance job
+    and the opt-in periodic prune scheduler."""
+    resp = httpx.post(f"{GRAPH_URL}/prune", timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     try:
         return resp.json()
