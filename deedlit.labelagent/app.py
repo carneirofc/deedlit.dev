@@ -12,6 +12,7 @@ Run (matches the sibling services): ``uvicorn app:app --port 8006``. AgentOS's
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -21,9 +22,11 @@ from agno.media import Image
 from agno.os import AgentOS
 from fastapi import File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image as PILImage, ImageOps
 
 from activity import install_activity
 from agent import ImageLabel, agent
+from config import VISION_MAX_DIM, VISION_WEBP_EFFORT
 
 
 # Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
@@ -147,6 +150,56 @@ def _coerce_label(content: object) -> dict:
     }
 
 
+def _downscale_for_vlm(data: bytes, fmt: str) -> tuple[bytes, str]:
+    """Shrink an image to a VLM-friendly size and re-encode it as lossless WebP.
+
+    The encoded image becomes tokens in the vision model's context, so a
+    full-resolution source burns context (and latency) for detail the labeler
+    never uses. Downscale to fit :data:`config.VISION_MAX_DIM` on the longest edge
+    (aspect preserved, never upscaled) and re-encode as LOSSLESS WebP — the
+    pixels the model sees are exact (no compression artifacts); the size win comes
+    from the downscale and WebP's lossless coder beating PNG.
+
+    Returns ``(bytes, format)``. Best-effort: falls back to the ORIGINAL
+    bytes/format on any decode/encode failure, or when re-encoding an
+    already-small image wouldn't actually be smaller — this must never break
+    labeling.
+    """
+    if VISION_MAX_DIM <= 0:
+        return data, fmt
+    try:
+        img = ImageOps.exif_transpose(PILImage.open(io.BytesIO(data)))
+        # Flatten any alpha onto white so transparent regions don't render as
+        # black (which can mislead the labeler); the model only sees RGB anyway.
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            bg = PILImage.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        else:
+            img = img.convert("RGB")
+        longest = max(img.size)
+        downscaled = longest > VISION_MAX_DIM
+        if downscaled:
+            scale = VISION_MAX_DIM / longest
+            img = img.resize(
+                (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                PILImage.LANCZOS,
+            )
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", lossless=True, quality=VISION_WEBP_EFFORT, method=6)
+        out = buf.getvalue()
+    except Exception as exc:  # corrupt / unsupported / animated — keep the original
+        log.warning("vlm downscale failed (%s); sending original image", exc)
+        return data, fmt
+    # If we didn't downscale and the WebP isn't smaller, re-encoding gained
+    # nothing — keep the original. (After a downscale the result is always worth
+    # it: fewer pixels means fewer vision tokens regardless of byte count.)
+    if not downscaled and len(out) >= len(data):
+        return data, fmt
+    return out, "webp"
+
+
 def run_label(data: bytes, fmt: str, prompt_hint: str | None = None) -> dict:
     """Run the agent over one image and return ``{label, description, tags, safety}``.
 
@@ -158,6 +211,13 @@ def run_label(data: bytes, fmt: str, prompt_hint: str | None = None) -> dict:
     user_msg = "Label and describe this image."
     if prompt_hint:
         user_msg += f" Generation prompt for context (may be inaccurate): {prompt_hint}"
+    # Downscale + WebP-recompress before the model sees it, to keep the per-image
+    # vision context (and latency) small. Runs here (not in the async route) so
+    # the CPU-bound PIL work stays on run_label's worker thread.
+    orig_len = len(data)
+    data, fmt = _downscale_for_vlm(data, fmt)
+    if len(data) != orig_len:
+        log.info("downscaled image for vlm: %d -> %d bytes (now %s)", orig_len, len(data), fmt)
     # The vision-LLM call is the slow part of the ingest `label` stage; time it so
     # a slow/overloaded llama-server is obvious in the log (and explains an ingest
     # that crawls while the CLIP GPU sits idle).
