@@ -16,7 +16,12 @@ from fastapi.testclient import TestClient
 import app as app_module
 from conftest import TEST_COLLECTION
 from id_scheme import NAMESPACE, point_id_for_sha256
-from search.config import DENSE_DIM, DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
+from search.config import (
+    DENSE_DIM,
+    DENSE_VECTOR_NAME,
+    DESCRIPTION_VECTOR_NAME,
+    SPARSE_VECTOR_NAME,
+)
 
 client = TestClient(app_module.app)
 store = app_module.get_store()
@@ -87,6 +92,36 @@ def test_collection_has_named_dense_and_sparse_vectors():
     assert sparse is not None and SPARSE_VECTOR_NAME in sparse
 
 
+def test_collection_has_description_dense_vector():
+    info = store.client.get_collection(TEST_COLLECTION)
+    vectors = info.config.params.vectors
+    # The description (CLIP text) vector lives in the same space as the image one.
+    assert DESCRIPTION_VECTOR_NAME in vectors
+    assert vectors[DESCRIPTION_VECTOR_NAME].size == DENSE_DIM
+    assert vectors[DESCRIPTION_VECTOR_NAME].distance.lower() == "cosine"
+
+
+def test_description_vector_indexed_and_queryable():
+    """A point's optional description vector is stored under its own named vector
+    and can be queried independently (fusion='description')."""
+    sha = _sha("desc-point")
+    desc_vec = _dense(700)
+    r = client.post(
+        "/points",
+        json={"sha256": sha, "dense": _dense(701), "description": desc_vec},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.post("/query", json={"description": desc_vec, "limit": 5})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fusion"] == "description"
+    assert sha in {h["sha256"] for h in data["hits"]}
+
+    # Clean up so the seeded A/B/C neighbour assertions stay unaffected.
+    client.delete(f"/points/{sha}")
+
+
 # --- (2) /points upserts and the point id equals uuid5(sha256) --------------
 
 
@@ -98,6 +133,21 @@ def test_point_id_is_uuid5_of_sha256():
     # The full sha256 is carried in the payload of the stored point.
     stored = store.client.retrieve(TEST_COLLECTION, ids=[expected], with_payload=True)
     assert stored[0].payload["sha256"] == _sha("idcheck")
+
+
+def test_upsert_points_writes_whole_batch_in_one_call():
+    """The batch upsert writes every point (one Qdrant round-trip) and returns
+    their ids in order; each is immediately retrievable (wait=True)."""
+    shas = [_sha(f"batch-{i}") for i in range(3)]
+    ids = store.upsert_points(
+        [(s, _dense(800 + i), None, {"name": f"batch{i}"}, None) for i, s in enumerate(shas)]
+    )
+    assert ids == [point_id_for_sha256(s) for s in shas]
+    for pid in ids:
+        assert store.client.retrieve(TEST_COLLECTION, ids=[pid])
+    # Clean up so the seeded A/B/C neighbour assertions stay unaffected.
+    for s in shas:
+        client.delete(f"/points/{s}")
 
 
 # --- (3) /query hybrid dense+sparse returns RRF-fused hits -------------------
@@ -119,6 +169,23 @@ def test_query_hybrid_uses_rrf_fusion():
     # Hits are ranked (scores descending).
     scores = [h["score"] for h in data["hits"]]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_query_offset_pages_the_ranked_result():
+    """`offset` skips the top N of the ranked result server-side, so search can
+    page over the WHOLE matching set (not a client slice of a fixed top-K)."""
+    # Single-modality (dense) offset.
+    base = client.post("/query", json={"dense": _dense(0), "limit": 10}).json()["hits"]
+    ranked = [h["sha256"] for h in base]
+    assert len(ranked) >= 3  # the seeded A/B/C
+    paged = client.post("/query", json={"dense": _dense(0), "limit": 10, "offset": 1}).json()["hits"]
+    assert [h["sha256"] for h in paged] == ranked[1:]
+
+    # Fused (dense+sparse RRF) offset — the prefetch is deepened to limit+offset.
+    hybrid = {"dense": _dense(0), "sparse": _sparse([1, 2, 3], [0.9, 0.8, 0.1]), "limit": 10}
+    fbase = [h["sha256"] for h in client.post("/query", json=hybrid).json()["hits"]]
+    fpaged = client.post("/query", json={**hybrid, "offset": 1}).json()["hits"]
+    assert [h["sha256"] for h in fpaged] == fbase[1:]
 
 
 # --- (4) /query with only dense (or only sparse) ----------------------------
@@ -168,6 +235,20 @@ def test_similar_returns_neighbors_excluding_self():
     assert shas[0] == SHA_B
 
 
+def test_similar_offset_pages_deeper_neighbors():
+    """offset pages past the nearest window. Page 0 (offset 0) yields the nearest
+    neighbour B; offset 1 skips it and surfaces the next-nearest (C) — no self,
+    no duplicate of the already-seen B."""
+    page0 = client.post("/similar", json={"sha256": SHA_A, "limit": 1, "offset": 0})
+    page1 = client.post("/similar", json={"sha256": SHA_A, "limit": 1, "offset": 1})
+    assert page0.status_code == 200 and page1.status_code == 200
+    first = [h["sha256"] for h in page0.json()["hits"]]
+    second = [h["sha256"] for h in page1.json()["hits"]]
+    assert first == [SHA_B]
+    assert SHA_A not in second and SHA_B not in second
+    assert second == [SHA_C]
+
+
 def test_by_image_returns_neighbors():
     r = client.post("/by-image", json={"sha256": SHA_A, "limit": 5})
     assert r.status_code == 200, r.text
@@ -176,3 +257,52 @@ def test_by_image_returns_neighbors():
     shas = [h["sha256"] for h in data["hits"]]
     assert SHA_A not in shas
     assert shas[0] == SHA_B
+
+
+def test_by_image_applies_payload_filter():
+    """A payload filter on /by-image excludes non-matching neighbours — B is the
+    nearest to A but is filtered out, leaving only C (which the filter matches)."""
+    r = client.post(
+        "/by-image",
+        json={
+            "sha256": SHA_A,
+            "limit": 5,
+            "filter": {"must": [{"key": "name", "match": {"value": "c"}}]},
+        },
+    )
+    assert r.status_code == 200, r.text
+    shas = [h["sha256"] for h in r.json()["hits"]]
+    assert shas == [SHA_C]  # B (nearest, name=b) filtered out; only C remains
+
+
+# --- (6) DELETE /points/{sha256} removes the point (idempotent) --------------
+
+
+def test_delete_point_removes_it_idempotently():
+    # Use a throwaway point so the seeded A/B/C fixtures stay intact.
+    sha = _sha("to-delete")
+    _upsert(sha, _dense(123))
+    pid = point_id_for_sha256(sha)
+    assert store.client.retrieve(TEST_COLLECTION, ids=[pid])  # present
+
+    r = client.delete(f"/points/{sha}")
+    assert r.status_code == 200, r.text
+    assert r.json()["sha256"] == sha
+    assert store.client.retrieve(TEST_COLLECTION, ids=[pid]) == []  # gone
+
+    # Deleting a missing point is not an error.
+    assert client.delete(f"/points/{sha}").status_code == 200
+
+
+def test_batch_delete_points_removes_many_in_one_call():
+    # Throwaway points so the seeded A/B/C fixtures stay intact.
+    s1, s2 = _sha("batch-del-1"), _sha("batch-del-2")
+    _upsert(s1, _dense(201))
+    _upsert(s2, _dense(202))
+    p1, p2 = point_id_for_sha256(s1), point_id_for_sha256(s2)
+    assert store.client.retrieve(TEST_COLLECTION, ids=[p1, p2])  # both present
+
+    r = client.post("/points/batch-delete", json={"sha256s": [s1, s2, _sha("never")]})
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] == 3  # 3 ids issued; the missing one is a no-op delete
+    assert store.client.retrieve(TEST_COLLECTION, ids=[p1, p2]) == []  # both gone

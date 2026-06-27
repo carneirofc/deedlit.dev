@@ -36,6 +36,7 @@ matching/merging is always on (kind, key).
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterable
 
 from neo4j import Driver
@@ -49,6 +50,53 @@ def normalize_name(name: str) -> str:
     base = os.path.basename(name.replace("\\", "/").strip())
     root, _ext = os.path.splitext(base)
     return (root or base).strip().lower()
+
+
+# Danbooru/A1111 emphasis weight (e.g. "tag:1.2") and balanced/stray emphasis
+# brackets ("(tag)", "((tag))", "[tag]") carry no tag identity. Stripping them so
+# "(asd)", "(asd:12)" and "asd" all collapse to the SAME Tag node. Mirrors
+# deedlit.metadata.prompt_tags._clean_prompt_tag so every tag source (prompt / AI
+# labeller / manual edit) agrees on the canonical tag.
+_TAG_WEIGHT_RE = re.compile(r":\s*\d+(?:\.\d+)?")
+_TAG_LEAD_BRACKET_RE = re.compile(r"^[([{<]+")
+_TAG_TRAIL_BRACKET_RE = re.compile(r"[)\]}>]+$")
+_TAG_WS_RE = re.compile(r"\s+")
+
+
+def clean_tag(raw: str) -> str:
+    """Canonical lowercased danbooru tag: drop emphasis weight + emphasis brackets.
+
+    "(asd)", "(asd:12)", "((asd))", "[asd]" -> "asd". Empty string when nothing is
+    left. Used as the :Tag node identity so a weighted and unweighted spelling of
+    the same booru tag never split into separate nodes."""
+    t = _TAG_WEIGHT_RE.sub("", raw.replace("\\", "")).strip()
+    while t and t[0] in "([{<" and t[-1] in ")]}>":
+        t = t[1:-1].strip()
+    opens = sum(t.count(c) for c in "([{")
+    closes = sum(t.count(c) for c in ")]}")
+    if opens != closes:
+        t = _TAG_TRAIL_BRACKET_RE.sub("", _TAG_LEAD_BRACKET_RE.sub("", t)).strip()
+    return _TAG_WS_RE.sub(" ", t).strip().lower()
+
+
+# Lookup indexes the ingest MERGE path relies on. Without them every
+# MERGE (:Tag {name}) / (:Asset {kind,key}) / (:Image {sha256}) is a FULL LABEL
+# SCAN — O(nodes) per upserted tag/asset — which is the dominant write cost (and
+# the lag) once the graph grows. Created idempotently; community-edition safe
+# (plain indexes, not enterprise node-key constraints).
+_SCHEMA_STATEMENTS = (
+    "CREATE INDEX image_sha256 IF NOT EXISTS FOR (i:Image) ON (i.sha256)",
+    "CREATE INDEX tag_name IF NOT EXISTS FOR (t:Tag) ON (t.name)",
+    "CREATE INDEX asset_kind_key IF NOT EXISTS FOR (a:Asset) ON (a.kind, a.key)",
+)
+
+
+def ensure_schema() -> None:
+    """Create the MERGE lookup indexes (idempotent). Call on startup / before a
+    rebuild. Cheap when they already exist; turns the per-tag full scan into a seek."""
+    with _driver().session(database=get_database()) as session:
+        for stmt in _SCHEMA_STATEMENTS:
+            session.run(stmt).consume()
 
 
 def asset_key(ref: AssetRef) -> str:
@@ -67,7 +115,7 @@ def upsert_edges(edge: EdgeUpsert) -> dict:
     references = [
         {"kind": r.kind, "name": r.name, "key": asset_key(r)} for r in edge.references
     ]
-    tags = sorted({t.strip().lower() for t in edge.tags if t.strip()})
+    tags = sorted({c for t in edge.tags if (c := clean_tag(t))})
     lineage = [{"parent": l.parent, "kind": l.kind} for l in edge.lineage]
 
     query = """
@@ -98,20 +146,207 @@ def upsert_edges(edge: EdgeUpsert) -> dict:
     }
     RETURN size($references) AS assets, size($tags) AS tags, size($lineage) AS lineage
     """
+    params = {
+        "sha256": edge.sha256,
+        "references": references,
+        "tags": tags,
+        "lineage": lineage,
+    }
     with _driver().session(database=get_database()) as session:
-        rec = session.run(
-            query,
-            sha256=edge.sha256,
-            references=references,
-            tags=tags,
-            lineage=lineage,
-        ).single()
+        # Managed write transaction: auto-retries transient errors / deadlocks
+        # (which Neo4j throws under concurrent MERGE load) — see the driver perf
+        # guide. The result is consumed inside the tx function.
+        rec = session.execute_write(lambda tx: tx.run(query, **params).single())
         return {
             "sha256": edge.sha256,
             "assets": rec["assets"],
             "tags": rec["tags"],
             "lineage": rec["lineage"],
         }
+
+
+def _edge_payload(edge: EdgeUpsert) -> dict:
+    """Normalize one EdgeUpsert into the {sha256, references, tags, lineage} row
+    shape the batched UNWIND query consumes (same normalization as upsert_edges)."""
+    return {
+        "sha256": edge.sha256,
+        "references": [
+            {"kind": r.kind, "name": r.name, "key": asset_key(r)} for r in edge.references
+        ],
+        "tags": sorted({c for t in edge.tags if (c := clean_tag(t))}),
+        "lineage": [{"parent": ln.parent, "kind": ln.kind} for ln in edge.lineage],
+    }
+
+
+def upsert_edges_batch(edges: list[EdgeUpsert]) -> list[dict]:
+    """Upsert MANY images' edges in ONE Neo4j transaction (UNWIND over the batch).
+
+    The batch counterpart to :func:`upsert_edges`: the index.graph worker pool
+    POSTs one /edges per image, and the service's micro-batcher coalesces the
+    concurrent calls into this single transaction instead of one write tx per
+    image — the dominant Neo4j write cost during bulk ingest / rebuild / reconcile,
+    which otherwise floods Neo4j and starves the read queries the UI makes
+    (neighbors / lineage / related-tags). Returns one result dict per input edge,
+    in order. Idempotent (all MERGE), mirroring the per-image path.
+    """
+    if not edges:
+        return []
+    batch = [_edge_payload(e) for e in edges]
+    query = """
+    UNWIND $batch AS item
+    MERGE (img:Image {sha256: item.sha256})
+    WITH img, item
+    CALL (img, item) {
+        UNWIND item.references AS ref
+        MERGE (a:Asset {kind: ref.kind, key: ref.key})
+          ON CREATE SET a.name = ref.name
+        MERGE (img)-[:USES]->(a)
+    }
+    CALL (img, item) {
+        UNWIND item.tags AS tname
+        MERGE (t:Tag {name: tname})
+        MERGE (img)-[:TAGGED]->(t)
+    }
+    CALL (img, item) {
+        UNWIND item.lineage AS lin
+        MERGE (p:Image {sha256: lin.parent})
+        MERGE (img)-[d:DERIVED_FROM]->(p)
+          SET d.kind = lin.kind
+    }
+    RETURN item.sha256 AS sha256,
+           size(item.references) AS assets,
+           size(item.tags) AS tags,
+           size(item.lineage) AS lineage
+    """
+    with _driver().session(database=get_database()) as session:
+        # Managed write transaction (auto-retry transient/deadlock) for the whole
+        # coalesced batch — one round-trip + retry boundary for many images.
+        rows = session.execute_write(lambda tx: tx.run(query, batch=batch).data())
+    return [
+        {"sha256": r["sha256"], "assets": r["assets"], "tags": r["tags"], "lineage": r["lineage"]}
+        for r in rows
+    ]
+
+
+def delete_image(sha256: str) -> int:
+    """Remove an image node and all its edges (DETACH DELETE). Idempotent.
+
+    Returns the number of Image nodes deleted (0 when it was not in the graph).
+    Asset / Tag nodes are intentionally left in place: they may still be USED /
+    TAGGED by other images. Any that are now orphaned are harmless and can be
+    pruned by a rebuild-from-catalog or a future sweep.
+    """
+    q = """
+    MATCH (img:Image {sha256: $sha256})
+    DETACH DELETE img
+    RETURN count(*) AS deleted
+    """
+    with _driver().session(database=get_database()) as session:
+        rec = session.execute_write(lambda tx: tx.run(q, sha256=sha256).single())
+        return int(rec["deleted"]) if rec else 0
+
+
+def delete_images(sha256s: list[str]) -> int:
+    """Remove MANY image nodes + their edges in ONE query (DETACH DELETE).
+
+    The batch counterpart to :func:`delete_image`: a single ``WHERE sha256 IN``
+    Cypher for the whole set instead of one round-trip per image. Asset/Tag nodes
+    are left in place (still used by other images). Returns the count deleted.
+    """
+    if not sha256s:
+        return 0
+    q = """
+    MATCH (img:Image) WHERE img.sha256 IN $shas
+    DETACH DELETE img
+    RETURN count(*) AS deleted
+    """
+    with _driver().session(database=get_database()) as session:
+        rec = session.execute_write(lambda tx: tx.run(q, shas=sha256s).single())
+        return int(rec["deleted"]) if rec else 0
+
+
+# Cap how many nodes one prune transaction removes, so a large orphan backlog
+# is cleared in bounded batches instead of one giant write tx (which holds long
+# locks and Neo4j may reject). Each orphan type loops until a round deletes
+# fewer than a full batch.
+_PRUNE_BATCH = max(1, int(os.getenv("GRAPH_PRUNE_BATCH", "10000")))
+
+
+def _count_orphans() -> dict:
+    """Count orphan :Asset (no incoming USES) and :Tag (no incoming TAGGED)
+    nodes without deleting anything — backs the prune ``dry_run`` preview."""
+    q = """
+    MATCH (a:Asset) WHERE NOT (a)<-[:USES]-(:Image)
+    WITH count(a) AS assets
+    MATCH (t:Tag) WHERE NOT (t)<-[:TAGGED]-(:Image)
+    RETURN assets, count(t) AS tags
+    """
+    with _driver().session(database=get_database()) as session:
+        rec = session.run(q).single()
+        return {"assets": int(rec["assets"]), "tags": int(rec["tags"])}
+
+
+def _delete_orphan_batches(session, match_clause: str, var: str) -> int:
+    """Delete the nodes matched by ``match_clause`` in ``_PRUNE_BATCH``-sized
+    transactions, looping until a round removes fewer than a full batch.
+
+    ``match_clause`` binds ``var`` to the orphan nodes; we DELETE (not DETACH):
+    a structurally-orphaned :Asset/:Tag has no edges by construction, so a plain
+    DELETE that errored would surface a logic bug instead of silently force-
+    removing a live edge. Returns the total number of nodes deleted."""
+    q = f"""
+    {match_clause}
+    WITH {var} LIMIT $batch
+    DELETE {var}
+    RETURN count(*) AS n
+    """
+    deleted = 0
+    while True:
+        n = int(session.execute_write(lambda tx: tx.run(q, batch=_PRUNE_BATCH).single()["n"]))
+        deleted += n
+        if n < _PRUNE_BATCH:
+            return deleted
+
+
+def prune_orphans(*, dry_run: bool = False) -> dict:
+    """Remove structurally-orphaned graph entries left behind by image deletes.
+
+    ``delete_image`` removes an :Image and its edges but intentionally leaves the
+    :Asset/:Tag nodes it pointed at in place — they may still be USED/TAGGED by
+    other images. As images come and go, some of those nodes end up with NO
+    remaining edge: pure orphans that only bloat the graph and pollute the entity
+    autocomplete (``suggest_entities``). This sweep removes them:
+
+      - :Asset with no incoming :USES   — no image references it any more
+      - :Tag   with no incoming :TAGGED — no image carries it any more
+
+    Both are unambiguous: in this model an :Asset/:Tag can ONLY come into being
+    via a USES/TAGGED edge from an :Image (see :func:`upsert_edges`), so one with
+    none is definitively dead and safe to delete.
+
+    :Image nodes are deliberately NOT pruned here. ``upsert_edges`` sets no
+    property on an :Image beyond ``sha256``, so a fully-ingested image that
+    happens to have no references and no tags is structurally identical to a
+    stranded lineage stub (the ``MERGE (p:Image {sha256: lin.parent})`` of a
+    since-deleted child). They can't be told apart without consulting the catalog
+    (the source of truth) — reconciling :Image nodes against catalog truth is the
+    rebuild/reconcile path, not this purely-structural sweep.
+
+    ``dry_run`` returns the counts that WOULD be removed without deleting (the
+    admin "preview impact" before a real run). Idempotent: a run with nothing
+    orphaned returns zeros.
+    """
+    if dry_run:
+        counts = _count_orphans()
+        return {"assets_deleted": counts["assets"], "tags_deleted": counts["tags"], "dry_run": True}
+    with _driver().session(database=get_database()) as session:
+        assets = _delete_orphan_batches(
+            session, "MATCH (a:Asset) WHERE NOT (a)<-[:USES]-(:Image)", "a"
+        )
+        tags = _delete_orphan_batches(
+            session, "MATCH (t:Tag) WHERE NOT (t)<-[:TAGGED]-(:Image)", "t"
+        )
+    return {"assets_deleted": assets, "tags_deleted": tags, "dry_run": False}
 
 
 def neighbors(sha256: str, relation: str = "any", limit: int = 24) -> list[dict]:
@@ -195,6 +430,43 @@ def related_tags(tag: str, limit: int = 24) -> list[dict]:
             {"tag": rec["tag"], "weight": float(rec["weight"])}
             for rec in session.run(q, tag=norm, limit=limit)
         ]
+
+
+def suggest_entities(entity_type: str, prefix: str = "", limit: int = 50) -> list[str]:
+    """Distinct graph entity names of ``entity_type`` matching ``prefix``, most-used
+    first — backs the graph-filter value autocomplete (one option list per type).
+
+    ``entity_type`` is ``"tag"`` (a :Tag node) or an asset kind (checkpoint / lora
+    / embedding / vae / controlnet / upscaler → an :Asset of that ``kind``). The
+    prefix match is case-insensitive (Tag names are stored lowercased; Asset names
+    keep their first-seen casing). Ranked by how many images USE/are TAGGED with
+    the entity so the most relevant options surface first. Empty prefix → the
+    most-used entities of that type.
+    """
+    t = (entity_type or "").strip().lower()
+    pfx = (prefix or "").strip().lower()
+    if t == "tag":
+        query = """
+        MATCH (t:Tag)
+        WHERE $pfx = '' OR toLower(t.name) STARTS WITH $pfx
+        OPTIONAL MATCH (t)<-[:TAGGED]-(i:Image)
+        WITH t.name AS name, count(i) AS uses
+        RETURN name ORDER BY uses DESC, name ASC
+        LIMIT $limit
+        """
+        params: dict = {"pfx": pfx, "limit": limit}
+    else:
+        query = """
+        MATCH (a:Asset {kind: $kind})
+        WHERE $pfx = '' OR toLower(a.name) STARTS WITH $pfx
+        OPTIONAL MATCH (a)<-[:USES]-(i:Image)
+        WITH a.name AS name, count(i) AS uses
+        RETURN name ORDER BY uses DESC, name ASC
+        LIMIT $limit
+        """
+        params = {"kind": t, "pfx": pfx, "limit": limit}
+    with _driver().session(database=get_database()) as session:
+        return [rec["name"] for rec in session.run(query, **params) if rec["name"]]
 
 
 def wipe_all() -> None:

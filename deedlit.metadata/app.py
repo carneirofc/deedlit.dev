@@ -6,10 +6,17 @@ Pixel work (sha256/phash/dims/thumbnail) is NOT done here — ingest owns it.
 The ``references{}`` field is deferred to #7 (always empty here).
 See contracts/metadata.openapi.yaml.
 """
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import logging
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
+from activity import install_activity
 from extract import interpret_metadata
 from png_metadata import read_embedded_metadata_from_png
 
@@ -22,13 +29,16 @@ class _HealthAccessFilter(logging.Filter):
         args = record.args
         # uvicorn.access record args: (client, method, full_path, http_ver, status)
         if isinstance(args, tuple) and len(args) >= 3:
-            return "/health" not in str(args[2])
+            path = str(args[2])
+            return "/health" not in path and "/activity" not in path
         return True
 
 
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
 
 app = FastAPI(title="deedlit.metadata", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+install_activity(app)
 
 
 @app.get("/health")

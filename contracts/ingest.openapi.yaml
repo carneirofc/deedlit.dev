@@ -46,6 +46,14 @@ paths:
       parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
       summary: Cancel a running job
       responses: { "200": { description: Cancelling } }
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      description: >
+        Lightweight in-process counters for the UI system-activity board: how
+        many requests are in flight, the trailing-60s completion rate, and the
+        most recent non-probe request. Excludes the /health and /activity probes.
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] } }, required: [status] }
@@ -69,7 +77,7 @@ components:
     MaintenanceRequest:
       type: object
       properties:
-        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile] }
+        type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile, label-backfill, prune-graph-orphans] }
         sha256: { type: [string, "null"], pattern: "^[a-f0-9]{64}$", description: "for reindex-one-image" }
       required: [type]
     Job:
@@ -88,4 +96,20 @@ components:
         failed_files: { type: integer }
         folder_path: { type: [string, "null"] }
         error_message: { type: [string, "null"] }
+        # Live pipeline stage + lifecycle timestamps for the system-activity
+        # board and the activity dock (which microservice is active, how long).
+        current_stage: { type: [string, "null"], description: "Stage in progress: hash/metadata/label/vision:dense/vision:sparse/catalog/search/graph" }
+        stage_counts: { type: object, additionalProperties: { type: integer }, description: "Per-stage count of files that have reached that stage" }
+        created_at: { type: string, description: "ISO-8601 UTC, set on creation" }
+        started_at: { type: [string, "null"], description: "ISO-8601 UTC, set when the job starts running" }
+        finished_at: { type: [string, "null"], description: "ISO-8601 UTC, set when the job settles" }
       required: [id, type, status]
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board.
+      properties:
+        inflight: { type: integer, description: "Requests currently being handled" }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request, e.g. 'POST /embed/image'" }
+      required: [inflight, per_min, busy, last_op]

@@ -43,8 +43,7 @@ deedlit.dev/
 │   │
 │   ├── lib/                    # Shared utilities
 │   │   ├── logger.ts           # Server-side logging
-│   │   ├── client-logger.ts    # Client-side logging
-│   │   └── image-loader.ts     # Image optimization
+│   │   └── client-logger.ts    # Client-side logging
 │   │
 │   └── proxy.ts                # Next.js proxy
 │

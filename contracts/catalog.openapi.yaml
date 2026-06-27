@@ -19,11 +19,26 @@ paths:
     get:
       summary: List/search images
       parameters:
-        - { name: tag, in: query, schema: { type: string } }
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
         - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, description: "Keep images rated at least this (0-5).", schema: { type: integer, minimum: 0, maximum: 5 } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: path, in: query, description: "Keep images whose on-disk file path contains this fragment (separator-insensitive substring).", schema: { type: string } }
+        - { name: sort, in: query, description: "Server-side ordering for the browse grid.", schema: { type: string, enum: [newest, oldest, rating_desc, rating_asc, name_asc, name_desc], default: newest } }
         - { name: limit, in: query, schema: { type: integer, default: 50 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
-      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Image" } } } } } }
+      responses: { "200": { description: "OK — lightweight summaries (basic card fields only; no workflow/api-prompt graphs, params, negative, or description). Fetch the full record via GET /images/{sha256}.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ImageSummary" } } } } } }
+  /images/batch-delete:
+    post:
+      summary: Bulk hard-delete many image records (+ blobs); not the source files
+      description: >
+        The batch counterpart to DELETE /images/{sha256}: two set-based SQL deletes
+        (asset refs, then the image rows — FK children cascade) plus per-blob
+        object-store cleanup for exactly the records that existed. Returns the
+        deleted + missing sha256s.
+      requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { sha256s: { type: array, items: { $ref: "#/components/schemas/Sha256" }, minItems: 1, maxItems: 1000 } }, required: [sha256s] } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string }, deleted: { type: array, items: { $ref: "#/components/schemas/Sha256" } }, missing: { type: array, items: { $ref: "#/components/schemas/Sha256" } } } } } } } }
   /images/{sha256}:
     parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
     get: { summary: Read one image, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } }, "404": { description: Not found } } }
@@ -31,6 +46,16 @@ paths:
       summary: Update mutable fields (rating/favorite/tags)
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ImagePatch" } } } }
       responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Image" } } } } }
+    delete:
+      summary: Delete an image record (+ sha256-keyed blobs); not the source file
+      description: >
+        Hard-deletes the Postgres row (FK children cascade) plus the per-image
+        asset references, then drops the sha256-keyed RustFS blobs (thumbnail +
+        cached embedding). The original file on disk is never touched. Note /
+        collection membership refs are left intact so a re-ingest re-attaches.
+      responses:
+        "200": { description: Deleted, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+        "404": { description: Not found }
   /images/{sha256}/rating:
     put:
       parameters: [ { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } } ]
@@ -43,10 +68,74 @@ paths:
       summary: Set favorite
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { favorite: { type: boolean } }, required: [favorite] } } } }
       responses: { "200": { description: OK } }
+  /images/count:
+    get:
+      summary: Total images matching a filter set
+      description: >
+        The count of images matching the same filters as GET /images (no
+        sort/paging). Lets a report/export tool size the work set before paging.
+      parameters:
+        - { name: tag, in: query, description: "Include tag (repeatable); image must carry ALL.", schema: { type: array, items: { type: string } } }
+        - { name: exclude_tag, in: query, description: "Exclude tag (repeatable); image must carry NONE.", schema: { type: array, items: { type: string } } }
+        - { name: favorite, in: query, schema: { type: boolean } }
+        - { name: rating_gte, in: query, schema: { type: integer, minimum: 0, maximum: 5 } }
+        - { name: safety, in: query, description: "Content-safety classes to include (repeatable); omit for all.", schema: { type: array, items: { type: string, enum: [sfw, nsfw, explicit] } } }
+        - { name: path, in: query, description: "Keep images whose on-disk file path contains this fragment (separator-insensitive substring).", schema: { type: string } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CountResult" } } } } }
+  /images/unlabeled:
+    get:
+      summary: sha256 of images missing an AI label/description
+      description: >
+        The label-backfill work set: cataloged images with no
+        deedlit.labelagent description. Returns { sha256: [...] }. Paged.
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { sha256: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [sha256] } } } } }
+  /images/directories:
+    get:
+      summary: Distinct source directories with per-directory image counts
+      description: >
+        The distinct images.directory values with live-image totals, biggest
+        folder first. Backs the library's split-by-source-directory section
+        headers (true folder totals, not just the loaded page).
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 2000, minimum: 1, maximum: 10000 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/DirectoryCount" } } } } } }
+  /tags:
+    get:
+      summary: Tag-name autocomplete (names matching prefix, most-used first)
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 10, minimum: 1, maximum: 50 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: string } } } } } }
+  /tags/report:
+    get:
+      summary: Full tag inventory with per-tag image counts, paged
+      description: >
+        Every tag plus how many distinct live images carry it (most-used first),
+        with a `total` for paging the whole inventory. The report counterpart to
+        GET /tags (which is a capped autocomplete of bare names).
+      parameters:
+        - { name: prefix, in: query, schema: { type: string, default: "" } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, minimum: 1, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0, minimum: 0 } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TagReport" } } } } }
+  /stats:
+    get:
+      summary: Aggregate library counts (the report summary)
+      description: >
+        image/tag/collection/note/folder counts, favorites, labeled vs unlabeled,
+        and the content-safety breakdown. All counts exclude soft-deleted images.
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Stats" } } } } }
+  /reports/folders:
+    get:
+      summary: Per-folder coverage (path + label + image/labeled/unlabeled counts)
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/FolderReport" } } } } } }
   /blobs/{sha256}/{kind}:
     parameters:
       - { name: sha256, in: path, required: true, schema: { $ref: "#/components/schemas/Sha256" } }
-      - { name: kind, in: path, required: true, schema: { type: string, enum: [thumbnail, embedding] } }
+      - { name: kind, in: path, required: true, schema: { type: string, enum: [thumbnail, embedding, sparse] } }
     get: { summary: Fetch a RustFS blob, responses: { "200": { description: Blob, content: { application/octet-stream: { schema: { type: string, format: binary } } } }, "404": { description: Not found } } }
     put:
       summary: Store a RustFS blob (sha256-keyed)
@@ -78,9 +167,92 @@ paths:
       summary: Set/reorder collection membership (ordered sha256 list)
       requestBody: { required: true, content: { application/json: { schema: { type: object, properties: { images: { type: array, items: { $ref: "#/components/schemas/Sha256" } } }, required: [images] } } } }
       responses: { "200": { description: OK } }
+  /folders:
+    post:
+      summary: Register a source folder (idempotent on path)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolderUpsert" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } } }
+    get: { summary: List configured folders (+ derived coverage), responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/SourceFolder" } } } } } } }
+  /folders/{id}:
+    parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
+    get: { summary: Read one folder, responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } }, "404": { description: Not found } } }
+    patch:
+      summary: Update folder controls + scan-state (partial)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolderPatch" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SourceFolder" } } } }, "404": { description: Not found } }
+    delete:
+      summary: Remove a folder from the registry (keeps its cataloged images)
+      responses: { "200": { description: Deleted }, "404": { description: Not found } }
+  /activity:
+    get:
+      summary: Live work snapshot (in-flight count, throughput, current op)
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Activity" } } } } }
 components:
   schemas:
+    Activity:
+      type: object
+      description: In-process live work snapshot for the system-activity board (in-flight requests, trailing-60s throughput, most recent op).
+      properties:
+        inflight: { type: integer }
+        per_min: { type: number, description: "Completions in the trailing 60s (≈ per-minute rate)" }
+        busy: { type: boolean, description: "inflight > 0" }
+        last_op: { type: [string, "null"], description: "Most recent non-probe request" }
+      required: [inflight, per_min, busy, last_op]
     Sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+    CountResult:
+      type: object
+      properties: { count: { type: integer } }
+      required: [count]
+    DirectoryCount:
+      type: object
+      description: "One source directory + how many live images live directly under it (split-by-source-directory section header)."
+      properties:
+        directory: { type: string }
+        image_count: { type: integer }
+      required: [directory, image_count]
+    TagCount:
+      type: object
+      properties:
+        name: { type: string }
+        normalized_name: { type: string }
+        image_count: { type: integer, description: "Distinct live images carrying the tag" }
+      required: [name, normalized_name, image_count]
+    TagReport:
+      type: object
+      properties:
+        total: { type: integer, description: "Tags matching the prefix (for paging)" }
+        items: { type: array, items: { $ref: "#/components/schemas/TagCount" } }
+      required: [total, items]
+    SafetyBreakdown:
+      type: object
+      description: "Live images per content-safety class; unclassified = NULL safety."
+      properties:
+        sfw: { type: integer }
+        nsfw: { type: integer }
+        explicit: { type: integer }
+        unclassified: { type: integer }
+    Stats:
+      type: object
+      properties:
+        images: { type: integer }
+        tags: { type: integer }
+        collections: { type: integer }
+        notes: { type: integer }
+        folders: { type: integer }
+        favorites: { type: integer }
+        labeled: { type: integer, description: "Images with an AI label/description" }
+        unlabeled: { type: integer }
+        safety: { $ref: "#/components/schemas/SafetyBreakdown" }
+      required: [images]
+    FolderReport:
+      type: object
+      properties:
+        path: { type: string }
+        label: { type: [string, "null"] }
+        image_count: { type: integer }
+        labeled_count: { type: integer }
+        unlabeled_count: { type: integer }
+      required: [path, image_count, labeled_count, unlabeled_count]
     Health: { type: object, properties: { status: { type: string, enum: [ok, degraded] }, db_ready: { type: boolean }, blob_ready: { type: boolean } }, required: [status] }
     AssetRef: { type: object, properties: { kind: { type: string, enum: [checkpoint, lora, embedding, vae, controlnet, upscaler] }, name: { type: string }, hash: { type: [string, "null"] } }, required: [kind, name] }
     Params:
@@ -99,6 +271,13 @@ components:
       type: object
       properties:
         sha256: { $ref: "#/components/schemas/Sha256" }
+        filepath:
+          type: [string, "null"]
+          description: >-
+            Original on-disk path of the source file captured at ingest, so an
+            image is identifiable when inspecting the catalog (the id is the
+            opaque sha256). Stored INSERT-only — a later reindex (which has no
+            path) never overwrites it. Null when unknown.
         phash: { type: [string, "null"] }
         width: { type: [integer, "null"] }
         height: { type: [integer, "null"] }
@@ -110,6 +289,17 @@ components:
         references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
         workflow_json: { type: [object, "null"] }
         api_prompt_json: { type: [object, "null"] }
+        safety:
+          type: [string, "null"]
+          enum: [sfw, nsfw, explicit, null]
+          description: AI content-safety class (deedlit.labelagent); null = unclassified.
+        description:
+          type: [string, "null"]
+          description: >-
+            AI-generated image description (deedlit.labelagent). An expensive
+            vision-LLM result, persisted in image_descriptions so it is
+            retrievable/viewable without re-running the model. Re-derivable: a
+            reindex without one keeps the stored value. Null = none.
       required: [sha256]
     Image:
       allOf:
@@ -119,12 +309,39 @@ components:
             rating: { type: [integer, "null"] }
             favorite: { type: boolean }
             created_at: { type: string, format: date-time }
+    ImageSummary:
+      description: >-
+        Lightweight browse row returned by GET /images (one per grid card). A
+        deliberate SUBSET of Image: only the fields a card renders. The heavy
+        workflow_json / api_prompt_json ComfyUI graphs (tens-to-hundreds of KB
+        each) plus the detail-only negative / params / description are OMITTED so
+        a browse page (and its auto-refresh poll) stays small. Fetch the full
+        record via GET /images/{sha256}.
+      type: object
+      properties:
+        sha256: { $ref: "#/components/schemas/Sha256" }
+        filepath: { type: [string, "null"] }
+        directory: { type: [string, "null"], description: "Parent directory of filepath (separators normalized to '/') — the split-by-source-directory grouping key." }
+        phash: { type: [string, "null"] }
+        width: { type: [integer, "null"] }
+        height: { type: [integer, "null"] }
+        sourceTool: { type: [string, "null"] }
+        prompt: { type: [string, "null"] }
+        tags: { type: array, items: { type: string } }
+        references: { type: array, items: { $ref: "#/components/schemas/AssetRef" } }
+        rating: { type: [integer, "null"] }
+        favorite: { type: boolean }
+        safety: { type: [string, "null"], enum: [sfw, nsfw, explicit, null] }
+        created_at: { type: [string, "null"], format: date-time }
+        imported_at: { type: [string, "null"], format: date-time }
+      required: [sha256]
     ImagePatch:
       type: object
       properties:
         rating: { type: [integer, "null"] }
         favorite: { type: [boolean, "null"] }
         tags: { type: [array, "null"], items: { type: string } }
+        safety: { type: [string, "null"], enum: [sfw, nsfw, explicit, null] }
     NoteUpsert:
       type: object
       properties:
@@ -151,4 +368,44 @@ components:
         - { $ref: "#/components/schemas/CollectionUpsert" }
         - type: object
           properties: { id: { type: string } }
+          required: [id]
+    SourceFolderUpsert:
+      type: object
+      description: Writable fields when registering a source folder.
+      properties:
+        path: { type: string, description: "Absolute path on the ingest host" }
+        label: { type: [string, "null"] }
+        enabled: { type: boolean, default: true, description: "Auto-scan on by default" }
+        recursive: { type: boolean, default: true }
+        scan_interval_seconds: { type: integer, default: 900, minimum: 0, description: "Per-folder scan cadence" }
+      required: [path]
+    SourceFolderPatch:
+      type: object
+      description: >-
+        Partial update. Carries both the user controls (enabled/recursive/
+        interval/label) and the scan-state the ingest scheduler writes back.
+      properties:
+        label: { type: [string, "null"] }
+        enabled: { type: [boolean, "null"] }
+        recursive: { type: [boolean, "null"] }
+        scan_interval_seconds: { type: [integer, "null"], minimum: 0 }
+        last_scan_status: { type: [string, "null"] }
+        last_scan_job_id: { type: [string, "null"] }
+        last_error: { type: [string, "null"] }
+        touch_last_scan_at: { type: boolean, default: false, description: "Stamp last_scan_at to now() server-side" }
+    SourceFolder:
+      allOf:
+        - { $ref: "#/components/schemas/SourceFolderUpsert" }
+        - type: object
+          properties:
+            id: { type: string }
+            last_scan_at: { type: [string, "null"], format: date-time }
+            last_scan_status: { type: [string, "null"] }
+            last_scan_job_id: { type: [string, "null"] }
+            last_error: { type: [string, "null"] }
+            created_at: { type: [string, "null"], format: date-time }
+            updated_at: { type: [string, "null"], format: date-time }
+            image_count: { type: integer, description: "Images under this folder (derived)" }
+            labeled_count: { type: integer, description: "Of those, with an AI label" }
+            unlabeled_count: { type: integer }
           required: [id]

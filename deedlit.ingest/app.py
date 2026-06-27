@@ -23,6 +23,11 @@ ingest job.
 """
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import asyncio
 import logging
 import os
@@ -30,11 +35,31 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, model_validator
 
+import config
+import job_ledger
+import ledger
+import pipeline
+import settings_client
+from activity import install_activity
 from fs_browse import FsBrowseError, browse_directory
-from jobs import REINDEX_ONE_IMAGE, JobStore, reconcile_interval_seconds, reconcile_scheduler
+from jobs import (
+    REINDEX_ONE_IMAGE,
+    JobStore,
+    _publish_label_best_effort,
+    _publish_reproject_best_effort,
+    folder_scan_scheduler,
+    folder_scan_tick_seconds,
+    label_backfill_interval_seconds,
+    label_backfill_scheduler,
+    orphan_prune_interval_seconds,
+    orphan_prune_scheduler,
+    reconcile_interval_seconds,
+    reconcile_scheduler,
+)
 
 store = JobStore()
 
@@ -42,16 +67,50 @@ store = JobStore()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.start_worker()
-    # Opt-in periodic reconcile sweep (#21). Disabled unless
-    # RECONCILE_INTERVAL_SECONDS > 0, so tests never get a surprise scheduler.
-    scheduler: asyncio.Task | None = None
+    # Restore durable state from catalog before serving (best-effort — a cold or
+    # unreachable catalog must never block startup; both helpers swallow their
+    # own errors and degrade to empty):
+    #   1. flip any job left queued/running by the previous process to
+    #      interrupted (its in-memory worker is gone),
+    #   2. hydrate the job registry so GET /jobs shows history immediately, and
+    #   3. seed the live producer config with the persisted UI overrides.
+    await job_ledger.interrupt_stale()
+    loaded = store.hydrate(await job_ledger.list_jobs(limit=200))
+    if loaded:
+        logging.getLogger("deedlit.ingest.app").info(
+            "hydrated %d job(s) from catalog history", loaded
+        )
+    overrides = await settings_client.load()
+    if overrides:
+        config.update(overrides)
+        logging.getLogger("deedlit.ingest.app").info(
+            "loaded persisted ingest config overrides: %s", overrides
+        )
+    # Opt-in background schedulers (all disabled unless their interval env > 0,
+    # so tests never get a surprise scheduler):
+    #   - reconcile sweep (#21)
+    #   - folder scan (per-folder cadence over the configured-folder registry)
+    #   - label backfill (relabel images missing an AI description)
+    #   - graph orphan prune (sweep orphaned Asset/Tag nodes from Neo4j)
+    schedulers: list[asyncio.Task] = []
     if reconcile_interval_seconds() > 0:
-        scheduler = asyncio.create_task(reconcile_scheduler(store))
+        schedulers.append(asyncio.create_task(reconcile_scheduler(store)))
+    if folder_scan_tick_seconds() > 0:
+        schedulers.append(asyncio.create_task(folder_scan_scheduler(store)))
+    if label_backfill_interval_seconds() > 0:
+        schedulers.append(asyncio.create_task(label_backfill_scheduler(store)))
+    if orphan_prune_interval_seconds() > 0:
+        schedulers.append(asyncio.create_task(orphan_prune_scheduler(store)))
     try:
         yield
     finally:
-        if scheduler is not None:
-            scheduler.cancel()
+        for task in schedulers:
+            task.cancel()
+        # Close the shared pooled HTTP clients (best-effort).
+        await pipeline.aclose()
+        await ledger.aclose()
+        await job_ledger.aclose()
+        await settings_client.aclose()
 
 
 # Health probes are polled on a tight interval (Docker HEALTHCHECK + the status
@@ -62,7 +121,8 @@ class _HealthAccessFilter(logging.Filter):
         args = record.args
         # uvicorn.access record args: (client, method, full_path, http_ver, status)
         if isinstance(args, tuple) and len(args) >= 3:
-            return "/health" not in str(args[2])
+            path = str(args[2])
+            return "/health" not in path and "/activity" not in path
         return True
 
 
@@ -83,6 +143,8 @@ if not _ingest_logger.handlers:
 _ingest_logger.setLevel(os.getenv("INGEST_LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(title="deedlit.ingest", version="0.1.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+install_activity(app)
 
 
 class IngestRequest(BaseModel):
@@ -104,6 +166,8 @@ class MaintenanceRequest(BaseModel):
         "rebuild-graph",
         "rebuild-thumbnails",
         "reconcile",
+        "label-backfill",
+        "prune-graph-orphans",
     ]
     sha256: str | None = None
     folderPath: str | None = None
@@ -130,6 +194,38 @@ class ReconcileRequest(BaseModel):
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+class ConfigPatch(BaseModel):
+    """PUT /config body — partial update of the live producer knobs (ADR 0002).
+
+    Both optional so the settings panel can patch one field; None leaves it
+    unchanged. ``ingest_concurrency`` is clamped to >= 1 by the config layer.
+    """
+
+    ingest_concurrency: int | None = None
+    # Master switch for the vision-LLM (labelagent) enrichment stage.
+    llm_enabled: bool | None = None
+
+
+@app.get("/config")
+def get_config() -> dict:
+    """Effective runtime producer config (env defaults + live overrides)."""
+    return config.runtime()
+
+
+@app.put("/config")
+async def put_config(patch: ConfigPatch) -> dict:
+    """Update the live producer config; returns the new effective config.
+
+    Tunes folder-scan parallelism from the settings panel without a restart.
+    The effective config is persisted to catalog best-effort so the change
+    survives an ingest restart (a persist failure is swallowed — the in-memory
+    override still applies this run). Consumer-side parallelism (broker prefetch /
+    worker replicas) is deploy-time and not settable here."""
+    effective = config.update(patch.model_dump(exclude_none=True))
+    await settings_client.save(effective)
+    return effective
 
 
 @app.get("/fs/browse")
@@ -184,6 +280,39 @@ def start_reconcile(req: ReconcileRequest) -> JSONResponse:
     store.start_worker()
     job = store.create_reconcile_job(per_image_max=req.perImageMax)
     return JSONResponse(status_code=202, content=job.to_dict())
+
+
+class SingleTaskRequest(BaseModel):
+    """POST /tasks/{index,label} body — enqueue ONE async task for an image.
+
+    Backs the DB power page's per-image re-index / re-label actions (#30). The
+    sha256 must be 64 lowercase hex chars (the cross-service id).
+    """
+
+    sha256: str
+
+    @model_validator(mode="after")
+    def _check_sha(self) -> "SingleTaskRequest":
+        import re
+
+        if not re.fullmatch(r"[a-f0-9]{64}", self.sha256):
+            raise ValueError("sha256 must be 64 lowercase hex characters")
+        return self
+
+
+@app.post("/tasks/index", status_code=202)
+async def enqueue_index_task(req: SingleTaskRequest) -> dict:
+    """Re-project one image from catalog truth: publish the per-stage projection
+    set (embed.dense + embed.sparse -> index.search, plus index.graph). No relabel."""
+    ok = await _publish_reproject_best_effort(req.sha256)
+    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "reproject"}
+
+
+@app.post("/tasks/label", status_code=202)
+async def enqueue_label_task(req: SingleTaskRequest) -> dict:
+    """Publish a single label task for one image (describe -> patch -> re-index)."""
+    ok = await _publish_label_best_effort(req.sha256)
+    return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "label"}
 
 
 @app.get("/jobs/{job_id}")

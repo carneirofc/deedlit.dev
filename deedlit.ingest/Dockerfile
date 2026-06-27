@@ -9,11 +9,12 @@ RUN pip install --no-cache-dir \
     "pillow>=10.0.0" \
     "imagehash>=4.3.1" \
     "python-multipart>=0.0.9" \
+    "aio-pika>=9.4.0" \
     "opentelemetry-distro>=0.48b0" \
     "opentelemetry-exporter-otlp-proto-http>=1.27.0" \
     "opentelemetry-instrumentation-fastapi>=0.48b0" \
     "opentelemetry-instrumentation-httpx>=0.48b0"
-COPY id_scheme.py pipeline.py jobs.py app.py ./
+COPY id_scheme.py pipeline.py jobs.py app.py activity.py broker.py worker.py ./
 
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --retries=10     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"

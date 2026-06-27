@@ -8,6 +8,38 @@
 /* Shared visual system. Keep app-level globals thin for reuse. */
 @import "@deedlit.dev/ui/styles.css";
 
+/* Ultrawide breakpoints. Tailwind v4 stops at 2xl (1536px); these let dense
+   grids add columns on wide desktops instead of stretching cards. */
+@theme {
+  --breakpoint-3xl: 1920px;
+  --breakpoint-4xl: 2560px;
+  --breakpoint-5xl: 3200px;
+}
+
+/* Tailwind v4's Preflight no longer sets `cursor: pointer` on buttons, so
+   clickable controls fell back to the default arrow. Restore the affordance for
+   interactive elements (enabled -> pointer, disabled -> not-allowed). Elements
+   made clickable via `onClick` on a non-interactive tag still need an explicit
+   `cursor-pointer` class. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  a[href],
+  label[for],
+  summary,
+  select:not(:disabled) {
+    cursor: pointer;
+  }
+
+  button:disabled,
+  [role="button"][aria-disabled="true"],
+  select:disabled,
+  input:disabled,
+  textarea:disabled {
+    cursor: not-allowed;
+  }
+}
+
 /* ---- Editor.js theme overrides ---- */
 .editorjs-container .codex-editor__redactor {
   padding-bottom: 0 !important;

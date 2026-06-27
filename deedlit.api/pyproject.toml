@@ -7,6 +7,10 @@ dependencies = [
     "fastapi>=0.116.0",
     "uvicorn[standard]>=0.35.0",
     "httpx>=0.27.0",
+    # FastAPI multipart form parsing — required by POST /search/by-image's
+    # UploadFile/Form params (reverse-image search). Without it FastAPI raises at
+    # request time ("Form data requires python-multipart to be installed").
+    "python-multipart>=0.0.9",
     # OpenTelemetry: zero-code tracing via `opentelemetry-instrument`. Exports
     # OTLP/http to Tempo (see OTEL_* env / dev:api script). httpx instrumentation
     # traces the gateway's calls to the owning services.

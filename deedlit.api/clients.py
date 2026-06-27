@@ -15,6 +15,7 @@ factory to install an ``httpx.MockTransport`` and stay offline.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -33,6 +34,14 @@ INGEST_URL = os.getenv("INGEST_URL", "http://localhost:8004").rstrip("/")
 # show every component, not just the routable ones.
 VISION_URL = os.getenv("VISION_URL", "http://localhost:8000").rstrip("/")
 METADATA_URL = os.getenv("METADATA_URL", "http://localhost:8005").rstrip("/")
+
+# RabbitMQ management HTTP API — backs the queue visualization page (#29). Creds
+# are held HERE (server-side) and never exposed to the browser; the gateway is
+# the only thing that talks to the management API.
+RABBITMQ_MGMT_URL = os.getenv("RABBITMQ_MGMT_URL", "http://localhost:15672").rstrip("/")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER", "deedlit")
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "deedlit")
+RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
 
 HTTP_TIMEOUT = float(os.getenv("API_HTTP_TIMEOUT", "15.0"))
 
@@ -148,6 +157,31 @@ async def vision(method: str, path: str, **kw: Any) -> Any:
     return await request("vision", method, VISION_URL, path, **kw)
 
 
+async def rabbitmq_mgmt(method: str, path: str, *, json: Any | None = None) -> Any:
+    """Call the RabbitMQ management HTTP API with the server-held credentials.
+
+    Backs the queue visualization page (#29). Raises :class:`DownstreamError` on
+    transport error / non-2xx so callers degrade (the dashboard stays usable when
+    the broker is down). Returns decoded JSON, or None for an empty body.
+    """
+    url = f"{RABBITMQ_MGMT_URL}{path}"
+    try:
+        async with make_async_client() as client:
+            resp = await client.request(
+                method, url, json=json, auth=(RABBITMQ_USER, RABBITMQ_PASSWORD)
+            )
+    except httpx.HTTPError as exc:
+        raise DownstreamError("rabbitmq", None, str(exc)) from exc
+    if resp.status_code >= 400:
+        raise DownstreamError("rabbitmq", resp.status_code, _safe_detail(resp))
+    if not resp.content:
+        return None
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Text search orchestration
 # ---------------------------------------------------------------------------
@@ -177,31 +211,176 @@ async def encode_query(query: str) -> dict[str, Any] | None:
     }
 
 
-async def search_by_text(query: str, limit: int, filter: dict[str, Any] | None) -> Any:
+def _to_qdrant_filter(facets: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Translate the UI's camelCase facet object into a Qdrant ``Filter`` shape.
+
+    Only facets that exist in each point's payload (written by ingest) can be
+    filtered on the vector path: ``tags`` (+ ``excludeTags``) and ``safety`` (the
+    content-safety class). The other facets (modelFamily / checkpoint / loras /
+    sourceTool / favorite / ratingGte) are catalog-only — mutable and not
+    projected into Qdrant — so they're ignored here and apply on the no-query
+    browse path instead. Returns ``None`` when nothing translatable is present so
+    search runs unfiltered (and so a raw facet dict never reaches Qdrant's
+    ``Filter(**raw)``, which only understands must/should/must_not).
+    """
+    if not facets:
+        return None
+    must: list[dict[str, Any]] = []
+    must_not: list[dict[str, Any]] = []
+
+    tags = facets.get("tags")
+    if isinstance(tags, list) and tags:
+        must.append({"key": "tags", "match": {"any": list(tags)}})
+
+    safety = facets.get("safety")
+    if isinstance(safety, str) and safety:
+        safety = [safety]
+    if isinstance(safety, list) and safety:
+        must.append({"key": "safety", "match": {"any": list(safety)}})
+
+    exclude = facets.get("excludeTags")
+    if isinstance(exclude, list) and exclude:
+        must_not.append({"key": "tags", "match": {"any": list(exclude)}})
+
+    qfilter: dict[str, Any] = {}
+    if must:
+        qfilter["must"] = must
+    if must_not:
+        qfilter["must_not"] = must_not
+    return qfilter or None
+
+
+# Reverse-image search uses the same 1024-dim CLIP image preset the shared Qdrant
+# `dense` vector is sized for. `big_g` (1280-dim) would not fit the collection, so
+# the query embedding is pinned here and the model is NOT exposed to the UI.
+SEARCH_BY_IMAGE_MODEL = os.getenv("SEARCH_BY_IMAGE_MODEL", "vit_h")
+
+
+async def embed_image_bytes(
+    data: bytes, filename: str, content_type: str | None = None
+) -> list[float]:
+    """Encode raw image bytes into the dense CLIP vector search expects.
+
+    The reverse-image-search counterpart to :func:`encode_query` (which encodes a
+    text query): an uploaded image is POSTed to deedlit.vision ``/embed/image`` as
+    multipart, pinned to the 1024-dim ``vit_h`` preset (see
+    ``SEARCH_BY_IMAGE_MODEL``). The vision call is multipart, so it bypasses the
+    JSON :func:`request` helper and posts through :func:`make_async_client`
+    directly (still monkeypatched in tests). Raises :class:`DownstreamError` on a
+    transport error / non-2xx / missing embedding so the route maps it to a 502.
+    """
+    files = {"file": (filename or "upload", data, content_type or "application/octet-stream")}
+    try:
+        async with make_async_client() as client:
+            resp = await client.post(
+                f"{VISION_URL}/embed/image",
+                files=files,
+                data={"model": SEARCH_BY_IMAGE_MODEL},
+            )
+    except httpx.HTTPError as exc:  # connect/timeout/transport
+        raise DownstreamError("vision", None, str(exc)) from exc
+    if resp.status_code >= 400:
+        raise DownstreamError("vision", resp.status_code, _safe_detail(resp))
+    body = resp.json() if resp.content else {}
+    # The live service returns ``embedding``; tolerate ``vector`` for parity with
+    # the ingest pipeline's reader (both shapes have appeared across versions).
+    embedding = (body or {}).get("embedding") or (body or {}).get("vector")
+    if not embedding:
+        raise DownstreamError("vision", resp.status_code, "embed/image returned no embedding")
+    return embedding
+
+
+async def search_by_image_upload(
+    data: bytes,
+    filename: str,
+    content_type: str | None,
+    *,
+    limit: int,
+    offset: int = 0,
+    filter: dict[str, Any] | None = None,
+) -> Any:
+    """Embed an uploaded image via vision, then run a dense vector search.
+
+    The image-upload counterpart to :func:`search_by_text`: the bytes are encoded
+    to a dense CLIP vector (vision ``/embed/image``), then handed to deedlit.search
+    ``POST /query`` as a single dense modality (so the response ``fusion`` is
+    ``"dense"``). The UI's flat camelCase facet object is translated into a Qdrant
+    payload filter (tags / excludeTags / safety — see :func:`_to_qdrant_filter`) and
+    forwarded, so reverse-image results honour the same safety/tag filter as text
+    search. ``offset`` pages deeper into the ranked results.
+    """
+    dense = await embed_image_bytes(data, filename, content_type)
+    body = {
+        "dense": dense,
+        "limit": limit,
+        "offset": offset,
+        "filter": _to_qdrant_filter(filter),
+    }
+    return await search("POST", "/query", json=body)
+
+
+async def search_by_text(
+    query: str, limit: int, filter: dict[str, Any] | None, offset: int = 0
+) -> Any:
     """Encode ``query`` via vision, then run the hybrid search on deedlit.search.
 
     An empty query has no vector to search by. Rather than returning nothing
     (which left the default library gallery blank after a successful ingest),
     fall back to a catalog browse — list the cataloged images directly so the
     no-query "browse" view shows the library.
+
+    The UI sends a flat camelCase facet object as ``filter``; for the vector path
+    it is translated into a Qdrant filter (payload facets only — see
+    :func:`_to_qdrant_filter`), while the browse path threads the catalog-backed
+    facets straight into ``GET /images``.
     """
     vectors = await encode_query(query)
     if vectors is None:
-        return await browse_catalog(limit, filter)
-    body = {**vectors, "limit": limit, "filter": filter}
+        return await browse_catalog(limit, filter, offset)
+    body = {**vectors, "limit": limit, "offset": offset, "filter": _to_qdrant_filter(filter)}
     return await search("POST", "/query", json=body)
 
 
-async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str, Any]:
+async def search_similar(
+    sha256: str,
+    limit: int,
+    filters: dict[str, Any] | None = None,
+    offset: int = 0,
+) -> Any:
+    """Image-to-image search on deedlit.search, honouring the UI facet filter.
+
+    Mirrors :func:`search_by_text`'s facet handling on the by-image path: the UI's
+    flat camelCase facets are translated into a Qdrant payload filter (tags /
+    excludeTags / safety — see :func:`_to_qdrant_filter`) and forwarded so the
+    same safety/tag filter constrains similar results. Omitted when nothing is
+    translatable, so an unfiltered call keeps the old behaviour.
+
+    ``offset`` pages deeper into the ranked neighbours so the UI can keep loading
+    more proximity results.
+    """
+    body: dict[str, Any] = {"sha256": sha256, "limit": limit}
+    if offset:
+        body["offset"] = offset
+    qfilter = _to_qdrant_filter(filters)
+    if qfilter is not None:
+        body["filter"] = qfilter
+    return await search("POST", "/similar", json=body)
+
+
+async def browse_catalog(
+    limit: int, filter: dict[str, Any] | None, offset: int = 0
+) -> dict[str, Any]:
     """List cataloged images as search-shaped hits (no-query browse fallback).
 
     deedlit.search is purely vector-driven and can't answer a filter-only/empty
     query, but the catalog is the source of truth and lists images directly.
     We map its rows into the ``{fusion, hits:[{sha256, score, payload}]}`` shape
     the UI already consumes, threading the supported facets (tag/favorite) into
-    catalog ``GET /images`` query params.
+    catalog ``GET /images`` query params. ``offset`` pages the catalog list.
     """
     params: dict[str, Any] = {"limit": limit}
+    if offset:
+        params["offset"] = offset
     if filter:
         # The UI sends `tags: [...]` (catalog lists by a single tag) + `favorite`.
         tags = filter.get("tags") or filter.get("tag")
@@ -212,6 +391,13 @@ async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str,
         fav = filter.get("favorite")
         if isinstance(fav, bool):
             params["favorite"] = fav
+        # Content-safety multi-select -> repeated ?safety= params (catalog lists
+        # by the set). httpx serialises a list value as repeated query params.
+        safety = filter.get("safety")
+        if isinstance(safety, str) and safety:
+            safety = [safety]
+        if isinstance(safety, list) and safety:
+            params["safety"] = list(safety)
     try:
         rows = await catalog("GET", "/images", params=params)
     except DownstreamError:
@@ -227,6 +413,125 @@ async def browse_catalog(limit: int, filter: dict[str, Any] | None) -> dict[str,
         # hit->card mapper (prompt/tags/rating/...) renders without a second fetch.
         hits.append({"sha256": sha, "score": None, "payload": row})
     return {"fusion": "browse", "hits": hits}
+
+
+# ---------------------------------------------------------------------------
+# Cross-service orchestration (shared by the REST routes and the MCP tools)
+#
+# These compose several owning services into one logical operation. They live
+# here — the downstream boundary — so the route layer (app.py) and the MCP tool
+# layer (mcp.py) call the SAME fan-out instead of each re-implementing it. They
+# return plain data / raise DownstreamError; the HTTP-status mapping stays in
+# the route, the tool-error wrapping stays in mcp.py.
+# ---------------------------------------------------------------------------
+async def image_detail(
+    sha256: str,
+    *,
+    similar_limit: int | None = None,
+    neighbor_limit: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate an image's detail (catalog record + search-similar + graph
+    neighbors) in ONE parallel fan-out.
+
+    catalog (the image record) is REQUIRED: its failure propagates so the caller
+    can map it (404 -> not found, else -> unavailable). The derived projections
+    (similar from search, neighbors from graph) are best-effort — a single
+    downstream miss degrades to an empty list so everything else still returns.
+    """
+    async def get_image() -> Any:
+        return await catalog("GET", f"/images/{sha256}")
+
+    async def get_similar() -> Any:
+        body: dict[str, Any] = {"sha256": sha256}
+        if similar_limit is not None:
+            body["limit"] = similar_limit
+        res = await search("POST", "/similar", json=body)
+        return (res or {}).get("hits", [])
+
+    async def get_neighbors() -> Any:
+        params = {"limit": neighbor_limit} if neighbor_limit is not None else None
+        res = await graph("GET", f"/neighbors/{sha256}", params=params)
+        return (res or {}).get("neighbors", [])
+
+    image_r, similar_r, neighbors_r = await asyncio.gather(
+        get_image(), get_similar(), get_neighbors(), return_exceptions=True
+    )
+    if isinstance(image_r, Exception):
+        raise image_r
+    return {
+        "image": image_r,
+        "similar": [] if isinstance(similar_r, Exception) else similar_r,
+        "neighbors": [] if isinstance(neighbors_r, Exception) else neighbors_r,
+    }
+
+
+async def unindex_image(sha256: str) -> dict[str, Any]:
+    """Delete an image's INDEXATION across the stores (catalog record + search
+    vector + graph node), NOT the source file on disk.
+
+    Catalog (truth) goes FIRST and raises on failure BEFORE the projections are
+    touched, so a failed truth-delete can't strand half-removed state. With the
+    record gone, the derived projections are cleaned best-effort in parallel and
+    each per-store outcome is reported in the result.
+    """
+    await catalog("DELETE", f"/images/{sha256}")
+
+    async def del_search() -> bool:
+        await search("DELETE", f"/points/{sha256}")
+        return True
+
+    async def del_graph() -> bool:
+        await graph("DELETE", f"/images/{sha256}")
+        return True
+
+    search_r, graph_r = await asyncio.gather(
+        del_search(), del_graph(), return_exceptions=True
+    )
+    return {
+        "status": "ok",
+        "sha256": sha256,
+        "catalog": True,
+        "search": search_r is True,
+        "graph": graph_r is True,
+    }
+
+
+async def unindex_images(sha256s: list[str]) -> dict[str, Any]:
+    """Bulk un-index MANY images across the stores in ONE call per store.
+
+    The batch counterpart to :func:`unindex_image`: catalog (truth) goes FIRST via
+    its batch-delete and reports which records actually existed; only those are
+    then cleaned from search + graph (best-effort, in parallel) — a single
+    round-trip per store instead of per image. Catalog failure propagates (the
+    caller maps it); the projection cleanups degrade to a per-store ``False``.
+    """
+    requested = list(dict.fromkeys(sha256s))  # de-dupe, keep order
+    cat = await catalog("POST", "/images/batch-delete", json={"sha256s": requested})
+    deleted = list((cat or {}).get("deleted", []))
+    missing = list((cat or {}).get("missing", []))
+
+    async def del_search() -> bool:
+        await search("POST", "/points/batch-delete", json={"sha256s": deleted})
+        return True
+
+    async def del_graph() -> bool:
+        await graph("POST", "/images/batch-delete", json={"sha256s": deleted})
+        return True
+
+    # Nothing actually deleted -> no projections to clean (skip the round-trips).
+    if deleted:
+        search_r, graph_r = await asyncio.gather(
+            del_search(), del_graph(), return_exceptions=True
+        )
+    else:
+        search_r = graph_r = True
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "missing": missing,
+        "search": search_r is True,
+        "graph": graph_r is True,
+    }
 
 
 # Service -> base URL map, for the health dashboard probe.

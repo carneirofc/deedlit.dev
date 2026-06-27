@@ -59,12 +59,12 @@ function withBase(url: string | undefined, fn: () => Promise<void> | void) {
 // Base URL resolution
 // ---------------------------------------------------------------------------
 
-test("base URL defaults to localhost:8080 and strips trailing slashes", () => {
+test("base URL defaults to localhost:8088 and strips trailing slashes", () => {
   withBase("http://gw.test:9000/", () => {
     expect(getGatewayBaseUrl()).toBe("http://gw.test:9000");
   });
   withBase(undefined, () => {
-    expect(getGatewayBaseUrl()).toBe("http://localhost:8080");
+    expect(getGatewayBaseUrl()).toBe("http://localhost:8088");
   });
 });
 
@@ -154,6 +154,7 @@ test("getDetail() GETs /detail/{sha} and image maps to the UI detail shape", asy
       sourceTool: "comfyui",
       rating: 4,
       favorite: true,
+      description: "A studio portrait of a woman in soft light.",
       tags: ["portrait", "studio"],
       params: { seed: 7, steps: 30, cfg: 6.5, sampler: "euler", clipskip: 2, width: 1024, height: 1536 },
       references: [
@@ -192,6 +193,14 @@ test("getDetail() GETs /detail/{sha} and image maps to the UI detail shape", asy
       ]);
       // loras pulled from references
       expect(ui.loras).toEqual([{ name: "detail.safetensors", weight: null }]);
+      // AI description -> single labelagent-attributed entry
+      expect(ui.descriptions).toEqual([
+        {
+          id: `${sha}:deedlit.labelagent`,
+          description: "A studio portrait of a woman in soft light.",
+          provider: "deedlit.labelagent",
+        },
+      ]);
     } finally {
       restoreFetch();
     }
@@ -208,6 +217,20 @@ test("hitToCompactResult prefers tags summary when no prompt, else filename", ()
 
   const named: SearchHit = { sha256: "e".repeat(64), score: 0.5, payload: { filename: "pic.png" } };
   expect(hitToCompactResult(named).summary).toBe("pic.png");
+});
+
+test("hitToCompactResult maps the content-safety class (null when absent/invalid)", () => {
+  const explicit: SearchHit = { sha256: "a".repeat(64), score: 0.1, payload: { safety: "explicit" } };
+  expect(hitToCompactResult(explicit).safety).toBe("explicit");
+  const bogus: SearchHit = { sha256: "b".repeat(64), score: 0.1, payload: { safety: "weird" } };
+  expect(hitToCompactResult(bogus).safety).toBeNull();
+  const none: SearchHit = { sha256: "c".repeat(64), score: 0.1, payload: {} };
+  expect(hitToCompactResult(none).safety).toBeNull();
+});
+
+test("buildSearchFilter keeps a non-empty safety array and drops an empty one", () => {
+  expect(buildSearchFilter({ safety: ["sfw", "nsfw"] })).toEqual({ safety: ["sfw", "nsfw"] });
+  expect(buildSearchFilter({ safety: [] })).toBeNull();
 });
 
 test("buildSearchFilter drops empty/undefined values and returns null when empty", () => {

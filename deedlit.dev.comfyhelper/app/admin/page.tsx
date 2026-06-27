@@ -2,8 +2,11 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import Link from "next/link";
+
 import { PathInput } from "@/components/PathInput";
-import { ServiceStatusBoard } from "@/components/ServiceStatusBoard";
+import { SourceFoldersPanel } from "@/components/SourceFoldersPanel";
+import { normalizePath, splitPaths } from "@/lib/library/paths";
 import { useActivity } from "@/lib/store/activity";
 
 // ---------------------------------------------------------------------------
@@ -21,7 +24,27 @@ interface JobSummary {
   startedAt: string | null;
   finishedAt: string | null;
   createdAt: string;
+  /** Current pipeline stage — which microservice is active right now. */
+  stage: string | null;
+  /** Per-stage reached-count for the expandable staircase. */
+  stageCounts: Record<string, number>;
 }
+
+// Pipeline stages in execution order — drives the expanded per-job staircase so
+// rows render in a stable, meaningful sequence (mirrors deedlit.ingest).
+const PIPELINE_STAGES = [
+  "hash",
+  "metadata",
+  "label",
+  "vision:dense",
+  "vision:sparse",
+  "catalog",
+  "search",
+  "graph",
+] as const;
+
+// Grafana base URL for the trace deep-link (compose maps it to :3002).
+const GRAFANA_URL = process.env.NEXT_PUBLIC_GRAFANA_URL ?? "http://localhost:3002";
 
 interface JobDetail {
   job: JobSummary;
@@ -87,6 +110,12 @@ const MAINTENANCE_ACTIONS: MaintenanceAction[] = [
     endpoint: "/api/library/maintenance/rebuild-neo4j",
   },
   {
+    key: "prune-graph-orphans",
+    label: "Prune graph orphans",
+    description: "Remove orphaned tag/model nodes left behind by deleted images.",
+    endpoint: "/api/library/maintenance/prune-graph-orphans",
+  },
+  {
     key: "regenerate-thumbnails",
     label: "Regenerate thumbnails",
     description: "Generate thumbnails for images missing one.",
@@ -97,6 +126,12 @@ const MAINTENANCE_ACTIONS: MaintenanceAction[] = [
     label: "Rescan files",
     description: "Mark images whose source file vanished as missing.",
     endpoint: "/api/library/maintenance/rescan-files",
+  },
+  {
+    key: "backfill-labels",
+    label: "Backfill labels",
+    description: "Run the labelagent on every image missing an AI description.",
+    endpoint: "/api/library/maintenance/backfill-labels",
   },
 ];
 
@@ -115,6 +150,10 @@ function jobStatusColor(status: string): string {
       return "bg-rose-500/15 text-rose-500";
     case "cancelled":
       return "bg-amber-500/15 text-amber-500";
+    // Left in-flight by an ingest restart (its in-memory worker is gone). A
+    // terminal state — re-trigger the job manually to re-run it.
+    case "interrupted":
+      return "bg-orange-500/15 text-orange-500";
     default:
       return "bg-ui-bg text-ui-ink-muted";
   }
@@ -127,6 +166,9 @@ export default function AdminPage() {
   const [folderPath, setFolderPath] = useState("");
   const [options, setOptions] = useState<IngestOptions>(DEFAULT_INGEST_OPTIONS);
   const [ingestBusy, setIngestBusy] = useState(false);
+  // Bulk one-shot ingest: one path per line, one job dispatched per path.
+  const [multiMode, setMultiMode] = useState(false);
+  const [multiText, setMultiText] = useState("");
 
   // Maintenance
   const [runs, setRuns] = useState<Record<string, ActionRun>>({});
@@ -174,8 +216,51 @@ export default function AdminPage() {
     };
   }, [expanded, jobs]);
 
+  // Dispatch one folder ingest and hand the job to the global activity poller so
+  // its progress shows in the dock from any page. Returns the dispatched job id.
+  const dispatchIngest = async (path: string): Promise<string | null | undefined> => {
+    const name = path.split(/[\\/]/).pop() || path;
+    const j = await fetchJson<{ job_id?: string | null }>(
+      `Ingest ${name}`,
+      "/api/library/ingest/folder",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ folderPath: path, ...options }),
+      },
+    );
+    trackJob(`Ingest ${name}`, j.job_id);
+    return j.job_id;
+  };
+
+  const startIngestMultiple = async () => {
+    const paths = splitPaths(multiText);
+    if (paths.length === 0) {
+      setError("Enter one folder path per line.");
+      return;
+    }
+    setIngestBusy(true);
+    setError(null);
+    setNotice(null);
+    let started = 0;
+    const errors: string[] = [];
+    for (const path of paths) {
+      try {
+        await dispatchIngest(path);
+        started++;
+      } catch (e) {
+        errors.push(`${path}: ${e instanceof Error ? e.message : "failed"}`);
+      }
+    }
+    setIngestBusy(false);
+    if (started > 0) setNotice(`Started ${started} ingestion job${started === 1 ? "" : "s"}.`);
+    if (errors.length) setError(errors.join(" · "));
+    refreshJobs();
+  };
+
   const startIngest = async () => {
-    const path = folderPath.trim();
+    if (multiMode) return startIngestMultiple();
+    const path = normalizePath(folderPath);
     if (!path) {
       setError("Folder path is required.");
       return;
@@ -184,19 +269,8 @@ export default function AdminPage() {
     setError(null);
     setNotice(null);
     try {
-      const j = await fetchJson<{ job_id?: string | null }>(
-        `Ingest ${path.split(/[\\/]/).pop() || path}`,
-        "/api/library/ingest/folder",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ folderPath: path, ...options }),
-        },
-      );
-      // Hand the dispatched job to the global poller so its progress shows in
-      // the activity dock from any page, then keep the page's own jobs list fresh.
-      trackJob(`Ingest ${path.split(/[\\/]/).pop() || path}`, j.job_id);
-      setNotice(`Ingestion started — job ${j.job_id}`);
+      const jobId = await dispatchIngest(path);
+      setNotice(`Ingestion started — job ${jobId}`);
       refreshJobs();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ingest failed");
@@ -249,15 +323,78 @@ export default function AdminPage() {
   return (
     <div className="mx-auto flex max-w-[1400px] flex-col gap-6" data-testid="admin-page">
       {/* Header */}
-      <header>
-        <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
-        <p className="text-ui-sm text-ui-ink-muted">
-          Trigger ingestion &amp; maintenance, monitor service health and jobs.
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Backend Admin</h1>
+          <p className="text-ui-sm text-ui-ink-muted">
+            Trigger ingestion &amp; maintenance and monitor jobs.
+          </p>
+        </div>
+        {/* Deep-link to the distributed traces (one ingest = one cross-service
+            trace tree) for debugging beyond the live board. */}
+        <a
+          href={GRAFANA_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={cls.btn}
+          data-testid="grafana-link"
+        >
+          View traces in Grafana ↗
+        </a>
       </header>
 
-      {/* System status — every backend component + its dependencies */}
-      <ServiceStatusBoard />
+      {/* System health lives on its own page now — link across to it. */}
+      <Link
+        href="/admin/health"
+        className={`${cls.card} flex items-center justify-between gap-3 transition hover:border-accent-cyan/60`}
+        data-testid="health-link"
+      >
+        <span className="flex items-center gap-3">
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-5 w-5 shrink-0 fill-none stroke-accent-cyan"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+          </svg>
+          <span>
+            <span className="block text-ui-sm font-semibold text-ui-ink-title">System Health</span>
+            <span className="block text-ui-2xs text-ui-ink-muted">
+              Live status, dependency readiness &amp; activity for every backend service.
+            </span>
+          </span>
+        </span>
+        <span className="shrink-0 text-ui-sm text-ui-ink-muted">View ↗</span>
+      </Link>
+
+      <Link
+        href="/admin/cache"
+        className={`${cls.card} flex items-center justify-between gap-3 transition hover:border-accent-cyan/60`}
+        data-testid="cache-link"
+      >
+        <span className="flex items-center gap-3">
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-5 w-5 shrink-0 fill-none stroke-accent-cyan"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+          </svg>
+          <span>
+            <span className="block text-ui-sm font-semibold text-ui-ink-title">Image Cache</span>
+            <span className="block text-ui-2xs text-ui-ink-muted">
+              Redis hit rate, entry counts, TTLs &amp; flush control for the thumbnail/original cache.
+            </span>
+          </span>
+        </span>
+        <span className="shrink-0 text-ui-sm text-ui-ink-muted">View ↗</span>
+      </Link>
 
       {error && (
         <p className="text-ui-sm text-rose-500" data-testid="admin-error">
@@ -272,29 +409,66 @@ export default function AdminPage() {
 
       {/* Ingest */}
       <section className={cls.card} data-testid="ingest-panel">
-        <h2 className="mb-3 text-ui-sm font-semibold text-ui-ink-title">Ingest folder</h2>
-        <div className="flex flex-wrap gap-2">
-          <PathInput
-            className="min-w-[14rem] flex-1"
-            inputClassName={`${cls.input} flex-1`}
-            buttonClassName={cls.btn}
-            value={folderPath}
-            onChange={setFolderPath}
-            onEnter={startIngest}
-            placeholder="K:/comfyui/.../ComfyUI/output"
-            pickerTitle="Choose a folder to ingest"
-            inputTestId="ingest-path-input"
-            buttonTestId="ingest-browse"
-          />
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-ui-sm font-semibold text-ui-ink-title">Ingest folder</h2>
           <button
-            className={cls.btn}
-            onClick={startIngest}
-            disabled={ingestBusy}
-            data-testid="ingest-start"
+            type="button"
+            className="text-ui-2xs text-accent-cyan hover:underline"
+            onClick={() => setMultiMode((m) => !m)}
+            data-testid="ingest-multi-toggle"
           >
-            {ingestBusy ? "Starting…" : "Start ingestion"}
+            {multiMode ? "← Single folder" : "Ingest multiple +"}
           </button>
         </div>
+        {multiMode ? (
+          <div className="flex flex-col gap-2">
+            <textarea
+              className={`${cls.input} min-h-[5rem] font-mono`}
+              value={multiText}
+              onChange={(e) => setMultiText(e.target.value)}
+              placeholder={"One folder path per line\nK:/comfyui/output\n/mnt/share/renders"}
+              spellCheck={false}
+              data-testid="ingest-multi-input"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                className={cls.btn}
+                onClick={startIngest}
+                disabled={ingestBusy}
+                data-testid="ingest-start"
+              >
+                {ingestBusy ? "Starting…" : "Start ingestion"}
+              </button>
+              <span className="text-ui-2xs text-ui-ink-muted">
+                {splitPaths(multiText).length} path{splitPaths(multiText).length === 1 ? "" : "s"} · one job each
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-start gap-2">
+            <PathInput
+              className="min-w-[14rem] flex-1"
+              inputClassName={`${cls.input} flex-1`}
+              buttonClassName={cls.btn}
+              value={folderPath}
+              onChange={setFolderPath}
+              onEnter={startIngest}
+              placeholder="K:/comfyui/.../ComfyUI/output"
+              pickerTitle="Choose a folder to ingest"
+              inputTestId="ingest-path-input"
+              buttonTestId="ingest-browse"
+              showPreview
+            />
+            <button
+              className={cls.btn}
+              onClick={startIngest}
+              disabled={ingestBusy}
+              data-testid="ingest-start"
+            >
+              {ingestBusy ? "Starting…" : "Start ingestion"}
+            </button>
+          </div>
+        )}
 
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2">
           {(Object.keys(DEFAULT_INGEST_OPTIONS) as Array<keyof IngestOptions>).map((key) => (
@@ -314,6 +488,9 @@ export default function AdminPage() {
           ))}
         </div>
       </section>
+
+      {/* Configured source folders — persistent registry + per-folder auto-scan */}
+      <SourceFoldersPanel />
 
       {/* Maintenance */}
       <section className={cls.card} data-testid="maintenance-panel">
@@ -390,6 +567,15 @@ export default function AdminPage() {
                       <span className="min-w-0 flex-1 truncate text-ui-xs text-ui-ink">
                         {j.folderPath ?? "—"}
                       </span>
+                      {ACTIVE_JOB_STATUSES.has(j.status) && j.stage && (
+                        <span
+                          className="shrink-0 rounded-full bg-sky-500/10 px-1.5 py-0.5 text-ui-2xs font-medium text-sky-500"
+                          title="active pipeline stage — the microservice working now"
+                          data-testid={`job-stage-${j.id}`}
+                        >
+                          {j.stage}
+                        </span>
+                      )}
                       <span className="shrink-0 text-ui-2xs text-ui-ink-muted">
                         {j.processedFiles}/{j.totalFiles} ({pct}%)
                         {j.failedFiles > 0 ? ` · ${j.failedFiles} err` : ""}
@@ -424,6 +610,34 @@ export default function AdminPage() {
                       </div>
                       {j.errorMessage && (
                         <p className="mt-1 text-rose-500">error: {j.errorMessage}</p>
+                      )}
+                      {/* Per-stage staircase: how far each microservice has
+                          carried this job's files (which service is the
+                          bottleneck / where failures stall). */}
+                      {Object.keys(j.stageCounts).length > 0 && (
+                        <div className="mt-2" data-testid={`job-stages-${j.id}`}>
+                          <p className="font-medium text-ui-ink">Pipeline stages</p>
+                          <div className="mt-1 flex flex-col gap-0.5">
+                            {PIPELINE_STAGES.filter((s) => s in j.stageCounts).map((s) => {
+                              const reached = j.stageCounts[s] ?? 0;
+                              const w = j.totalFiles > 0 ? Math.round((reached / j.totalFiles) * 100) : 0;
+                              return (
+                                <div key={s} className="flex items-center gap-2">
+                                  <span className="w-24 shrink-0 truncate text-ui-ink">{s}</span>
+                                  <div className="h-1 flex-1 overflow-hidden rounded-full bg-ui-bg-soft">
+                                    <div
+                                      className="h-full rounded-full bg-accent-cyan/70"
+                                      style={{ width: `${w}%` }}
+                                    />
+                                  </div>
+                                  <span className="w-14 shrink-0 text-right tabular-nums">
+                                    {reached}/{j.totalFiles}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
                       )}
                       {detail && detail.job.id === j.id && detail.failedFiles.length > 0 && (
                         <div className="mt-2">

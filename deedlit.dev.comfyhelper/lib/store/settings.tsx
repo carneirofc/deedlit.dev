@@ -16,6 +16,46 @@ export type BrowseMode = "browse" | "semantic" | "image";
 export type ViewMode = "grid" | "list" | "masonry";
 export type GridDensity = "compact" | "comfortable" | "spacious";
 export type ImageFit = "contain" | "cover";
+/** How browse results are sectioned. `none` = one flat grid; `folder` = split
+ *  into collapsible sections by source directory (browse path only). */
+export type GroupByMode = "none" | "folder";
+
+/** AI content-safety class. Mirrors the catalog/labelagent `safety` enum. */
+export type SafetyClass = "sfw" | "nsfw" | "explicit";
+export const SAFETY_CLASSES: readonly SafetyClass[] = ["sfw", "nsfw", "explicit"] as const;
+export const SAFETY_LABEL: Record<SafetyClass, string> = {
+  sfw: "SFW",
+  nsfw: "NSFW",
+  explicit: "Explicit",
+};
+
+/**
+ * Result ordering. `relevance` is the vector-search ranking (only meaningful
+ * when there is a text/image query); the rest are server-side catalog sorts used
+ * by the filter-only browse grid. Mirrors the catalog `sort` enum + relevance.
+ */
+export type SortMode =
+  | "relevance"
+  | "newest"
+  | "oldest"
+  | "created_desc"
+  | "created_asc"
+  | "rating_desc"
+  | "rating_asc"
+  | "name_asc"
+  | "name_desc";
+
+export const SORT_MODES: readonly SortMode[] = [
+  "relevance",
+  "newest",
+  "oldest",
+  "created_desc",
+  "created_asc",
+  "rating_desc",
+  "rating_asc",
+  "name_asc",
+  "name_desc",
+] as const;
 
 /**
  * User-tunable preferences for the image library UI.  Persisted to
@@ -32,6 +72,13 @@ export interface LibrarySettings {
   infiniteScroll: boolean;
   /** How result cards are laid out. */
   viewMode: ViewMode;
+  /** Result ordering. Defaults to newest-first for browse; relevance is applied
+   * automatically when a text/image query is active. */
+  sortMode: SortMode;
+  /** Split browse results into collapsible sections by source directory.
+   * `none` = one flat grid (default). Only applies on the filter-only browse
+   * path; the vector-search results have no directory to group by. */
+  groupBy: GroupByMode;
   /** Card size / column count for grid & masonry views. */
   gridDensity: GridDensity;
   /** Show the similarity-score chip on cards. */
@@ -45,6 +92,8 @@ export interface LibrarySettings {
   /** Load the full-resolution original instead of the thumbnail in the viewer. */
   viewerFullResolution: boolean;
   showPrompt: boolean;
+  /** Show the AI-generated description panel on the detail page. */
+  showDescription: boolean;
   showGenerationParams: boolean;
   showRelationshipGraph: boolean;
   /** Relationship-graph hop depth (1–3). */
@@ -67,6 +116,20 @@ export interface LibrarySettings {
   defaultFavoritesOnly: boolean;
   /** Default minimum score for semantic / similar / by-image searches. */
   defaultMinScore: number;
+  /**
+   * Content-safety classes the browse/search grid shows by default. All three
+   * (or none) selected = no filter (everything, incl. unclassified); a strict
+   * subset hides the unlisted classes. Seeds the library page's safety chips.
+   */
+  defaultSafety: SafetyClass[];
+
+  // --- Slideshow (fullscreen viewer) ---
+  /** Seconds each image is shown before the slideshow auto-advances. */
+  slideshowInterval: number;
+  /** Loop back to the first image after the last one. */
+  slideshowLoop: boolean;
+  /** Advance to a random image instead of the next in order. */
+  slideshowShuffle: boolean;
 }
 
 export const DEFAULT_SETTINGS: LibrarySettings = {
@@ -74,6 +137,8 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   defaultMode: "browse",
   infiniteScroll: false,
   viewMode: "grid",
+  sortMode: "newest",
+  groupBy: "none",
   gridDensity: "comfortable",
   showScores: true,
   showCardMeta: true,
@@ -81,6 +146,7 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   viewerImageFit: "contain",
   viewerFullResolution: false,
   showPrompt: true,
+  showDescription: true,
   showGenerationParams: true,
   showRelationshipGraph: true,
   graphDepth: 1,
@@ -95,6 +161,11 @@ export const DEFAULT_SETTINGS: LibrarySettings = {
   defaultMinRating: 0,
   defaultFavoritesOnly: false,
   defaultMinScore: 0,
+  defaultSafety: ["sfw", "nsfw", "explicit"],
+
+  slideshowInterval: 5,
+  slideshowLoop: true,
+  slideshowShuffle: false,
 };
 
 const clamp = (value: number, min: number, max: number): number =>
@@ -116,12 +187,21 @@ function mergeSettings(raw: unknown): LibrarySettings {
       : (DEFAULT_SETTINGS[k] as number);
   const oneOf = <T extends string>(k: keyof LibrarySettings, allowed: readonly T[]): T =>
     allowed.includes(r[k] as T) ? (r[k] as T) : (DEFAULT_SETTINGS[k] as unknown as T);
+  // Sanitize a stored multi-select against the allowed set (drop junk, de-dupe);
+  // a non-array falls back to the default.
+  const subsetOf = <T extends string>(k: keyof LibrarySettings, allowed: readonly T[]): T[] => {
+    const v = r[k];
+    if (!Array.isArray(v)) return [...(DEFAULT_SETTINGS[k] as T[])];
+    return Array.from(new Set(v.filter((x): x is T => allowed.includes(x as T))));
+  };
 
   return {
     pageSize: num("pageSize", 10, 200),
     defaultMode: oneOf("defaultMode", ["browse", "semantic", "image"] as const),
     infiniteScroll: bool("infiniteScroll"),
     viewMode: oneOf("viewMode", ["grid", "list", "masonry"] as const),
+    sortMode: oneOf("sortMode", SORT_MODES),
+    groupBy: oneOf("groupBy", ["none", "folder"] as const),
     gridDensity: oneOf("gridDensity", ["compact", "comfortable", "spacious"] as const),
     showScores: bool("showScores"),
     showCardMeta: bool("showCardMeta"),
@@ -129,6 +209,7 @@ function mergeSettings(raw: unknown): LibrarySettings {
     viewerImageFit: oneOf("viewerImageFit", ["contain", "cover"] as const),
     viewerFullResolution: bool("viewerFullResolution"),
     showPrompt: bool("showPrompt"),
+    showDescription: bool("showDescription"),
     showGenerationParams: bool("showGenerationParams"),
     showRelationshipGraph: bool("showRelationshipGraph"),
     graphDepth: num("graphDepth", 1, 3),
@@ -143,6 +224,11 @@ function mergeSettings(raw: unknown): LibrarySettings {
     defaultMinRating: num("defaultMinRating", 0, 5),
     defaultFavoritesOnly: bool("defaultFavoritesOnly"),
     defaultMinScore: num("defaultMinScore", 0, 1),
+    defaultSafety: subsetOf("defaultSafety", SAFETY_CLASSES),
+
+    slideshowInterval: num("slideshowInterval", 1, 60),
+    slideshowLoop: bool("slideshowLoop"),
+    slideshowShuffle: bool("slideshowShuffle"),
   };
 }
 
@@ -214,15 +300,18 @@ export function useSettings(): SettingsValue {
 // ---------------------------------------------------------------------------
 
 const GRID_COLUMNS: Record<GridDensity, string> = {
-  compact: "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 2xl:grid-cols-8",
-  comfortable: "grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6",
-  spacious: "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4",
+  compact:
+    "grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 2xl:grid-cols-8 3xl:grid-cols-10 4xl:grid-cols-12 5xl:grid-cols-14",
+  comfortable:
+    "grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 3xl:grid-cols-8 4xl:grid-cols-10 5xl:grid-cols-12",
+  spacious:
+    "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6 4xl:grid-cols-8",
 };
 
 const MASONRY_COLUMNS: Record<GridDensity, string> = {
-  compact: "columns-3 sm:columns-4 lg:columns-6 xl:columns-7",
-  comfortable: "columns-2 sm:columns-3 lg:columns-4 xl:columns-5",
-  spacious: "columns-1 sm:columns-2 lg:columns-3",
+  compact: "columns-3 sm:columns-4 lg:columns-6 xl:columns-7 2xl:columns-8 3xl:columns-10 4xl:columns-12 5xl:columns-14",
+  comfortable: "columns-2 sm:columns-3 lg:columns-4 xl:columns-5 2xl:columns-6 3xl:columns-8 4xl:columns-10 5xl:columns-12",
+  spacious: "columns-1 sm:columns-2 lg:columns-3 xl:columns-4 2xl:columns-5 3xl:columns-6 4xl:columns-8",
 };
 
 export function gridColumnsClass(density: GridDensity): string {

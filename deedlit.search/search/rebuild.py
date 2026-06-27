@@ -9,6 +9,12 @@ Each catalog item is expected to carry the vectors to index:
   - ``payload``: optional extra payload to store alongside the point
 Items without a ``dense`` vector are skipped (nothing to index on).
 
+NOTE: this inline-vector rebuild does NOT populate the ``description`` named
+vector — the catalog ``/images`` record's ``description`` is the AI *text*, not a
+vector. The description vector is (re)built through the ingest DAG rebuild
+(REBUILD_SEARCH republishes the embed stages), which embeds the description text
+on the GPU and upserts it via ``POST /points``.
+
 The catalog HTTP call is isolated in ``fetch_catalog_images`` so tests can mock
 it without requiring a running catalog.
 """

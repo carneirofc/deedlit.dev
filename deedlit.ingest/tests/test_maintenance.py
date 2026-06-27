@@ -15,6 +15,7 @@ Covered:
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 
@@ -55,26 +57,32 @@ def fresh_store(monkeypatch):
 
 @pytest.fixture
 def mock_outbound(monkeypatch):
-    """Mock metadata/vision/fan-out so the pipeline runs offline."""
-    calls: dict = {"fanout": [], "extract": 0, "image": 0, "sparse": 0}
+    """Record every broker publish the producer makes (queue-driven, offline).
 
-    def fake_extract(data, filename, mime):
-        calls["extract"] += 1
-        return {
-            "sourceTool": "a1111",
-            "prompt": "a red knight",
-            "negative": None,
-            "tags": ["red", "knight"],
-            "params": {"seed": 1},
-            "references": {"checkpoints": [], "loras": []},
-            "workflow_json": None,
-            "api_prompt_json": None,
-        }
+    ``pub_ingest`` records ``ingest`` task enqueues (folder-walk / rescan);
+    ``pub_dense``/``pub_sparse``/``pub_graph``/``pub_label`` record the per-stage
+    DAG publishes (reindex reproject + any direct stage publish).
+    """
+    calls: dict = {
+        "pub_ingest": [],
+        "pub_dense": [], "pub_sparse": [], "pub_graph": [], "pub_label": [],
+    }
 
-    monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
-    monkeypatch.setattr(pipeline, "embed_image", lambda d, f, m: [0.1, 0.2])
-    monkeypatch.setattr(pipeline, "embed_sparse", lambda t: {"indices": [1], "values": [0.5]})
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: calls["fanout"].append(rec))
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        calls["pub_ingest"].append(path)
+
+    def _record(key):
+        async def pub(sha256, parent_op_id=None, **kwargs):
+            calls[key].append(sha256)
+        return pub
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("pub_dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("pub_sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("pub_graph"))
+    monkeypatch.setattr(broker_module, "publish_label_task", _record("pub_label"))
+    # No catalog in tests: "nothing cataloged" so a rescan enqueues every file.
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     return calls
 
 
@@ -92,17 +100,8 @@ def _wait_for(client: TestClient, job_id: str, statuses: set[str], timeout: floa
 # ---------------------------------------------------------------------------
 # (1) reindex-one-image
 # ---------------------------------------------------------------------------
-def test_reindex_one_image_runs_and_reports_progress(fresh_store, mock_outbound, monkeypatch):
+def test_reindex_one_image_republishes_projection_stages(fresh_store, mock_outbound):
     sha = "a" * 64
-    data = _png_bytes((10, 20, 30))
-
-    fetched: list[str] = []
-
-    def fake_fetch(sha256):
-        fetched.append(sha256)
-        return data, "image/png"
-
-    monkeypatch.setattr(pipeline, "fetch_image_bytes", fake_fetch)
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": "reindex-one-image", "sha256": sha})
@@ -117,9 +116,13 @@ def test_reindex_one_image_runs_and_reports_progress(fresh_store, mock_outbound,
         assert final["progress"]["total"] == 1
         assert final["progress"]["done"] == 1
 
-    assert fetched == [sha]
-    # The single image was re-run through the pipeline and fanned out.
-    assert len(mock_outbound["fanout"]) == 1
+    # The image is re-projected via the queue: embed.dense + embed.sparse (which
+    # fan into index.search) + index.graph — from catalog truth, no inline pipeline.
+    assert mock_outbound["pub_dense"] == [sha]
+    assert mock_outbound["pub_sparse"] == [sha]
+    assert mock_outbound["pub_graph"] == [sha]
+    # reindex does NOT re-label (that is the separate label task / label-backfill).
+    assert mock_outbound["pub_label"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +146,10 @@ def test_rescan_files_walks_library_root(tmp_path, fresh_store, mock_outbound, m
         assert final["progress"]["done"] == 3
         assert final["progress"]["skipped"] == 0
 
-    assert len(mock_outbound["fanout"]) == 3
+    # rescan walks the root and PUBLISHES one ingest task per file — the worker
+    # pool catalogs + projects them; the producer does no inline work.
+    assert len(mock_outbound["pub_ingest"]) == 3
+    assert all(str(tmp_path) in p for p in mock_outbound["pub_ingest"])
 
 
 def test_rescan_files_accepts_explicit_root(tmp_path, fresh_store, mock_outbound):
@@ -160,43 +166,93 @@ def test_rescan_files_accepts_explicit_root(tmp_path, fresh_store, mock_outbound
 # ---------------------------------------------------------------------------
 # (3) rebuild-* types start and complete (driving the owning service directly)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "rtype,func_name",
-    [
-        ("rebuild-search", "rebuild_search"),       # search POST /rebuild
-        ("rebuild-graph", "rebuild_graph"),         # graph  POST /rebuild
-        ("rebuild-thumbnails", "rebuild_thumbnails"),  # catalog-owned rebuild
-    ],
-)
-def test_rebuild_types_drive_owning_service(fresh_store, monkeypatch, rtype, func_name):
+def test_rebuild_thumbnails_drives_catalog_rebuild(fresh_store, monkeypatch):
+    """rebuild-thumbnails stays a catalog-owned rebuild (thumbnails are catalog
+    blobs, not a queue projection)."""
     triggered: list[str] = []
+    monkeypatch.setattr(
+        pipeline, "rebuild_thumbnails", lambda: triggered.append("thumbnails") or {"ok": True}
+    )
 
-    def make_fake(name):
-        def fake():
-            triggered.append(name)
-            return {"ok": True}
+    with TestClient(app_module.app) as client:
+        r = client.post("/jobs", json={"type": "rebuild-thumbnails"})
+        assert r.status_code == 202
+        job_id = r.json()["id"]
+        final = _wait_for(client, job_id, {"completed", "failed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["total"] == 1
+        assert final["progress"]["done"] == 1
 
+    assert triggered == ["thumbnails"]
+
+
+@pytest.mark.parametrize("rtype", ["rebuild-search", "rebuild-graph"])
+def test_rebuild_search_graph_bulk_reproject(fresh_store, monkeypatch, rtype):
+    """rebuild-search / rebuild-graph are bulk PRODUCERS (ADR 0002): they
+    re-publish the projection stages (embed.dense + embed.sparse -> index.search,
+    plus index.graph) per cataloged image, instead of calling an owning-service
+    /rebuild inline."""
+    monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: ["a" * 64, "b" * 64])
+    pub: dict[str, list[str]] = {"embed.dense": [], "embed.sparse": [], "index.graph": []}
+
+    def _record(key):
+        async def fake(sha256, parent_op_id=None):
+            pub[key].append(sha256)
         return fake
 
-    # Mock every owning-service rebuild so we can assert exactly one fired.
-    monkeypatch.setattr(pipeline, "rebuild_search", make_fake("rebuild_search"))
-    monkeypatch.setattr(pipeline, "rebuild_graph", make_fake("rebuild_graph"))
-    monkeypatch.setattr(pipeline, "rebuild_thumbnails", make_fake("rebuild_thumbnails"))
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("embed.dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("embed.sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("index.graph"))
 
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": rtype})
         assert r.status_code == 202
-        body = r.json()
-        assert body["type"] == rtype
-        job_id = body["id"]
-
+        job_id = r.json()["id"]
         final = _wait_for(client, job_id, {"completed", "failed"})
         assert final["status"] == "completed"
-        # A rebuild is a single unit of work.
+        assert final["progress"]["total"] == 2
+        assert final["progress"]["done"] == 2
+
+    for key in pub:
+        assert sorted(pub[key]) == ["a" * 64, "b" * 64], key
+
+
+# ---------------------------------------------------------------------------
+# (3b) prune-graph-orphans drives graph POST /prune + reports counts
+# ---------------------------------------------------------------------------
+def test_prune_graph_orphans_drives_graph_prune(fresh_store, monkeypatch):
+    """prune-graph-orphans is a single opaque unit owned by deedlit.graph: it
+    calls graph POST /prune once and stashes the deletion counts in the report."""
+    triggered: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "prune_graph_orphans",
+        lambda: triggered.append("prune")
+        or {"status": "ok", "assets_deleted": 3, "tags_deleted": 5, "dry_run": False},
+    )
+
+    with TestClient(app_module.app) as client:
+        r = client.post("/jobs", json={"type": "prune-graph-orphans"})
+        assert r.status_code == 202
+        body = r.json()
+        assert body["type"] == "prune-graph-orphans"
+        job_id = body["id"]
+        final = _wait_for(client, job_id, {"completed", "failed"})
+        assert final["status"] == "completed"
         assert final["progress"]["total"] == 1
         assert final["progress"]["done"] == 1
+        # The graph's deletion counts surface in the job report for the UI.
+        assert final["report"]["assets_deleted"] == 3
+        assert final["report"]["tags_deleted"] == 5
 
-    assert triggered == [func_name]
+    assert triggered == ["prune"]
+
+
+def test_prune_orphan_tick_enqueues_job(fresh_store):
+    """The opt-in scheduler's tick enqueues exactly one prune-graph-orphans job."""
+    job = jobs_module.run_orphan_prune_tick(fresh_store)
+    assert job.type == "prune-graph-orphans"
+    assert fresh_store.get(job.id) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +261,14 @@ def test_rebuild_types_drive_owning_service(fresh_store, monkeypatch, rtype, fun
 def test_rescan_files_cancellable_mid_run(tmp_path, fresh_store, monkeypatch):
     _write_pngs(tmp_path, [(i, 0, 0) for i in range(0, 60, 6)])  # 10 distinct images
 
-    def slow_process(data, filename):
-        time.sleep(0.05)
-        return pipeline.IngestRecord(
-            sha256=pipeline.compute_sha256(data),
-            record={}, point={}, edges={}, thumbnail=None,
-        )
+    # Slow publish so cancel can land mid-run. Pin to serial so the cancel point
+    # is deterministic (this test is about cancellation, not concurrency).
+    async def slow_publish(path, source_folder_id=None, parent_op_id=None):
+        await asyncio.sleep(0.05)
 
-    monkeypatch.setattr(pipeline, "process_file", slow_process)
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: None)
+    monkeypatch.setenv("INGEST_CONCURRENCY", "1")
+    monkeypatch.setattr(broker_module, "publish_ingest_task", slow_publish)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
 
     with TestClient(app_module.app) as client:
         job_id = client.post(

@@ -1,0 +1,49 @@
+# Production orchestrator. mprocs runs every LOCAL service (the UI + API gateway +
+# backend services) on the host; the DATASTORES + broker run in Docker, exactly as
+# in dev (npm run prod:infra). Like mprocs.yaml, mprocs wraps each child in a Win32
+# Job Object so quitting (q) / restarting (r) kills the whole process tree.
+#
+# This is the PRODUCTION counterpart of mprocs.yaml — same services, but:
+#   - the Next apps run their PRODUCTION build (next start / standalone), not next dev
+#   - uvicorn runs without --reload (the dev:* commands already omit it)
+#
+#   npm run prod:all     # docker infra + migrate + build + run everything here
+#   npm run prod:infra   # bring up the docker datastores/broker + migrate
+#   npm run prod:build   # production-build the UI apps (run before `prod`)
+#   npm run prod         # run the built apps (infra must already be up)
+#
+# Datastores are NOT managed here — Docker owns their lifecycle (prod:infra).
+# The backend services bind 127.0.0.1 (reached over localhost by each other and by
+# the Next servers); only the gateway (api) and the two Next apps are host-exposed.
+
+procs:
+  comfyhelper:
+    shell: "npm run start:comfyhelper"   # Next comfyhelper (prod) -> :3000
+  ui:
+    shell: "npm run start:dev"           # Next landing (prod)     -> :3001
+  api:
+    shell: "npm run start:api"           # BFF gateway             -> :8088 (0.0.0.0)
+  catalog:
+    shell: "npm run start:catalog"       # -> 127.0.0.1:8001
+  search:
+    shell: "npm run start:search"        # -> 127.0.0.1:8002
+  graph:
+    shell: "npm run start:graph"         # -> 127.0.0.1:8003
+  ingest:
+    shell: "npm run start:ingest"        # -> 127.0.0.1:8004
+  ingest-worker:
+    # RabbitMQ consumer (ADR 0002): drains the per-stage DAG queues and builds the
+    # search+graph projections. Same codebase as ingest, run as a consumer (no
+    # port). One local worker drains every queue; run_worker still gives `label`
+    # its own prefetch-1 exclusive channel, so a combined local worker is fine.
+    shell: "npm run start:ingest-worker"
+    env:
+      QUEUES: "ingest,embed.dense,embed.sparse,index.search,index.graph,label"
+  metadata:
+    shell: "npm run start:metadata"      # -> 127.0.0.1:8005
+  labelagent:
+    shell: "npm run start:labelagent"    # -> 127.0.0.1:8006 (needs llama-server on :8888)
+
+  # GPU vision service
+  vision:
+    shell: "npm run start:vision"        # -> 127.0.0.1:8000

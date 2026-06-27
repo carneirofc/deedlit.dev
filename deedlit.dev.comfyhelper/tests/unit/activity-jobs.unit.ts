@@ -35,6 +35,8 @@ function snapshot(over: Partial<JobSnapshot> = {}): JobSnapshot {
     processedFiles: 3,
     failedFiles: 0,
     errorMessage: null,
+    stage: null,
+    stageCounts: {},
     ...over,
   };
 }
@@ -78,6 +80,14 @@ test("a cancelled job errors with a 'cancelled' fallback message", () => {
   const out = applyJobToActivity(jobActivity(), snapshot({ status: "cancelled" }), NOW);
   expect(out.status).toBe("error");
   expect(out.message).toBe("cancelled");
+});
+
+test("an interrupted job (ingest restart) settles to error, not perpetual poll", () => {
+  const out = applyJobToActivity(jobActivity(), snapshot({ status: "interrupted" }), NOW);
+  expect(out.status).toBe("error");
+  expect(out.message).toBe("interrupted (service restarted)");
+  expect(out.endedAt).toBe(NOW);
+  expect(TERMINAL_JOB_STATUSES.has("interrupted")).toBe(true);
 });
 
 test("returns the same reference when nothing changed", () => {
@@ -162,6 +172,8 @@ test("normalizeJob coerces fields and tolerates junk", () => {
     processedFiles: 2,
     failedFiles: 1,
     errorMessage: "x",
+    stage: null,
+    stageCounts: {},
   });
 
   expect(normalizeJob(null)).toEqual({
@@ -171,7 +183,41 @@ test("normalizeJob coerces fields and tolerates junk", () => {
     processedFiles: 0,
     failedFiles: 0,
     errorMessage: null,
+    stage: null,
+    stageCounts: {},
   });
+});
+
+test("normalizeJob reads the live stage from camelCase or snake_case", () => {
+  // camelCase (the /api/library/jobs route shape)
+  expect(normalizeJob({ id: "j", stage: "vision:dense", stageCounts: { metadata: 5 } })).toMatchObject({
+    stage: "vision:dense",
+    stageCounts: { metadata: 5 },
+  });
+  // snake_case (the raw ingest service shape)
+  expect(normalizeJob({ id: "j", current_stage: "catalog", stage_counts: { catalog: 2 } })).toMatchObject({
+    stage: "catalog",
+    stageCounts: { catalog: 2 },
+  });
+  // junk stage_counts entries are dropped
+  expect(normalizeJob({ id: "j", stage_counts: { good: 3, bad: "x" } }).stageCounts).toEqual({ good: 3 });
+});
+
+test("applyJobToActivity carries the active stage and clears it on settle", () => {
+  // In flight: the activity gains the job's current stage.
+  const running = applyJobToActivity(jobActivity(), snapshot({ stage: "vision:dense" }), NOW);
+  expect(running.stage).toBe("vision:dense");
+
+  // A change in stage alone (counts unchanged) is not "same" — must update.
+  const a = jobActivity({ stage: "metadata", progress: { processed: 3, total: 10, failed: 0 } });
+  const moved = applyJobToActivity(a, snapshot({ stage: "label", processedFiles: 3 }), NOW);
+  expect(moved).not.toBe(a);
+  expect(moved.stage).toBe("label");
+
+  // Settled: no service is working, so the stage clears.
+  const done = applyJobToActivity(jobActivity(), snapshot({ status: "completed", stage: "graph" }), NOW);
+  expect(done.status).toBe("success");
+  expect(done.stage).toBeNull();
 });
 
 test("errorMessage extracts from Error / string / fallback", () => {

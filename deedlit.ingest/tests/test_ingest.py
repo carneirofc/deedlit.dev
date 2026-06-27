@@ -1,11 +1,14 @@
-"""Tests for the deedlit.ingest job lifecycle + single-file pipeline + fan-out.
+"""Tests for the deedlit.ingest job lifecycle + the ``ingest`` queue stage.
 
-All outbound HTTP (metadata, vision, and the catalog/search/graph fan-out) is
-monkeypatched so the suite is deterministic and offline. Images are tiny PNGs
-built with Pillow.
+Ingest is FULLY QUEUE-DRIVEN (ADR 0001/0002): a folder scan only PUBLISHES one
+``ingest`` task per file — the worker pool reads the bytes, catalogs them, and
+fans out the per-stage DAG. The producer does no processing and has no inline
+fallback, so RabbitMQ is the durability boundary. All broker publishes are
+monkeypatched so the suite is deterministic and offline; images are tiny PNGs.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -15,6 +18,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 
@@ -39,49 +43,28 @@ def _write_pngs(folder: Path, colors: list[tuple[int, int, int]]) -> list[Path]:
 
 @pytest.fixture
 def fresh_store(monkeypatch):
-    """Give each test a clean in-memory JobStore (fresh dedup set)."""
+    """Give each test a clean in-memory JobStore."""
     store = jobs_module.JobStore()
     monkeypatch.setattr(app_module, "store", store)
     return store
 
 
 @pytest.fixture
-def mock_outbound(monkeypatch):
-    """Mock metadata/vision/fan-out so the pipeline runs offline.
+def mock_publish(monkeypatch):
+    """Record the ``ingest`` task publishes — the producer's only outbound call.
 
-    Returns a dict recording the fan-out calls in order so tests can assert
-    catalog-first ordering and retry behavior.
+    Returns a dict whose ``pub_ingest`` list holds every published file path so a
+    folder-scan test can assert one enqueue per file.
     """
-    calls: dict = {"fanout": [], "extract": 0, "image": 0, "sparse": 0}
+    calls: dict = {"pub_ingest": []}
 
-    def fake_extract(data, filename, mime):
-        calls["extract"] += 1
-        return {
-            "sourceTool": "a1111",
-            "prompt": "a red knight",
-            "negative": None,
-            "tags": ["red", "knight"],
-            "params": {"seed": 1, "steps": 20},
-            "references": {"checkpoints": [{"name": "sdxl", "hash": None}], "loras": []},
-            "workflow_json": None,
-            "api_prompt_json": None,
-        }
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        calls["pub_ingest"].append(path)
 
-    def fake_image(data, filename, mime):
-        calls["image"] += 1
-        return [0.1, 0.2, 0.3]
-
-    def fake_sparse(text):
-        calls["sparse"] += 1
-        return {"indices": [1, 2], "values": [0.5, 0.7]}
-
-    def fake_fanout(rec):
-        calls["fanout"].append(rec)
-
-    monkeypatch.setattr(pipeline, "extract_metadata", fake_extract)
-    monkeypatch.setattr(pipeline, "embed_image", fake_image)
-    monkeypatch.setattr(pipeline, "embed_sparse", fake_sparse)
-    monkeypatch.setattr(pipeline, "fan_out_writes", fake_fanout)
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+    # No catalog in tests: "nothing cataloged" so a folder scan enqueues every
+    # file. The incremental dedup-skip path has its own test below.
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     return calls
 
 
@@ -98,9 +81,9 @@ def _wait_for(client: TestClient, job_id: str, statuses: set[str], timeout: floa
 
 
 # ---------------------------------------------------------------------------
-# (1) POST /ingest returns a job and processes files
+# (1) POST /ingest enqueues one ingest task per file
 # ---------------------------------------------------------------------------
-def test_ingest_returns_job_and_processes_files(tmp_path, fresh_store, mock_outbound):
+def test_ingest_returns_job_and_enqueues_each_file(tmp_path, fresh_store, mock_publish):
     _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
     with TestClient(app_module.app) as client:
         r = client.post("/ingest", json={"folderPath": str(tmp_path)})
@@ -113,36 +96,68 @@ def test_ingest_returns_job_and_processes_files(tmp_path, fresh_store, mock_outb
         final = _wait_for(client, job_id, {"completed"})
         assert final["status"] == "completed"
         assert final["progress"]["total"] == 3
-        assert final["progress"]["done"] == 3
+        assert final["progress"]["done"] == 3  # done counts files ENQUEUED
         assert final["progress"]["skipped"] == 0
         assert final["progress"]["failed"] == 0
-    assert len(mock_outbound["fanout"]) == 3
+    # One ingest task per file, each carrying the real on-disk path so the worker
+    # can read the bytes off the shared disk.
+    assert len(mock_publish["pub_ingest"]) == 3
+    assert all(str(tmp_path) in p for p in mock_publish["pub_ingest"])
 
 
 # ---------------------------------------------------------------------------
-# (2) sha256 dedup — re-running the same folder skips unchanged
+# (2c) incremental scan: files already cataloged (by path) are skipped, so a
+# scheduled re-walk / re-ingest of an unchanged library enqueues nothing — the
+# fix for the re-enqueue storm that re-embedded + re-labelled everything per scan.
 # ---------------------------------------------------------------------------
-def test_dedup_skips_unchanged_on_rerun(tmp_path, fresh_store, mock_outbound):
+def test_already_cataloged_files_are_skipped(tmp_path, fresh_store, monkeypatch):
+    paths = _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
+    # Catalog already holds the first two (forward-slash normalized, as the real
+    # boundary returns); the third is new.
+    cataloged = {str(paths[0]).replace("\\", "/"), str(paths[1]).replace("\\", "/")}
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: cataloged)
+    published: list[str] = []
+
+    async def fake_publish_ingest(path, source_folder_id=None, parent_op_id=None):
+        published.append(path)
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", fake_publish_ingest)
+
+    with TestClient(app_module.app) as client:
+        job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
+        final = _wait_for(client, job_id, {"completed"})
+        assert final["status"] == "completed"
+        assert final["progress"]["total"] == 3
+        assert final["progress"]["skipped"] == 2  # the two already-cataloged
+        assert final["progress"]["done"] == 1  # only the new file enqueued
+    assert len(published) == 1
+    assert published[0].replace("\\", "/") == str(paths[2]).replace("\\", "/")
+
+
+# ---------------------------------------------------------------------------
+# (2b) broker down -> files fail (no inline fallback; RabbitMQ is required)
+# ---------------------------------------------------------------------------
+def test_broker_down_marks_files_failed(tmp_path, fresh_store, monkeypatch):
+    async def boom(path, source_folder_id=None, parent_op_id=None):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(broker_module, "publish_ingest_task", boom)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
     _write_pngs(tmp_path, [(255, 0, 0), (0, 255, 0)])
     with TestClient(app_module.app) as client:
-        first = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()
-        f1 = _wait_for(client, first["id"], {"completed"})
-        assert f1["progress"]["done"] == 2
-        assert f1["progress"]["skipped"] == 0
-
-        second = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()
-        f2 = _wait_for(client, second["id"], {"completed"})
-        assert f2["progress"]["total"] == 2
-        assert f2["progress"]["done"] == 0
-        assert f2["progress"]["skipped"] == 2
-    # Only the first run fanned out (2 files); the re-run skipped both.
-    assert len(mock_outbound["fanout"]) == 2
+        job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
+        final = _wait_for(client, job_id, {"completed"})
+        # The job still settles; every file is counted failed (nothing cataloged).
+        assert final["status"] == "completed"
+        assert final["progress"]["total"] == 2
+        assert final["progress"]["failed"] == 2
+        assert final["progress"]["done"] == 0
 
 
 # ---------------------------------------------------------------------------
-# (2b) GET /jobs lists jobs (newest first) with UI-shaped flat fields
+# (2c) GET /jobs lists jobs (newest first) with UI-shaped flat fields
 # ---------------------------------------------------------------------------
-def test_list_jobs_returns_jobs_with_flat_fields(tmp_path, fresh_store, mock_outbound):
+def test_list_jobs_returns_jobs_with_flat_fields(tmp_path, fresh_store, mock_publish):
     # Without this list endpoint the gateway GET /jobs 405s -> [] and the UI's
     # job poller never sees progress/completion. The flat *_files aliases are
     # what the UI dashboard/dock normalize on.
@@ -157,16 +172,14 @@ def test_list_jobs_returns_jobs_with_flat_fields(tmp_path, fresh_store, mock_out
         jobs = listed.json()
         assert isinstance(jobs, list) and len(jobs) == 1
         job = jobs[0]
-        # Flat aliases the UI consumes (snake_case file counts + folder path).
         assert job["total_files"] == 2
         assert job["processed_files"] == 2
         assert job["failed_files"] == 0
         assert job["folder_path"] == str(tmp_path)
-        # Nested progress is preserved for the contract / per-job detail.
         assert job["progress"]["done"] == 2
 
 
-def test_list_jobs_newest_first(fresh_store, mock_outbound):
+def test_list_jobs_newest_first(fresh_store, mock_publish):
     with TestClient(app_module.app) as client:
         a = client.post("/jobs", json={"type": "rebuild-search"}).json()["id"]
         b = client.post("/jobs", json={"type": "rebuild-graph"}).json()["id"]
@@ -181,37 +194,31 @@ def test_list_jobs_newest_first(fresh_store, mock_outbound):
 def test_cancel_mid_run(tmp_path, fresh_store, monkeypatch):
     _write_pngs(tmp_path, [(i, 0, 0) for i in range(0, 60, 6)])  # 10 distinct images
 
-    processed = {"n": 0}
+    # Slow publish so cancel can land mid-run. Pin concurrency to 1 so the cancel
+    # point is deterministic (this test is about cancellation, not concurrency).
+    async def slow_publish(path, source_folder_id=None, parent_op_id=None):
+        await asyncio.sleep(0.05)
 
-    # Slow, side-effecting pipeline so cancel can land mid-run.
-    def slow_process(data, filename):
-        processed["n"] += 1
-        time.sleep(0.05)
-        return pipeline.IngestRecord(
-            sha256=pipeline.compute_sha256(data),
-            record={}, point={}, edges={}, thumbnail=None,
-        )
-
-    monkeypatch.setattr(pipeline, "process_file", slow_process)
-    monkeypatch.setattr(pipeline, "fan_out_writes", lambda rec: None)
+    monkeypatch.setenv("INGEST_CONCURRENCY", "1")
+    monkeypatch.setattr(broker_module, "publish_ingest_task", slow_publish)
+    monkeypatch.setattr(pipeline, "list_catalog_filepaths_under", lambda folder: set())
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/ingest", json={"folderPath": str(tmp_path)}).json()["id"]
-        # Let a couple files process, then cancel.
         _wait_for(client, job_id, {"running"}, timeout=2.0)
         time.sleep(0.12)
         cancel = client.post(f"/jobs/{job_id}/cancel").json()
         assert cancel["status"] in ("running", "cancelled")
         final = _wait_for(client, job_id, {"cancelled", "completed"})
         assert final["status"] == "cancelled"
-        # Did not process all 10 files.
+        # Did not enqueue all 10 files.
         assert final["progress"]["done"] < 10
 
 
 # ---------------------------------------------------------------------------
-# (4) pipeline computes sha256/phash/dims and a WebP thumbnail
+# (4) local pixel work: sha256/phash/dims + a WebP thumbnail (downscale-only)
 # ---------------------------------------------------------------------------
-def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
+def test_pixel_work_hashes_dims_thumbnail():
     data = _png_bytes((123, 50, 200), size=32)
 
     assert len(pipeline.compute_sha256(data)) == 64
@@ -227,25 +234,21 @@ def test_pipeline_computes_hashes_dims_thumbnail(mock_outbound):
     assert thumb is not None
     with Image.open(io.BytesIO(thumb)) as im:
         assert im.format == "WEBP"
+        # 32px source is below the 1080 short-edge floor -> kept at native size.
+        assert im.size == (32, 32)
 
-    rec = pipeline.process_file(data, "img.png")
-    assert rec.sha256 == pipeline.compute_sha256(data)
-    assert rec.record["phash"] == phash
-    assert rec.record["width"] == 32 and rec.record["height"] == 32
-    assert rec.record["sha256"] == rec.sha256
-    assert rec.point["dense"] == [0.1, 0.2, 0.3]
-    assert rec.point["sparse"] == {"indices": [1, 2], "values": [0.5, 0.7]}
-    # search UpsertPoint is keyed by sha256 (search derives uuid5 itself); the
-    # derived point id is surfaced in the payload.
-    assert rec.point["sha256"] == rec.sha256
-    assert rec.point["payload"]["point_id"] == pipeline.point_id_for_sha256(rec.sha256)
-    # references flattened to {kind,name,hash}
-    assert {"kind": "checkpoint", "name": "sdxl", "hash": None} in rec.record["references"]
-    assert rec.thumbnail is not None
+    # A source larger than the floor is downscaled so its SHORTER edge == floor.
+    big = _png_bytes((10, 20, 30), size=400)  # 400x400 square
+    big_thumb = pipeline.make_webp_thumbnail(big, min_edge=100)
+    assert big_thumb is not None
+    with Image.open(io.BytesIO(big_thumb)) as im:
+        assert min(im.size) == 100
 
 
 # ---------------------------------------------------------------------------
-# (5) fan-out writes DIRECTLY to catalog/search/graph, catalog-first, w/ retry
+# (5) per-store retry on a transient 5xx, then fail after exhausting retries.
+# The retry helper backs every stage's catalog/search/graph write (ingest_fast +
+# the DAG stages), so it is exercised directly.
 # ---------------------------------------------------------------------------
 class _FakeResp:
     def __init__(self, status_code):
@@ -258,97 +261,31 @@ class _FakeResp:
             raise pipeline.httpx.HTTPStatusError("err", request=None, response=None)
 
 
-def test_fanout_direct_to_owning_services_catalog_first_with_retry(monkeypatch):
-    """The fan-out hits the OWNING services directly (#17), not the TS app:
+class _FakeClient:
+    """Async stand-in for the pooled httpx.AsyncClient used by the retry helper."""
 
-      catalog POST /images -> catalog PUT /blobs/{sha}/thumbnail
-        -> search POST /points -> graph POST /edges
+    def __init__(self, *, post=None):
+        self._post = post
 
-    Catalog is FIRST (record before blob before the derived projections) and the
-    catalog record POST is retried on a transient 500.
-    """
-    sha = "a" * 64
-    calls: list[tuple[str, str]] = []  # (method, url)
-    attempts = {"images": 0}
-
-    def fake_post(url, json=None, timeout=None):
-        calls.append(("POST", url))
-        if url == f"{pipeline.CATALOG_URL}/images":
-            attempts["images"] += 1
-            if attempts["images"] == 1:
-                return _FakeResp(500)  # transient failure, then retry succeeds
-        return _FakeResp(200)
-
-    def fake_put(url, content=None, headers=None, timeout=None):
-        calls.append(("PUT", url))
-        return _FakeResp(200)
-
-    monkeypatch.setattr(pipeline.httpx, "post", fake_post)
-    monkeypatch.setattr(pipeline.httpx, "put", fake_put)
-
-    rec = pipeline.IngestRecord(
-        sha256=sha,
-        record={"sha256": sha},
-        point={"sha256": sha, "dense": [0.0]},
-        edges={"sha256": sha},
-        thumbnail=b"webp-bytes",
-    )
-    pipeline.fan_out_writes(rec)
-
-    urls = [u for _m, u in calls]
-    images_idx = [i for i, u in enumerate(urls) if u == f"{pipeline.CATALOG_URL}/images"]
-    thumb_idx = urls.index(f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail")
-    points_idx = urls.index(f"{pipeline.SEARCH_URL}/points")
-    edges_idx = urls.index(f"{pipeline.GRAPH_URL}/edges")
-
-    # Direct service targets, NOT the TS app.
-    assert all("/api/library/" not in u for u in urls)
-    # Catalog record retried (2 POSTs) and the whole catalog write (record +
-    # thumbnail blob) lands BEFORE search, which lands before graph.
-    assert len(images_idx) == 2  # one failed + one retry success
-    assert max(images_idx) < thumb_idx < points_idx < edges_idx
-    # The thumbnail blob was PUT (not POSTed).
-    assert ("PUT", f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail") in calls
+    async def post(self, url, json=None, **kw):
+        return self._post(url, json=json)
 
 
-def test_fanout_skips_thumbnail_blob_when_absent(monkeypatch):
-    """No thumbnail -> no blob PUT, but the record/point/edges still fan out."""
-    sha = "c" * 64
-    calls: list[str] = []
+def test_post_with_retry_retries_5xx_then_succeeds(monkeypatch):
+    attempts = {"n": 0}
+
+    def fake_post(url, json=None):
+        attempts["n"] += 1
+        return _FakeResp(500 if attempts["n"] == 1 else 200)
+
+    monkeypatch.setattr(pipeline, "get_client", lambda: _FakeClient(post=fake_post))
+    asyncio.run(pipeline._post_with_retry(f"{pipeline.CATALOG_URL}/images", {"sha256": "a" * 64}))
+    assert attempts["n"] == 2  # one transient failure, then a retry success
+
+
+def test_post_with_retry_raises_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(
-        pipeline.httpx,
-        "post",
-        lambda url, json=None, timeout=None: (calls.append(url) or _FakeResp(200)),
-    )
-    monkeypatch.setattr(
-        pipeline.httpx,
-        "put",
-        lambda url, content=None, headers=None, timeout=None: (calls.append(url) or _FakeResp(200)),
-    )
-
-    rec = pipeline.IngestRecord(
-        sha256=sha,
-        record={"sha256": sha},
-        point={"sha256": sha, "dense": [0.0]},
-        edges={"sha256": sha},
-        thumbnail=None,
-    )
-    pipeline.fan_out_writes(rec)
-
-    assert f"{pipeline.CATALOG_URL}/blobs/{sha}/thumbnail" not in calls
-    assert calls == [
-        f"{pipeline.CATALOG_URL}/images",
-        f"{pipeline.SEARCH_URL}/points",
-        f"{pipeline.GRAPH_URL}/edges",
-    ]
-
-
-def test_fanout_raises_after_exhausting_retries(monkeypatch):
-    monkeypatch.setattr(
-        pipeline.httpx, "post", lambda url, json=None, timeout=None: _FakeResp(503)
-    )
-    rec = pipeline.IngestRecord(
-        sha256="b" * 64, record={}, point={}, edges={}, thumbnail=None
+        pipeline, "get_client", lambda: _FakeClient(post=lambda url, json=None: _FakeResp(503))
     )
     with pytest.raises(pipeline.httpx.HTTPStatusError):
-        pipeline.fan_out_writes(rec)
+        asyncio.run(pipeline._post_with_retry(f"{pipeline.CATALOG_URL}/images", {}))

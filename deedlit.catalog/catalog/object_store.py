@@ -10,6 +10,11 @@ chars, mirroring the comfyhelper key layout:
 
   * thumbnail -> ``thumbnails/{shard}/{sha256}.webp``   (image/webp)
   * embedding -> ``embeddings/{shard}/{sha256}.bin``    (application/octet-stream)
+  * sparse    -> ``sparse/{shard}/{sha256}.json``       (application/json)
+
+The ``embedding`` (dense vector) and ``sparse`` blobs are the persisted outputs
+of the embed.dense / embed.sparse DAG stages (ADR 0002); the catalog is the
+fan-in rendezvous where index.search reads both back.
 
 where ``shard = sha256[:2]``. (comfyhelper additionally namespaces by
 size/provider-dims in its keys; the catalog blob endpoint exposes the simpler
@@ -27,7 +32,12 @@ from catalog.config import get_config
 _KIND_SPEC: dict[str, tuple[str, str, str]] = {
     "thumbnail": ("thumbnails", "webp", "image/webp"),
     "embedding": ("embeddings", "bin", "application/octet-stream"),
+    "sparse": ("sparse", "json", "application/json"),
 }
+
+# The valid blob kinds — the single source of truth for the router allowlists and
+# the image-delete cleanup loop, so adding a kind above is enough.
+BLOB_KINDS: frozenset[str] = frozenset(_KIND_SPEC)
 
 _client = None
 _client_endpoint: str | None = None
@@ -118,6 +128,23 @@ def get_blob(sha256: str, kind: str) -> bytes | None:
         return res["Body"].read()
     except ClientError:
         return None
+
+
+def delete_blob(sha256: str, kind: str) -> bool:
+    """Delete a sha256-keyed blob. Returns ``True`` if the store accepted it.
+
+    S3 DeleteObject is idempotent (deleting a missing key still succeeds), so a
+    ``True`` result does not prove the blob existed — only that cleanup ran. A
+    ``ClientError`` (bucket/endpoint trouble) returns ``False`` so callers can
+    treat blob cleanup on image-delete as best-effort.
+    """
+    cfg = get_config().object_store
+    key = blob_key(sha256, kind)
+    try:
+        get_client().delete_object(Bucket=cfg.bucket, Key=key)
+        return True
+    except ClientError:
+        return False
 
 
 def blob_ready() -> bool:

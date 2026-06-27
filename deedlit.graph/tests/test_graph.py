@@ -138,6 +138,180 @@ def test_edges_key_distinguishes_by_hash_when_present():
     assert b not in [n["sha256"] for n in nb["neighbors"]]
 
 
+# --- (6) DELETE /images/{sha256} removes the node + its edges ----------------
+
+
+def test_delete_image_removes_node_and_neighbor_edges():
+    a, b = sha("delA"), sha("delB")
+    ckpt = {"kind": "checkpoint", "name": "todelete.safetensors", "hash": None}
+    client.post("/edges", json={"sha256": a, "references": [ckpt]})
+    client.post("/edges", json={"sha256": b, "references": [ckpt]})
+    # a and b share the checkpoint, so they are shared-asset neighbors.
+    nb = client.get(f"/neighbors/{a}", params={"relation": "shared_asset"}).json()
+    assert b in [n["sha256"] for n in nb["neighbors"]]
+
+    r = client.delete(f"/images/{b}")
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 1
+
+    # b's node + USES edge are gone, so it no longer surfaces as a's neighbor.
+    nb2 = client.get(f"/neighbors/{a}", params={"relation": "shared_asset"}).json()
+    assert b not in [n["sha256"] for n in nb2["neighbors"]]
+
+    # Deleting a missing node is not an error and reports 0.
+    assert client.delete(f"/images/{b}").json()["deleted"] == 0
+
+
+def test_clean_tag_collapses_weighting_and_brackets():
+    from graph.repository import clean_tag
+
+    for raw in ["(asd)", "(asd:12)", "(asd:1.2)", "((asd))", "[asd]", "asd", "ASD", " AsD "]:
+        assert clean_tag(raw) == "asd", raw
+    assert clean_tag("red eyes") == "red eyes"
+    assert clean_tag("(red eyes:1.1)") == "red eyes"
+
+
+def test_weighted_and_plain_tag_collapse_to_one_node():
+    a, b = sha("tcoA"), sha("tcoB")
+    # Same booru tag, weighted on one image and plain on the other -> ONE :Tag
+    # node, so the two images become tag-cooccurrence neighbors.
+    client.post("/edges", json={"sha256": a, "tags": ["(asd:1.2)"], "references": []})
+    client.post("/edges", json={"sha256": b, "tags": ["asd"], "references": []})
+    nb = client.get(f"/neighbors/{a}", params={"relation": "tag_cooccurrence"}).json()
+    assert b in [n["sha256"] for n in nb["neighbors"]]
+
+
+def test_entities_suggest_by_type_prefix_and_usage():
+    a, b = sha("eA"), sha("eB")
+    ckpt = {"kind": "checkpoint", "name": "Dreamshaper.safetensors", "hash": None}
+    lora = {"kind": "lora", "name": "detail-tweaker.safetensors"}
+    client.post("/edges", json={"sha256": a, "references": [ckpt, lora], "tags": ["forest", "night"]})
+    client.post("/edges", json={"sha256": b, "references": [ckpt], "tags": ["forest"]})
+
+    # Tags ranked most-used first (forest: 2 images, night: 1).
+    tags = client.get("/entities", params={"type": "tag"}).json()
+    assert tags[0] == "forest"
+    assert "night" in tags
+
+    # Prefix is case-insensitive and matches the start of the name.
+    assert client.get("/entities", params={"type": "tag", "prefix": "FOR"}).json() == ["forest"]
+
+    # Asset kind -> the asset's display name (original casing preserved).
+    assert client.get("/entities", params={"type": "checkpoint"}).json() == ["Dreamshaper.safetensors"]
+    assert client.get(
+        "/entities", params={"type": "checkpoint", "prefix": "dream"}
+    ).json() == ["Dreamshaper.safetensors"]
+    # Kinds are independent.
+    assert client.get("/entities", params={"type": "lora"}).json() == ["detail-tweaker.safetensors"]
+
+    # No matches / unknown kind -> empty list (the picker just goes quiet).
+    assert client.get("/entities", params={"type": "vae"}).json() == []
+    assert client.get("/entities", params={"type": "tag", "prefix": "zzz"}).json() == []
+
+
+def test_batch_delete_removes_many_nodes():
+    a, b, c = sha("bdelA"), sha("bdelB"), sha("bdelC")
+    ck = {"kind": "checkpoint", "name": "batchdel.safetensors", "hash": None}
+    for s in (a, b, c):
+        client.post("/edges", json={"sha256": s, "references": [ck]})
+
+    # Delete a + b in ONE call (+ a never-seen sha, which is a no-op).
+    r = client.post("/images/batch-delete", json={"sha256s": [a, b, sha("never")]})
+    assert r.status_code == 200
+    assert r.json()["deleted"] == 2  # only a + b existed
+
+    # a + b are gone; c is untouched.
+    assert client.delete(f"/images/{a}").json()["deleted"] == 0
+    assert client.delete(f"/images/{b}").json()["deleted"] == 0
+    assert client.delete(f"/images/{c}").json()["deleted"] == 1
+
+
+# --- POST /prune removes structurally-orphaned Asset/Tag nodes --------------
+
+
+def test_prune_removes_orphaned_asset_and_tag_after_image_delete():
+    a = sha("pruneA")
+    ckpt = {"kind": "checkpoint", "name": "lonely.safetensors", "hash": None}
+    client.post("/edges", json={"sha256": a, "references": [ckpt], "tags": ["solo"]})
+
+    # The asset + tag are reachable via the entity autocomplete while the image lives.
+    assert client.get("/entities", params={"type": "checkpoint"}).json() == ["lonely.safetensors"]
+    assert "solo" in client.get("/entities", params={"type": "tag"}).json()
+
+    # Delete the only image that used them: delete_image leaves the Asset/Tag behind.
+    assert client.delete(f"/images/{a}").json()["deleted"] == 1
+    assert client.get("/entities", params={"type": "checkpoint"}).json() == ["lonely.safetensors"]
+    assert "solo" in client.get("/entities", params={"type": "tag"}).json()
+
+    # Prune sweeps the now-orphaned Asset + Tag.
+    r = client.post("/prune")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["assets_deleted"] == 1
+    assert body["tags_deleted"] == 1
+    assert body["dry_run"] is False
+
+    # They're gone from the autocomplete now.
+    assert client.get("/entities", params={"type": "checkpoint"}).json() == []
+    assert client.get("/entities", params={"type": "tag"}).json() == []
+
+    # Idempotent: a second prune finds nothing.
+    assert client.post("/prune").json() == {
+        "status": "ok", "assets_deleted": 0, "tags_deleted": 0, "dry_run": False,
+    }
+
+
+def test_prune_keeps_assets_and_tags_still_in_use():
+    a, b = sha("keepA"), sha("keepB")
+    ckpt = {"kind": "checkpoint", "name": "shared.safetensors", "hash": None}
+    client.post("/edges", json={"sha256": a, "references": [ckpt], "tags": ["forest"]})
+    client.post("/edges", json={"sha256": b, "references": [ckpt], "tags": ["forest"]})
+
+    # Delete only one of the two images that share the checkpoint + tag.
+    client.delete(f"/images/{a}")
+    # The asset + tag are STILL used by b, so prune must not touch them.
+    r = client.post("/prune").json()
+    assert r["assets_deleted"] == 0
+    assert r["tags_deleted"] == 0
+    assert client.get("/entities", params={"type": "checkpoint"}).json() == ["shared.safetensors"]
+    assert client.get("/entities", params={"type": "tag"}).json() == ["forest"]
+
+
+def test_prune_dry_run_counts_without_deleting():
+    a = sha("dryA")
+    client.post(
+        "/edges",
+        json={
+            "sha256": a,
+            "references": [{"kind": "lora", "name": "dry.safetensors"}],
+            "tags": ["alpha", "beta"],
+        },
+    )
+    client.delete(f"/images/{a}")
+
+    # dry_run reports the would-be deletions and removes nothing.
+    preview = client.post("/prune", json={"dry_run": True}).json()
+    assert preview == {"status": "ok", "assets_deleted": 1, "tags_deleted": 2, "dry_run": True}
+    assert "dry.safetensors" in client.get("/entities", params={"type": "lora"}).json()
+
+    # The real run then actually deletes them.
+    done = client.post("/prune", json={"dry_run": False}).json()
+    assert done["assets_deleted"] == 1 and done["tags_deleted"] == 2
+    assert client.get("/entities", params={"type": "lora"}).json() == []
+
+
+def test_prune_never_deletes_image_nodes():
+    # A bare image with no references and no tags is structurally identical to a
+    # lineage stub; prune must leave ALL Image nodes in place.
+    a = sha("imgKeep")
+    client.post("/edges", json={"sha256": a})
+    client.post("/prune")
+    # The image node still exists (lineage query answers for a known node).
+    assert client.get(f"/lineage/{a}").status_code == 200
+    # And it can still be deleted explicitly (i.e. it was not pruned away).
+    assert client.delete(f"/images/{a}").json()["deleted"] == 1
+
+
 # --- rebuild-from-catalog (mocked HTTP) -------------------------------------
 
 

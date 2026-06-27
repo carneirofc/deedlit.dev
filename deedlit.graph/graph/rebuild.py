@@ -16,7 +16,7 @@ import httpx
 
 from graph.config import get_config
 from graph.models import AssetRef, EdgeUpsert, LineageRef
-from graph.repository import upsert_edges
+from graph.repository import ensure_schema, upsert_edges
 
 _PAGE = 200
 
@@ -63,6 +63,7 @@ def rebuild_from_catalog(client: httpx.Client | None = None) -> dict:
     own_client = client is None
     client = client or httpx.Client(timeout=30.0)
     try:
+        ensure_schema()  # MERGE lookup indexes before the bulk rebuild
         images = _fetch_images(client, cfg.catalog_url)
         upserted = 0
         for image in images:

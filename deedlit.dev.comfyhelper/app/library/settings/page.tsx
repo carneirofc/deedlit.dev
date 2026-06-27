@@ -1,12 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
+import { CodeBlock, CopyButton } from "@deedlit.dev/ui";
+
+import { getIngestConfig, updateIngestConfig, type IngestConfig } from "@/lib/api-client";
 import {
   DEFAULT_SETTINGS,
+  SAFETY_CLASSES,
+  SAFETY_LABEL,
   useSettings,
   type LibrarySettings,
+  type SafetyClass,
 } from "@/lib/store/settings";
 
 // ---------------------------------------------------------------------------
@@ -44,6 +50,20 @@ function Row({ label, hint, control }: { label: string; hint?: string; control: 
         {hint && <p className="text-ui-2xs text-ui-ink-muted">{hint}</p>}
       </div>
       <div className="shrink-0">{control}</div>
+    </div>
+  );
+}
+
+function InfoRow({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2.5">
+      <div className="min-w-0">
+        <p className="text-ui-sm text-ui-ink">{label}</p>
+        {hint && <p className="text-ui-2xs text-ui-ink-muted">{hint}</p>}
+      </div>
+      <span className="shrink-0 rounded-md border border-ui-border/60 bg-ui-bg px-2 py-1 text-ui-2xs text-ui-ink-muted">
+        {value}
+      </span>
     </div>
   );
 }
@@ -132,6 +152,275 @@ function NumberSlider({
 }
 
 // ---------------------------------------------------------------------------
+// Ingest & indexing — SERVER-backed (deedlit.ingest /config via the gateway),
+// unlike the rest of this page (browser localStorage). Tunes the producer
+// fast-path parallelism live; consumer/deploy knobs are shown read-only.
+// ---------------------------------------------------------------------------
+
+function IngestSettingsSection() {
+  const [cfg, setCfg] = useState<IngestConfig | null>(null);
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  // Manual library rescan (walks the source root for new/vanished files). Reuses
+  // the existing maintenance job — this is just a trigger from the settings panel.
+  const [rescan, setRescan] = useState<"idle" | "running" | "done" | "error">("idle");
+
+  const rescanNow = useCallback(async () => {
+    setRescan("running");
+    try {
+      const r = await fetch("/api/library/maintenance/rescan-files", { method: "POST" });
+      setRescan(r.ok ? "done" : "error");
+    } catch {
+      setRescan("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    getIngestConfig()
+      .then((c) => alive && setCfg(c))
+      .catch(() => alive && setStatus("error"));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const save = useCallback(async (patch: Partial<IngestConfig>) => {
+    setCfg((prev) => (prev ? { ...prev, ...patch } : prev)); // optimistic
+    setStatus("saving");
+    try {
+      setCfg(await updateIngestConfig(patch));
+      setStatus("saved");
+    } catch {
+      setStatus("error");
+    }
+  }, []);
+
+  return (
+    <Section
+      title="Ingest & indexing"
+      hint="Server-side ingest parallelism. Applies to the next folder scan — not stored in this browser."
+    >
+      {cfg === null ? (
+        <p className="py-2 text-ui-2xs text-ui-ink-muted">
+          {status === "error" ? "Ingest service unreachable." : "Loading…"}
+        </p>
+      ) : (
+        <>
+          <Row
+            label="Folder-scan publish concurrency"
+            hint="How many ingest tasks a scan publishes to the queue in parallel. The worker pool catalogs and projects them across processes."
+            control={
+              <NumberSlider
+                value={cfg.ingest_concurrency}
+                min={1}
+                max={32}
+                step={1}
+                onChange={(v) => save({ ingest_concurrency: v })}
+              />
+            }
+          />
+          <Row
+            label="AI labelling (LLM)"
+            hint="Run the vision model to add a description, content-safety class & extra tags to each image. Off skips it — images are still cataloged, embedded & searchable. Applies to new ingests (and the label-backfill sweep)."
+            control={
+              <Toggle
+                checked={cfg.llm_enabled}
+                onChange={(v) => save({ llm_enabled: v })}
+              />
+            }
+          />
+          <Row
+            label="Rescan library now"
+            hint="Walk the source folders for new or vanished files and reconcile the catalog. Runs as a background job — watch it on the Admin page."
+            control={
+              <button
+                type="button"
+                className={cls.btn}
+                onClick={rescanNow}
+                disabled={rescan === "running"}
+                data-testid="rescan-now"
+              >
+                {rescan === "running"
+                  ? "Starting…"
+                  : rescan === "done"
+                    ? "Started ✓"
+                    : rescan === "error"
+                      ? "Retry"
+                      : "Rescan"}
+              </button>
+            }
+          />
+          <InfoRow
+            label="Consumer prefetch (fast queues)"
+            value="TASK_PREFETCH"
+            hint="Tasks each fast worker runs at once. Deploy-time: set in docker-compose, scale with --scale ingest-worker=N."
+          />
+          <InfoRow
+            label="LLM (label) queue"
+            value="single · prefetch 1"
+            hint="When AI labelling is on, the label queue runs one exclusive consumer at prefetch 1 so the vision model is never hit concurrently. Fixed."
+          />
+          <p className="pt-2 text-ui-2xs text-ui-ink-muted" aria-live="polite" data-testid="ingest-config-status">
+            {rescan === "error"
+              ? "Rescan failed — is the ingest service up?"
+              : status === "saving"
+                ? "Saving…"
+                : status === "saved"
+                  ? "Saved."
+                  : status === "error"
+                    ? "Save failed — is the ingest service up?"
+                    : ""}
+          </p>
+        </>
+      )}
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Agent access (MCP) — connection details for pointing an AI agent at this
+// library over the Model Context Protocol. This app is UI-only; it proxies a
+// JSON-RPC MCP server (POST /api/mcp -> deedlit.api gateway POST /mcp) that
+// exposes search / retrieval / graph / ingest tools. GET /api/mcp lists them.
+// ---------------------------------------------------------------------------
+
+type McpTool = { name: string; description: string };
+
+function McpAccessSection() {
+  // Absolute, browser-reachable endpoint. Resolved on the client so the copied
+  // URL/config is something an external MCP client can actually dial.
+  const [endpoint, setEndpoint] = useState("/api/mcp");
+  const [tools, setTools] = useState<McpTool[] | null>(null);
+  const [toolsState, setToolsState] = useState<"idle" | "loading" | "error">("idle");
+  const [copied, setCopied] = useState<"url" | "config" | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") setEndpoint(`${window.location.origin}/api/mcp`);
+  }, []);
+
+  // Ready-to-paste MCP client config (Claude Desktop / Claude Code `mcpServers`
+  // block, HTTP transport). Server name mirrors the gateway's serverInfo.
+  const config = useMemo(
+    () =>
+      JSON.stringify(
+        { mcpServers: { "comfyhelper-image-library": { type: "http", url: endpoint } } },
+        null,
+        2,
+      ),
+    [endpoint],
+  );
+
+  const copy = useCallback((text: string, which: "url" | "config") => {
+    navigator.clipboard
+      ?.writeText(text)
+      .then(() => {
+        setCopied(which);
+        setTimeout(() => setCopied((c) => (c === which ? null : c)), 1500);
+      })
+      .catch(() => {});
+  }, []);
+
+  const loadTools = useCallback(async () => {
+    setToolsState("loading");
+    try {
+      const res = await fetch("/api/mcp");
+      if (!res.ok) throw new Error(String(res.status));
+      const data = (await res.json()) as { tools?: McpTool[] };
+      setTools(data.tools ?? []);
+      setToolsState("idle");
+    } catch {
+      setToolsState("error");
+    }
+  }, []);
+
+  return (
+    <Section
+      title="Agent access (MCP)"
+      hint="Connect an AI agent (Claude, etc.) to this library over the Model Context Protocol. The app exposes a JSON-RPC MCP server with search, retrieval, graph and ingest tools."
+    >
+      <div className="flex items-center justify-between gap-4 py-2.5">
+        <div className="min-w-0">
+          <p className="text-ui-sm text-ui-ink">Endpoint</p>
+          <p className="truncate font-mono text-ui-2xs text-ui-ink-muted" title={endpoint}>
+            {endpoint}
+          </p>
+        </div>
+        <CopyButton
+          copied={copied === "url"}
+          onClick={() => copy(endpoint, "url")}
+          aria-label="Copy MCP endpoint URL"
+          data-testid="mcp-copy-url"
+        />
+      </div>
+
+      <div className="py-2.5">
+        <div className="mb-2 flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-ui-sm text-ui-ink">Client config</p>
+            <p className="text-ui-2xs text-ui-ink-muted">
+              Add to your MCP client (e.g. Claude Desktop / Claude Code), then restart it.
+            </p>
+          </div>
+          <CopyButton
+            copied={copied === "config"}
+            onClick={() => copy(config, "config")}
+            aria-label="Copy MCP client config"
+            data-testid="mcp-copy-config"
+          />
+        </div>
+        <CodeBlock maxHeight="max-h-48" testId="mcp-config">
+          {config}
+        </CodeBlock>
+        <p className="mt-2 text-ui-2xs text-ui-ink-muted">
+          Claude Code CLI:{" "}
+          <code className="font-mono text-ui-ink">
+            claude mcp add --transport http comfyhelper {endpoint}
+          </code>
+        </p>
+      </div>
+
+      <div className="py-2.5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-ui-sm text-ui-ink">Available tools</p>
+            <p className="text-ui-2xs text-ui-ink-muted">
+              The tool surface the agent can call. Served by the gateway; needs it running.
+            </p>
+          </div>
+          <button
+            type="button"
+            className={cls.btn}
+            onClick={loadTools}
+            disabled={toolsState === "loading"}
+            data-testid="mcp-load-tools"
+          >
+            {toolsState === "loading" ? "Loading…" : tools ? "Refresh" : "List tools"}
+          </button>
+        </div>
+        {toolsState === "error" && (
+          <p className="mt-2 text-ui-2xs text-error-ink">
+            Couldn’t reach the MCP server — is the deedlit.api gateway up?
+          </p>
+        )}
+        {tools && tools.length > 0 && (
+          <ul className="mt-3 flex flex-col gap-1.5" data-testid="mcp-tools">
+            {tools.map((t) => (
+              <li key={t.name} className="text-ui-2xs">
+                <code className="font-mono text-accent-cyan">{t.name}</code>
+                <span className="text-ui-ink-muted"> — {t.description}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {tools && tools.length === 0 && (
+          <p className="mt-2 text-ui-2xs text-ui-ink-muted">No tools advertised.</p>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export default function SettingsPage() {
   const { settings, setKey, reset, hydrated } = useSettings();
@@ -150,12 +439,28 @@ export default function SettingsPage() {
     onChange: (v: number) => setKey(k, v as never),
   });
 
-  const dirty = (Object.keys(DEFAULT_SETTINGS) as Array<keyof LibrarySettings>).some(
-    (k) => settings[k] !== DEFAULT_SETTINGS[k],
-  );
+  // Toggle one content-safety class in/out of the default-shown set.
+  const toggleDefaultSafety = (c: SafetyClass) => {
+    const cur = settings.defaultSafety;
+    setKey("defaultSafety", cur.includes(c) ? cur.filter((x) => x !== c) : [...cur, c]);
+  };
+
+  const dirty = (Object.keys(DEFAULT_SETTINGS) as Array<keyof LibrarySettings>).some((k) => {
+    const a = settings[k];
+    const b = DEFAULT_SETTINGS[k];
+    // Array settings (e.g. defaultSafety) compare by content, order-insensitive —
+    // a reference compare would read as perpetually dirty after hydration.
+    if (Array.isArray(a) && Array.isArray(b)) {
+      if (a.length !== b.length) return true;
+      const sa = [...a].sort();
+      const sb = [...b].sort();
+      return sa.some((v, i) => v !== sb[i]);
+    }
+    return a !== b;
+  });
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-6" data-testid="settings-page">
+    <div className="mx-auto flex w-full max-w-[1700px] flex-col gap-6" data-testid="settings-page">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-ui-2xl font-semibold text-ui-ink-title">Settings</h1>
@@ -183,6 +488,9 @@ export default function SettingsPage() {
         <p className="text-ui-xs text-ui-ink-muted">Loading saved settings…</p>
       )}
 
+      {/* Cards flow into 2–3 balanced columns on wide desktops. CSS multi-column
+          (not grid) so uneven card heights pack without leaving row gaps. */}
+      <div className="columns-1 gap-6 lg:columns-2 2xl:columns-3 [&>section]:mb-6 [&>section]:break-inside-avoid">
       {/* Browsing & pagination */}
       <Section
         title="Browsing & pagination"
@@ -194,13 +502,13 @@ export default function SettingsPage() {
           control={<NumberSlider {...slide("pageSize")} min={10} max={200} step={10} />}
         />
         <Row
-          label="Default search tab"
+          label="Open search on"
+          hint="Text/tag search runs a hybrid keyword + semantic match; “By image” opens the reverse-image dropzone."
           control={
             <Segmented
               {...seg<LibrarySettings["defaultMode"]>("defaultMode")}
               options={[
-                { value: "browse", label: "Browse" },
-                { value: "semantic", label: "Semantic" },
+                { value: "browse", label: "Search" },
                 { value: "image", label: "By image" },
               ]}
             />
@@ -264,6 +572,11 @@ export default function SettingsPage() {
         />
         <Row label="Show prompt" control={<Toggle {...bool("showPrompt")} />} />
         <Row
+          label="Show AI description"
+          hint="The vision-model description generated by the label agent."
+          control={<Toggle {...bool("showDescription")} />}
+        />
+        <Row
           label="Show generation parameters"
           control={<Toggle {...bool("showGenerationParams")} />}
         />
@@ -313,6 +626,36 @@ export default function SettingsPage() {
         />
       </Section>
 
+      {/* Slideshow */}
+      <Section
+        title="Slideshow"
+        hint="The fullscreen viewer opened by clicking an image or the Slideshow button."
+      >
+        <Row
+          label="Auto-advance interval"
+          hint="Seconds each image is shown while the slideshow is playing."
+          control={
+            <NumberSlider
+              {...slide("slideshowInterval")}
+              min={1}
+              max={60}
+              step={1}
+              format={(v) => `${v}s`}
+            />
+          }
+        />
+        <Row
+          label="Loop"
+          hint="Return to the first image after the last."
+          control={<Toggle {...bool("slideshowLoop")} />}
+        />
+        <Row
+          label="Shuffle"
+          hint="Jump to a random image instead of the next in order."
+          control={<Toggle {...bool("slideshowShuffle")} />}
+        />
+      </Section>
+
       {/* Search defaults */}
       <Section
         title="Search defaults"
@@ -337,6 +680,32 @@ export default function SettingsPage() {
         />
         <Row label="Favorites only" control={<Toggle {...bool("defaultFavoritesOnly")} />} />
         <Row
+          label="Content safety"
+          hint="Which safety classes the grid shows by default. All on = no filter; turn one off (e.g. Explicit) to hide it everywhere until you re-enable it."
+          control={
+            <div className="flex gap-1.5" data-testid="default-safety">
+              {SAFETY_CLASSES.map((c) => {
+                const on = settings.defaultSafety.includes(c);
+                return (
+                  <button
+                    key={c}
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => toggleDefaultSafety(c)}
+                    className={`rounded-full border px-2.5 py-1 text-ui-2xs font-medium transition ${
+                      on
+                        ? "border-accent-cyan bg-accent-cyan/15 text-accent-cyan"
+                        : "border-ui-border/60 text-ui-ink-muted hover:text-ui-ink"
+                    }`}
+                  >
+                    {SAFETY_LABEL[c]}
+                  </button>
+                );
+              })}
+            </div>
+          }
+        />
+        <Row
           label="Minimum match score"
           hint="Default threshold for semantic / similar / by-image search."
           control={
@@ -350,6 +719,13 @@ export default function SettingsPage() {
           }
         />
       </Section>
+
+      {/* Ingest & indexing (server-backed, not localStorage) */}
+      <IngestSettingsSection />
+
+      {/* Agent access (MCP) — connection details, not stored settings */}
+      <McpAccessSection />
+      </div>
     </div>
   );
 }

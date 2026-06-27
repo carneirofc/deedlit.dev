@@ -19,8 +19,12 @@ Environment variables (all optional):
 | `COMFYUI_ROOT` | `K:\comfyui\ComfyUI_windows_portable\ComfyUI` | Source of the local `models/clip_vision/*.safetensors` vision tower weights. |
 | `CLIP_MODEL_PRESET` | `vit_h` | Default preset when a request omits `model`: `vit_h` (ViT-H-14, 1024-dim, lighter) or `big_g` (ViT-bigG-14, 1280-dim, heavier). |
 | `CLIP_MODELS` | `vit_h,big_g` | Comma-separated set of presets consumers may select via the `model` parameter. Both load on demand for side-by-side comparison. |
-| `CLIP_DEVICE` | `cuda` if available, else `cpu` | Torch device. |
+| `CLIP_DEVICE` | `cuda` if available, else `cpu` | Torch device for the CLIP towers (dense). |
 | `CLIP_FP16` | `true` | Use half precision on CUDA. |
+| `SPARSE_MODEL` | `prithivida/Splade_PP_en_v1` | SPLADE model for `/embed/sparse`. |
+| `SPARSE_DEVICE` | same as `CLIP_DEVICE` | Device for SPLADE (onnxruntime). `cuda` runs sparse on the GPU via `CUDAExecutionProvider` (needs the `fastembed-gpu` package); `cpu` forces CPU. Runs on its own worker thread so dense + sparse embed in parallel. |
+| `VISION_DENSE_BATCH_MAX` | `16` | Max images coalesced into one batched dense GPU forward. Concurrent `POST /embed/image` calls (the ingest hot path) fuse into a single `[B,3,224,224]` pass so a large ingest backlog saturates the GPU. Lower if VRAM is tight. |
+| `VISION_DENSE_BATCH_WAIT_MS` | `10` | How long the first queued image waits to accumulate a batch before firing (throughput vs. latency). `0` fires as soon as the GPU worker is free, still grabbing everything already queued. |
 | `QDRANT_URL` | `http://localhost:6333` | Optional Qdrant base URL for the test UI's live-search section. |
 | `QDRANT_COLLECTION` | `images` | Collection the test UI searches against. |
 | `QDRANT_TIMEOUT` | `5.0` | HTTP timeout (seconds) for Qdrant calls. |

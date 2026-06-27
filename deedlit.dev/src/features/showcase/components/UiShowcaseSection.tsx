@@ -3,18 +3,15 @@
 import Image from "next/image";
 import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from "react";
 
-
-import { toggleStringInList } from "@/lib/list-utils";
 import {
-  CyberPanel,
   CyberSubpanel,
   FilterSelectionCard,
   InfoChip,
   Modal,
   OutlineButton,
-  PageHeader,
   PanelSectionHeader,
   ScanProgress,
+  SectionLabel,
   SegmentedControl,
   SelectInput,
   StatusBadge,
@@ -33,6 +30,7 @@ import {
   Toast,
   WarningList,
 } from "@deedlit.dev/ui";
+import { toggleStringInList } from "@/lib/list-utils";
 
 const INITIAL_POSITIVE_FILTERS = ["masterpiece", "cinematic lighting", "depth of field"];
 const INITIAL_NEGATIVE_FILTERS = ["lowres", "watermark"];
@@ -45,7 +43,7 @@ const TABLE_EXAMPLE_ROWS = [
 
 type DockTab = "tag-filter-panel" | "path-tree-filter" | "tag-preset-panel";
 
-export default function UiShowcasePage() {
+export function UiShowcaseSection() {
   const [logicalMode, setLogicalMode] = useState<"and" | "or">("and");
   const [dockTab, setDockTab] = useState<DockTab>("tag-filter-panel");
   const [scanProgress, setScanProgress] = useState(42);
@@ -95,24 +93,25 @@ export default function UiShowcasePage() {
   }
 
   return (
-    <CyberPanel
-      id="ui-showcase-page"
-      data-testid="ui-showcase-page"
+    <section
+      data-testid="ui-showcase-section"
+      className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8"
     >
-      <PageHeader
-        testId="ui-showcase-header"
-        subtitle="Design System"
-        title="UI Component Showcase"
-        description="Reusable UI components currently used across Gallery, Stats, and Admin."
-        pills={
-          <div className="flex flex-wrap items-center gap-2">
-            <InfoChip testId="ui-showcase-pill-components">Components: 19</InfoChip>
-            <InfoChip testId="ui-showcase-pill-filters">Active filters: {totalSelectedFilters}</InfoChip>
-          </div>
-        }
-      />
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <SectionLabel>Design System</SectionLabel>
+          <h2 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">UI Component Showcase</h2>
+          <p className="mt-2 max-w-3xl text-sm text-muted">
+            Reusable UI components from the shared design system, currently used across Services, Gallery, and Books.
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <InfoChip>Components: 19</InfoChip>
+          <InfoChip>Active filters: {totalSelectedFilters}</InfoChip>
+        </div>
+      </div>
 
-      <div className="mt-4 grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
+      <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
         <CyberSubpanel>
           <PanelSectionHeader
             title="Buttons And Chips"
@@ -419,7 +418,6 @@ export default function UiShowcasePage() {
           />
         </div>
       </Modal>
-    </CyberPanel>
+    </section>
   );
 }
-

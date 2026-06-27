@@ -91,17 +91,34 @@ export const ImageDetailSchema = z.object({
 export type ImageDetail = z.infer<typeof ImageDetailSchema>;
 
 // Compact result row used in search / similarity responses.
+// AI content-safety class (deedlit.labelagent). Drives the library safety filter.
+export const SafetySchema = z.enum(["sfw", "nsfw", "explicit"]);
+export type Safety = z.infer<typeof SafetySchema>;
+
 export const CompactResultSchema = z.object({
   imageId: z.string(),
   score: z.number().nullable().optional(),
   thumbnailUrl: z.string(),
+  /** Small grid-tile URL (~512px WebP). Falls back to thumbnailUrl when absent. */
+  gridUrl: z.string().optional(),
   summary: z.string(),
   tags: z.array(z.string()),
   model: z.string().nullable().optional(),
   checkpoint: z.string().nullable().optional(),
   rating: z.number().nullable().optional(),
+  safety: SafetySchema.nullable().optional(),
+  /** Parent directory of the source file — the split-by-source-directory grouping
+   * key. Present on the catalog browse path; null/absent on vector-search hits. */
+  directory: z.string().nullable().optional(),
 });
 export type CompactResult = z.infer<typeof CompactResultSchema>;
+
+/** One source directory + its live-image total (gateway GET /images/directories). */
+export const DirectoryCountSchema = z.object({
+  directory: z.string(),
+  image_count: z.number(),
+});
+export type DirectoryCount = z.infer<typeof DirectoryCountSchema>;
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -116,6 +133,8 @@ export const SearchFiltersSchema = z.object({
   ratingGte: z.number().int().min(0).max(5).optional(),
   favorite: z.boolean().optional(),
   sourceTool: z.string().optional(),
+  // Content-safety classes to include. Omit/empty = no filter (show all).
+  safety: z.array(SafetySchema).optional(),
 });
 export type SearchFilters = z.infer<typeof SearchFiltersSchema>;
 
@@ -124,8 +143,12 @@ export type SearchFilters = z.infer<typeof SearchFiltersSchema>;
  * image ids.  Either scope from a hub node (e.g. all images sharing Model X) or
  * from an image's neighbourhood (images reachable within `hops`).
  */
+// The node types that actually exist in the Neo4j projection: a :Tag, or an
+// :Asset of one of these kinds (see deedlit.graph repository GRAPH MODEL). Each
+// is autocomplete-backed by GET /graph/entities. ("Model"/"Folder" were dropped:
+// neither is a graph node — folders live only in the catalog/path filter.)
 export const GraphNodeRefSchema = z.object({
-  type: z.enum(["Tag", "Model", "Checkpoint", "LoRA", "Folder"]),
+  type: z.enum(["Tag", "Checkpoint", "LoRA", "Embedding", "VAE", "ControlNet", "Upscaler"]),
   value: z.string().min(1),
 });
 export type GraphNodeRef = z.infer<typeof GraphNodeRefSchema>;
@@ -147,6 +170,46 @@ export const MetadataSearchRequestSchema = z.object({
 });
 export type MetadataSearchRequest = z.infer<typeof MetadataSearchRequestSchema>;
 
+/** Server-side browse ordering for the catalog grid (no relevance — that's the
+ * vector search path). Mirrors the catalog `sort` enum. */
+export const CatalogSortSchema = z.enum([
+  "newest", // ingestion date, newest first
+  "oldest", // ingestion date, oldest first
+  "created_desc", // source-file creation date, newest first
+  "created_asc", // source-file creation date, oldest first
+  "rating_desc",
+  "rating_asc",
+  "name_asc",
+  "name_desc",
+]);
+export type CatalogSort = z.infer<typeof CatalogSortSchema>;
+
+/**
+ * Filter-only browse over the catalog truth (gateway GET /images): real
+ * server-side sort + offset pagination, used when there is no text query. Only
+ * the catalog-backed filters live here; model/checkpoint/lora/source-tool are
+ * vector-search-only and stay on {@link MetadataSearchRequestSchema}.
+ */
+export const CatalogBrowseRequestSchema = z.object({
+  tags: z.array(z.string()).optional(),
+  excludeTags: z.array(z.string()).optional(),
+  favorite: z.boolean().optional(),
+  ratingGte: z.number().int().min(0).max(5).optional(),
+  safety: z.array(SafetySchema).optional(),
+  /** Substring match on the on-disk image path (separator-insensitive). */
+  path: z.string().optional(),
+  sort: CatalogSortSchema.default("newest"),
+  limit: z.number().int().min(1).max(200).default(40),
+  offset: z.number().int().min(0).default(0),
+});
+export type CatalogBrowseRequest = z.infer<typeof CatalogBrowseRequestSchema>;
+
+/** Bulk export — the selected images, by sha256. Capped to bound the server-side fan-out. */
+export const ExportRequestSchema = z.object({
+  ids: z.array(z.string().min(1)).min(1).max(500),
+});
+export type ExportRequest = z.infer<typeof ExportRequestSchema>;
+
 export const SemanticSearchRequestSchema = z.object({
   query: z.string().min(1),
   filters: SearchFiltersSchema.optional(),
@@ -161,6 +224,8 @@ export const SimilarSearchRequestSchema = z.object({
   filters: SearchFiltersSchema.optional(),
   graphScope: GraphScopeSchema.optional(),
   limit: z.number().int().min(1).max(200).default(30),
+  /** Rank offset into the neighbour list — pages deeper proximity results. */
+  offset: z.number().int().min(0).default(0),
   minScore: z.number().min(0).max(1).default(0),
   /** HNSW search beam width — raise for recall on larger collections. */
   hnswEf: z.number().int().min(4).max(1024).optional(),

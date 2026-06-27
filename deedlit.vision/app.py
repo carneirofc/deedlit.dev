@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+if __import__("os").getenv("OTEL_TRACES_EXPORTER"):
+    from opentelemetry.instrumentation.auto_instrumentation import initialize as _otel_initialize
+    _otel_initialize()
+    del _otel_initialize
+
 import asyncio
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
+import time
 import warnings
 from pathlib import Path
 from typing import Annotated, Literal
@@ -23,12 +30,17 @@ import httpx
 import open_clip
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms
+from torchvision.transforms import v2
+from torchvision.transforms.functional import pil_to_tensor
 from transformers import CLIPVisionConfig, CLIPVisionModelWithProjection
+
+from activity import install_activity
 
 
 # ---------------------------------------------------------------------
@@ -58,14 +70,64 @@ EMBEDDING_DISTANCE = "Cosine"
 DEVICE = os.getenv("CLIP_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 USE_FP16 = os.getenv("CLIP_FP16", "true").lower() == "true"
 
+# Fail fast (at import, before uvicorn binds) if CUDA was explicitly requested
+# but isn't actually usable — so a GPU deployment can never silently degrade to
+# CPU. Without this, a torch build lacking kernels for the installed GPU (e.g.
+# cu121 wheels on a Blackwell sm_120 card) still reports cuda.is_available()
+# True, loads onto "cuda", and only blows up at the first matmul. Set
+# CLIP_DEVICE=cpu to run on CPU intentionally.
+if DEVICE.startswith("cuda") and not torch.cuda.is_available():
+    raise RuntimeError(
+        f"CLIP_DEVICE={DEVICE!r} requested CUDA but torch.cuda.is_available() is "
+        f"False (torch {torch.__version__}, built for CUDA {torch.version.cuda}). "
+        "Check the NVIDIA container runtime and that torch matches this GPU's "
+        "compute capability. Set CLIP_DEVICE=cpu to run on CPU intentionally."
+    )
+
 # SPLADE sparse text embedding (lexical/term-weight vectors for hybrid search).
 # Loaded lazily on the first /embed/sparse call, mirroring the CLIP towers.
 # fastembed downloads the (small) ONNX model from the Hub on first use.
 SPARSE_MODEL_NAME = os.getenv("SPARSE_MODEL", "prithivida/Splade_PP_en_v1")
 
+# SPLADE runs on onnxruntime, NOT torch — so it needs its OWN device switch and
+# the onnxruntime CUDA provider (shipped by the `fastembed-gpu` package). Without
+# this it silently used the CPUExecutionProvider while the CLIP towers ran on the
+# GPU. Defaults to the CLIP device so a CUDA deployment puts sparse on the GPU
+# too; set SPARSE_DEVICE=cpu to keep SPLADE on CPU intentionally.
+SPARSE_DEVICE = os.getenv("SPARSE_DEVICE", DEVICE)
+SPARSE_USE_GPU = SPARSE_DEVICE.startswith("cuda")
+
+
+def _cuda_index(device: str) -> int:
+    """GPU ordinal from a torch-style device string (``cuda`` -> 0, ``cuda:1`` -> 1)."""
+    _, _, idx = device.partition(":")
+    return int(idx) if idx.isdigit() else 0
+
 # Standard CLIP image normalization (OpenAI dataset stats, used by OpenCLIP too).
 CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+
+# Image preprocessing device. The BICUBIC resize + normalize used to run CPU-side
+# (PIL/torchvision) on the single GPU worker thread, so each batch pegged ONE CPU
+# core resizing while the GPU sat idle, then ran a sub-100ms forward — CPU-bound,
+# GPU-starved. With CUDA we now upload the decoded uint8 image and run
+# resize/crop/scale/normalize ON THE GPU; the CPU only decodes (parallelised over
+# _cpu_pool). Set VISION_PREPROCESS_DEVICE=cpu to keep the exact original
+# PIL/torchvision numerics (e.g. to match vectors indexed before this change).
+PREPROCESS_ON_GPU = os.getenv("VISION_PREPROCESS_DEVICE", DEVICE).startswith("cuda")
+
+# GPU preprocessing pipeline applied to a uint8 [C,H,W] tensor already on-device.
+# Mirrors the CPU Compose below (Resize shorter-side 224 BICUBIC antialias ->
+# CenterCrop 224 -> /255 float -> CLIP normalize). The CLIP towers all use this
+# same 224 pipeline, so one shared transform serves every preset.
+_GPU_PREPROCESS = v2.Compose(
+    [
+        v2.Resize(224, interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
+        v2.CenterCrop(224),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=list(CLIP_IMAGE_MEAN), std=list(CLIP_IMAGE_STD)),
+    ]
+)
 
 
 MODEL_CONFIGS = {
@@ -133,6 +195,11 @@ CONFIG = MODEL_CONFIGS[DEFAULT_PRESET]
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333").rstrip("/")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "images")
 QDRANT_TIMEOUT = float(os.getenv("QDRANT_TIMEOUT", "5.0"))
+# deedlit.search owns the shared collection and configures NAMED vectors
+# (dense + sparse), so a search must address the vector by name — a bare
+# {"vector": [...]} query fails with "Not existing vector name". This is the
+# dense vector to query from the test UI; it matches deedlit.search's name.
+QDRANT_DENSE_VECTOR_NAME = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
 
 # Backing-stack services from deedlit.dev.comfyhelper's docker-compose. Used only
 # by the test UI's "Services" panel for reachability + console deep-links; none
@@ -162,11 +229,24 @@ class _HealthAccessFilter(logging.Filter):
         args = record.args
         # uvicorn.access record args: (client, method, full_path, http_ver, status)
         if isinstance(args, tuple) and len(args) >= 3:
-            return "/health" not in str(args[2])
+            path = str(args[2])
+            return "/health" not in path and "/activity" not in path
         return True
 
 
 logging.getLogger("uvicorn.access").addFilter(_HealthAccessFilter())
+
+# Surface this service's own work logs (model loads + per-request embed timing)
+# at INFO so the GPU's behaviour is visible — without this, a custom logger
+# propagates to the WARNING-level root and stays hidden behind uvicorn's loggers.
+# Set VISION_LOG_LEVEL=DEBUG for more detail.
+log = logging.getLogger("deedlit.vision")
+if not log.handlers:
+    _vh = logging.StreamHandler()
+    _vh.setFormatter(logging.Formatter("%(levelname)s:     [%(name)s] %(message)s"))
+    log.addHandler(_vh)
+    log.propagate = False
+log.setLevel(os.getenv("VISION_LOG_LEVEL", "INFO").upper())
 
 app = FastAPI(
     title="ComfyUI CLIP Embedding API",
@@ -188,6 +268,8 @@ app = FastAPI(
         {"name": "services", "description": "Reachability of the backing data-stack services (used by the test UI)."},
     ],
 )
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+install_activity(app)
 
 
 class TextEmbeddingRequest(BaseModel):
@@ -311,6 +393,7 @@ class HealthResponse(BaseModel):
     vision_ready: bool = Field(..., description="Whether the vision tower (image embeddings) is loaded.")
     text_ready: bool = Field(..., description="Whether the text tower (text embeddings) is loaded.")
     sparse_model: str = Field(..., description="SPLADE model name used for sparse text embeddings.")
+    sparse_device: str = Field(..., description="Device SPLADE runs on (`cpu` or `cuda`); onnxruntime, separate from the CLIP towers.")
     sparse_ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
 
 
@@ -379,6 +462,7 @@ class ModelInfo(BaseModel):
 
 class SparseModelInfo(BaseModel):
     name: str = Field(..., description="SPLADE model name for sparse text embeddings.")
+    device: str = Field(..., description="Device SPLADE runs on (`cpu` or `cuda`); onnxruntime, separate from the CLIP towers.")
     ready: bool = Field(..., description="Whether the SPLADE sparse text model is loaded.")
 
 
@@ -402,6 +486,65 @@ _tokenizers: dict[str, object] = {}
 # SPLADE sparse text model. Single-element cache keyed by model name so the
 # heavy fastembed import + ONNX model download happen only on first use.
 _sparse_models: dict[str, object] = {}
+
+
+# All model loads and forward passes run on this one worker thread. The (async)
+# routes ``await`` it, which buys two things:
+#   1. Responsiveness — heavy torch work runs off the asyncio event loop, so a
+#      slow first-use load or a long embed no longer freezes the whole worker
+#      (health checks and concurrent requests keep answering).
+#   2. Single-flight — a single worker serializes GPU work, so concurrent
+#      first-requests can't both enter ``_load_*_model`` and double-load a tower,
+#      which on a tight box exhausts VRAM / Windows commit and crashes with
+#      "paging file is too small" (os error 1455). Requests queue here instead.
+_gpu_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-gpu")
+
+# SPLADE (onnxruntime) runs on its OWN single worker thread, separate from the
+# torch ``_gpu_pool``. Dense (CLIP, torch) and sparse (SPLADE, onnxruntime) are
+# different runtimes with independent memory pools and CUDA contexts, so giving
+# sparse its own thread lets a sparse request overlap a CLIP forward instead of
+# queuing behind it on the single torch worker — the two embeddings now run in
+# parallel on the GPU. Still max_workers=1 so SPLADE keeps its own single-flight
+# (no double model load).
+_sparse_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vision-sparse")
+
+# Image decode runs here, NOT on the asyncio event loop and NOT on the single
+# _gpu_pool worker. PIL/libjpeg decode is CPU-bound and releases the GIL, so a
+# pool of workers decodes the images of a burst in parallel across cores while
+# the GPU stays busy embedding the previous batch. (The expensive resize/normalize
+# moved to the GPU — see _preprocess_image — so decode is the only per-image CPU
+# cost left.) max_workers defaults to min(8, cpu_count).
+_cpu_pool = ThreadPoolExecutor(
+    max_workers=int(os.getenv("VISION_PREPROCESS_WORKERS", str(min(8, os.cpu_count() or 4)))),
+    thread_name_prefix="vision-cpu",
+)
+
+# Dense micro-batching. The ingest hot path POSTs /embed/image for ONE image per
+# file; with a scaled ingest-worker pool, hundreds of those land here at once. On
+# the single GPU worker they otherwise run one-image-at-a-time (batch=1), which
+# wastes the GPU — a ViT-H forward on one 224x224 image leaves almost all of the
+# device idle. The batcher coalesces concurrent single-image requests that arrive
+# within a short window into ONE [B,3,224,224] forward pass, so a large ingest
+# backlog saturates the GPU. Single-flight is preserved (still one forward at a
+# time on _gpu_pool); batching IS the parallelism — B images embed together.
+#   VISION_DENSE_BATCH_MAX:     max images per GPU forward.
+#   VISION_DENSE_BATCH_WAIT_MS: how long the first request waits to accumulate a
+#                               batch before firing (latency vs. throughput knob;
+#                               0 = fire as soon as the worker is free).
+DENSE_BATCH_MAX = max(1, int(os.getenv("VISION_DENSE_BATCH_MAX", "32")))
+DENSE_BATCH_WAIT_MS = max(0.0, float(os.getenv("VISION_DENSE_BATCH_WAIT_MS", "10")))
+
+
+async def _run_gpu(fn, *args):
+    """Run a blocking GPU/CPU torch call on the single torch inference worker thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_gpu_pool, fn, *args)
+
+
+async def _run_sparse(fn, *args):
+    """Run a blocking SPLADE/onnxruntime call on the dedicated sparse worker thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_sparse_pool, fn, *args)
 
 
 def _normalize(x: torch.Tensor) -> torch.Tensor:
@@ -439,10 +582,24 @@ def _embed_text_vec(text: str, preset: str = DEFAULT_PRESET) -> torch.Tensor:
     return vec[0]
 
 
+def _preprocess_image(image: Image.Image, preset: str) -> torch.Tensor:
+    """Turn a decoded PIL image into a model-input tensor ``[3,224,224]`` on DEVICE.
+
+    On CUDA (``PREPROCESS_ON_GPU``) the uint8 image is uploaded and the
+    resize/crop/scale/normalize run on the GPU, so the heavy BICUBIC resize no
+    longer pegs a CPU thread while the GPU idles. On CPU it falls back to the
+    original PIL/torchvision Compose for byte-identical numerics.
+    """
+    if PREPROCESS_ON_GPU:
+        return _GPU_PREPROCESS(pil_to_tensor(image).to(DEVICE))
+    return _vision_preprocess[preset](image).to(DEVICE)
+
+
 def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.Tensor:
     _load_vision_model(preset)
 
-    image_tensor = _vision_preprocess[preset](image).unsqueeze(0).to(DEVICE)
+    started = time.perf_counter()
+    image_tensor = _preprocess_image(image, preset).unsqueeze(0)
 
     if USE_FP16 and DEVICE.startswith("cuda"):
         image_tensor = image_tensor.half()
@@ -451,7 +608,143 @@ def _embed_image_vec(image: Image.Image, preset: str = DEFAULT_PRESET) -> torch.
         vec = _vision_models[preset](pixel_values=image_tensor).image_embeds
         vec = _normalize(vec)
 
+    # Per-request GPU timing: if this is fast but ingest is slow, the bottleneck
+    # is elsewhere (labelagent/metadata/network), not the CLIP forward pass.
+    log.info(
+        "embed image (%s) %.0f ms on %s%s",
+        preset, (time.perf_counter() - started) * 1000, DEVICE,
+        " fp16" if (USE_FP16 and DEVICE.startswith("cuda")) else "",
+    )
     return vec[0]
+
+
+# Worker-thread entry points: run the full embed + ``.cpu().tolist()`` copy off
+# the event loop and return a plain list, so the routes only build the response.
+def _embed_image_list(image: Image.Image, preset: str) -> list[float]:
+    return _embed_image_vec(image, preset).float().cpu().tolist()
+
+
+def _embed_text_list(text: str, preset: str) -> list[float]:
+    return _embed_text_vec(text, preset).float().cpu().tolist()
+
+
+def _embed_images_batch(images: list[Image.Image], preset: str) -> list[list[float]]:
+    """Embed a list of images in ONE batched GPU forward pass.
+
+    Preprocesses every image, stacks them into a single [B,3,224,224] tensor and
+    runs one forward — the GPU embeds the whole batch in parallel instead of B
+    sequential batch-1 passes. ``_normalize`` reduces over the last dim, so it
+    L2-normalizes each row independently. Returns one plain-Python vector per
+    image, in input order.
+    """
+    _load_vision_model(preset)
+
+    on_cuda = DEVICE.startswith("cuda")
+
+    started = time.perf_counter()
+    batch = torch.stack([_preprocess_image(image, preset) for image in images])
+    if USE_FP16 and on_cuda:
+        batch = batch.half()
+    if on_cuda:
+        torch.cuda.synchronize()  # let the prep timing capture the GPU resize, not just kernel launches
+    prep_ms = (time.perf_counter() - started) * 1000
+
+    fwd_started = time.perf_counter()
+    with torch.no_grad():
+        vecs = _vision_models[preset](pixel_values=batch).image_embeds
+        vecs = _normalize(vecs)
+    if on_cuda:
+        torch.cuda.synchronize()
+    fwd_ms = (time.perf_counter() - fwd_started) * 1000
+
+    # Split prep vs forward so a CPU-bound preprocessing stall (the old bottleneck)
+    # is visible separately from the GPU forward. If prep >> fwd, decode/upload is
+    # the limit, not the GPU.
+    log.info(
+        "embed image batch (%s) n=%d prep %.0f ms + fwd %.0f ms on %s%s",
+        preset, len(images), prep_ms, fwd_ms, DEVICE,
+        " fp16" if (USE_FP16 and on_cuda) else "",
+    )
+    return vecs.float().cpu().tolist()
+
+
+def _embed_images_list(items: list[tuple[str, Image.Image]], preset: str) -> list[tuple[str, list[float]]]:
+    # One batched forward for the whole upload rather than a per-image loop.
+    vectors = _embed_images_batch([image for _, image in items], preset)
+    return [(label, vector) for (label, _), vector in zip(items, vectors)]
+
+
+def _embed_texts_list(texts: list[str], preset: str) -> list[tuple[str, list[float]]]:
+    return [(text, _embed_text_list(text, preset)) for text in texts]
+
+
+# --- Dense micro-batcher -------------------------------------------------
+# One asyncio.Queue + one drain task per preset. /embed/image enqueues its image
+# with a future and awaits it; the drain task coalesces everything that arrives
+# within DENSE_BATCH_WAIT_MS (capped at DENSE_BATCH_MAX) into a single batched GPU
+# forward, then resolves each future. Lazily started on the uvicorn event loop on
+# the first request (single uvicorn worker => one loop, so no cross-loop hazard).
+_dense_queues: dict[str, asyncio.Queue] = {}
+_dense_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _dense_batch_loop(preset: str, queue: asyncio.Queue) -> None:
+    """Drain ``queue`` forever, embedding each coalesced batch in one GPU job."""
+    loop = asyncio.get_running_loop()
+    while True:
+        image, fut = await queue.get()
+        batch: list[tuple[Image.Image, asyncio.Future]] = [(image, fut)]
+
+        # Accumulate more requests that arrive within the wait window, so a burst
+        # of concurrent single-image calls fires as one big forward. A free worker
+        # with WAIT_MS=0 still grabs everything already queued before embedding.
+        deadline = loop.time() + DENSE_BATCH_WAIT_MS / 1000.0
+        while len(batch) < DENSE_BATCH_MAX:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(queue.get(), remaining))
+            except asyncio.TimeoutError:
+                break
+
+        images = [im for im, _ in batch]
+        try:
+            vectors = await _run_gpu(_embed_images_batch, images, preset)
+            for (_, f), vector in zip(batch, vectors):
+                if not f.done():
+                    f.set_result(vector)
+        except Exception as exc:  # propagate the same failure to every waiter
+            for _, f in batch:
+                if not f.done():
+                    f.set_exception(exc)
+
+
+def _dense_queue(preset: str) -> asyncio.Queue:
+    """Return (lazily creating) the per-preset queue + its running drain task."""
+    queue = _dense_queues.get(preset)
+    if queue is None:
+        queue = asyncio.Queue()
+        _dense_queues[preset] = queue
+        # Keep a reference so the long-lived task is never GC'd mid-flight.
+        _dense_tasks[preset] = asyncio.create_task(_dense_batch_loop(preset, queue))
+    return queue
+
+
+async def _embed_image_batched(image: Image.Image, preset: str) -> list[float]:
+    """Submit one image to the dense batcher and await its embedding.
+
+    Concurrent callers coalesce into a shared GPU forward; a single caller still
+    gets a (batch-of-one) embedding after at most DENSE_BATCH_WAIT_MS.
+    """
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    await _dense_queue(preset).put((image, fut))
+    return await fut
+
+
+def _decode_rgb(raw: bytes) -> Image.Image:
+    """Decode raw image bytes to an RGB PIL image (CPU; runs on _cpu_pool)."""
+    return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
 async def _read_image_upload(file: UploadFile) -> Image.Image:
@@ -463,8 +756,12 @@ async def _read_image_upload(file: UploadFile) -> Image.Image:
 
     raw = await file.read()
 
+    # Decode off the event loop on the CPU pool: PIL/libjpeg decode is CPU-bound
+    # and releases the GIL, so a burst of uploads decodes in parallel across cores
+    # instead of blocking the single event-loop thread one image at a time.
+    loop = asyncio.get_running_loop()
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        return await loop.run_in_executor(_cpu_pool, _decode_rgb, raw)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid image {file.filename!r}: {exc}") from exc
 
@@ -486,15 +783,33 @@ def _load_vision_model(preset: str) -> None:
     if not local_path.exists():
         raise RuntimeError(f"Local clip_vision safetensors not found for {preset!r}: {local_path}")
 
-    m = CLIPVisionModelWithProjection(config["vision_config"])
+    # Lazy first-use load (safetensors -> GPU) is a one-time multi-second cost
+    # during which the GPU looks idle; log it so a slow first file is explained.
+    log.info("loading CLIP vision tower %s onto %s …", preset, DEVICE)
+    _load_started = time.perf_counter()
 
-    state_dict = load_file(str(local_path))
+    # Build the model and load the checkpoint directly on the target device so we
+    # never hold the weights in CPU commit. The old path allocated a full fp32
+    # random-init model on CPU here, then mmapped a second fp32 copy via
+    # load_file — ~2x the checkpoint in CPU commit. On Windows, when the system
+    # commit limit is already near full, that construction exhausts the remaining
+    # commit and the subsequent safetensors mmap fails with "paging file is too
+    # small" (os error 1455) on the large towers (vit_h / big_g). Constructing
+    # under the device context puts the random-init weights straight on the GPU,
+    # and load_file(device=DEVICE) lands the checkpoint there too.
+    with torch.device(DEVICE):
+        m = CLIPVisionModelWithProjection(config["vision_config"])
+
+    state_dict = load_file(str(local_path), device=DEVICE)
     state_dict.pop("vision_model.embeddings.position_ids", None)
     missing, unexpected = m.load_state_dict(state_dict, strict=False)
     if missing or unexpected:
         raise RuntimeError(
             f"Unexpected clip_vision state dict layout for {preset!r}. missing={missing} unexpected={unexpected}"
         )
+    # Release the loaded checkpoint copy promptly so peak (GPU) memory during load
+    # stays at ~1x the weights rather than 2x once they're copied into the module.
+    del state_dict
 
     m = m.to(DEVICE).eval()
 
@@ -510,6 +825,7 @@ def _load_vision_model(preset: str) -> None:
             transforms.Normalize(mean=CLIP_IMAGE_MEAN, std=CLIP_IMAGE_STD),
         ]
     )
+    log.info("loaded CLIP vision tower %s in %.0f ms", preset, (time.perf_counter() - _load_started) * 1000)
 
 
 def _load_text_model(preset: str) -> None:
@@ -551,8 +867,42 @@ def _load_sparse_model() -> object:
 
     from fastembed import SparseTextEmbedding
 
-    _sparse_models[SPARSE_MODEL_NAME] = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
-    return _sparse_models[SPARSE_MODEL_NAME]
+    # Drive onnxruntime onto the GPU when SPARSE_DEVICE is cuda. The CUDA provider
+    # is listed first with CPU as fallback, so onnxruntime uses the GPU when
+    # onnxruntime-gpu (the `fastembed-gpu` package) is installed and silently
+    # degrades to CPU — with an ORT warning — when it is not. `device_ids` pins
+    # the GPU ordinal. fastembed downloads the (small) ONNX model on first use.
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if SPARSE_USE_GPU
+        else ["CPUExecutionProvider"]
+    )
+    log.info("loading SPLADE sparse model %s (providers=%s) …", SPARSE_MODEL_NAME, providers)
+    _load_started = time.perf_counter()
+    model = SparseTextEmbedding(
+        model_name=SPARSE_MODEL_NAME,
+        providers=providers,
+        device_ids=[_cuda_index(SPARSE_DEVICE)] if SPARSE_USE_GPU else None,
+    )
+
+    # Surface the provider onnxruntime actually selected so a silent CPU fallback
+    # (e.g. CPU-only fastembed installed on a GPU box) is visible in the logs
+    # rather than hiding behind "sparse is slow". Best-effort across fastembed
+    # versions — never fail the load over an introspection miss.
+    active = None
+    try:
+        inner = getattr(getattr(model, "model", None), "model", None)
+        if inner is not None and hasattr(inner, "get_providers"):
+            active = inner.get_providers()
+    except Exception:
+        active = None
+    log.info(
+        "loaded SPLADE sparse model %s in %.0f ms (active providers=%s)",
+        SPARSE_MODEL_NAME, (time.perf_counter() - _load_started) * 1000, active or "unknown",
+    )
+
+    _sparse_models[SPARSE_MODEL_NAME] = model
+    return model
 
 
 def _embed_sparse(text: str) -> tuple[list[int], list[float]]:
@@ -563,9 +913,14 @@ def _embed_sparse(text: str) -> tuple[list[int], list[float]]:
     ``list[int]`` / ``list[float]``.
     """
     model = _load_sparse_model()
+    started = time.perf_counter()
     embedding = next(iter(model.embed([text])))
     indices = [int(i) for i in embedding.indices.tolist()]
     values = [float(v) for v in embedding.values.tolist()]
+    log.info(
+        "embed sparse %.0f ms on %s",
+        (time.perf_counter() - started) * 1000, SPARSE_DEVICE,
+    )
     return indices, values
 
 
@@ -619,6 +974,7 @@ def health() -> HealthResponse:
         vision_ready=DEFAULT_PRESET in _vision_models,
         text_ready=DEFAULT_PRESET in _text_models,
         sparse_model=SPARSE_MODEL_NAME,
+        sparse_device=SPARSE_DEVICE,
         sparse_ready=SPARSE_MODEL_NAME in _sparse_models,
     )
 
@@ -668,6 +1024,7 @@ def models() -> ModelsResponse:
         models=[_model_info(p) for p in MODEL_CONFIGS],
         sparse=SparseModelInfo(
             name=SPARSE_MODEL_NAME,
+            device=SPARSE_DEVICE,
             ready=SPARSE_MODEL_NAME in _sparse_models,
         ),
     )
@@ -682,13 +1039,12 @@ def models() -> ModelsResponse:
     tags=["embeddings"],
     description="Encode a single text with the OpenCLIP text tower and return its L2-normalized embedding.",
 )
-def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
+async def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     preset = _resolve_preset(request.model)
-    vec = _embed_text_vec(request.text, preset)
-    embedding = vec.float().cpu().tolist()
+    embedding = await _run_gpu(_embed_text_list, request.text, preset)
 
     return EmbeddingResponse(
         model_preset=preset,
@@ -712,11 +1068,11 @@ def embed_text(request: TextEmbeddingRequest) -> EmbeddingResponse:
         "The SPLADE model loads lazily on first use."
     ),
 )
-def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
+async def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    indices, values = _embed_sparse(request.text)
+    indices, values = await _run_sparse(_embed_sparse, request.text)
 
     return SparseEmbeddingResponse(
         model=SPARSE_MODEL_NAME,
@@ -734,15 +1090,16 @@ def embed_sparse(request: SparseEmbeddingRequest) -> SparseEmbeddingResponse:
     tags=["embeddings"],
     description="Encode one or more texts with the OpenCLIP text tower and return one L2-normalized embedding per text, in order.",
 )
-def embed_texts(request: TextsEmbeddingRequest) -> BatchEmbeddingResponse:
+async def embed_texts(request: TextsEmbeddingRequest) -> BatchEmbeddingResponse:
     preset = _resolve_preset(request.model)
-    results = []
     for i, text in enumerate(request.texts):
         if not text.strip():
             raise HTTPException(status_code=400, detail=f"texts[{i}] cannot be empty.")
-        vec = _embed_text_vec(text, preset)
-        embedding = vec.float().cpu().tolist()
-        results.append(EmbeddingResult(index=i, label=text, dim=len(embedding), embedding=embedding))
+    embeddings = await _run_gpu(_embed_texts_list, list(request.texts), preset)
+    results = [
+        EmbeddingResult(index=i, label=label, dim=len(embedding), embedding=embedding)
+        for i, (label, embedding) in enumerate(embeddings)
+    ]
 
     return BatchEmbeddingResponse(
         model_preset=preset,
@@ -767,8 +1124,9 @@ async def embed_image(
 ) -> EmbeddingResponse:
     preset = _resolve_preset(model)
     image = await _read_image_upload(file)
-    vec = _embed_image_vec(image, preset)
-    embedding = vec.float().cpu().tolist()
+    # Go through the micro-batcher: concurrent /embed/image calls (the ingest hot
+    # path) coalesce into one batched GPU forward instead of serializing batch-1.
+    embedding = await _embed_image_batched(image, preset)
 
     return EmbeddingResponse(
         model_preset=preset,
@@ -796,14 +1154,17 @@ async def embed_images(
         raise HTTPException(status_code=400, detail="files cannot be empty.")
 
     preset = _resolve_preset(model)
-    results = []
-    for i, file in enumerate(files):
-        image = await _read_image_upload(file)
-        vec = _embed_image_vec(image, preset)
-        embedding = vec.float().cpu().tolist()
-        results.append(
-            EmbeddingResult(index=i, label=file.filename or f"image_{i}", dim=len(embedding), embedding=embedding)
-        )
+    # Read all uploads on the event loop, then embed the whole batch in one GPU
+    # job so the worker is held once for the batch rather than per round-trip.
+    items = [
+        (file.filename or f"image_{i}", await _read_image_upload(file))
+        for i, file in enumerate(files)
+    ]
+    embeddings = await _run_gpu(_embed_images_list, items, preset)
+    results = [
+        EmbeddingResult(index=i, label=label, dim=len(embedding), embedding=embedding)
+        for i, (label, embedding) in enumerate(embeddings)
+    ]
 
     return BatchEmbeddingResponse(
         model_preset=preset,
@@ -821,6 +1182,31 @@ def _ranked_results(reference: torch.Tensor, candidates: list[tuple[str, torch.T
     return sorted(results, key=lambda r: r.similarity, reverse=True)
 
 
+# Worker-thread entry points for the similarity routes: embed reference +
+# candidates and rank, all in one serialized GPU job (uploads are read on the
+# event loop first and passed in as already-decoded PIL images).
+def _rank_text_similarity(reference: str, candidates: list[str], preset: str) -> list[SimilarityResult]:
+    ref_vec = _embed_text_vec(reference, preset)
+    cand = [(text, _embed_text_vec(text, preset)) for text in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
+def _rank_image_similarity(
+    reference: Image.Image, candidates: list[tuple[str, Image.Image]], preset: str
+) -> list[SimilarityResult]:
+    ref_vec = _embed_image_vec(reference, preset)
+    cand = [(label, _embed_image_vec(image, preset)) for label, image in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
+def _rank_text_to_image_similarity(
+    text: str, candidates: list[tuple[str, Image.Image]], preset: str
+) -> list[SimilarityResult]:
+    ref_vec = _embed_text_vec(text, preset)
+    cand = [(label, _embed_image_vec(image, preset)) for label, image in candidates]
+    return _ranked_results(ref_vec, cand)
+
+
 @app.post(
     "/similarity/text",
     response_model=SimilarityResponse,
@@ -833,26 +1219,23 @@ def _ranked_results(reference: torch.Tensor, candidates: list[tuple[str, torch.T
         "ranked by cosine similarity to the reference (descending)."
     ),
 )
-def similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
+async def similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
     if not request.reference.strip():
         raise HTTPException(status_code=400, detail="reference cannot be empty.")
     if not request.candidates:
         raise HTTPException(status_code=400, detail="candidates cannot be empty.")
-
-    preset = _resolve_preset(request.model)
-    ref_vec = _embed_text_vec(request.reference, preset)
-
-    candidates = []
     for i, text in enumerate(request.candidates):
         if not text.strip():
             raise HTTPException(status_code=400, detail=f"candidates[{i}] cannot be empty.")
-        candidates.append((text, _embed_text_vec(text, preset)))
+
+    preset = _resolve_preset(request.model)
+    results = await _run_gpu(_rank_text_similarity, request.reference, list(request.candidates), preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=request.reference,
-        results=_ranked_results(ref_vec, candidates),
+        results=results,
     )
 
 
@@ -886,18 +1269,17 @@ async def similarity_image(
 
     preset = _resolve_preset(model)
     ref_image = await _read_image_upload(reference)
-    ref_vec = _embed_image_vec(ref_image, preset)
-
-    candidate_vecs = []
-    for i, file in enumerate(candidates):
-        image = await _read_image_upload(file)
-        candidate_vecs.append((file.filename or f"candidate_{i}", _embed_image_vec(image, preset)))
+    cand_items = [
+        (file.filename or f"candidate_{i}", await _read_image_upload(file))
+        for i, file in enumerate(candidates)
+    ]
+    results = await _run_gpu(_rank_image_similarity, ref_image, cand_items, preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=reference.filename or "reference",
-        results=_ranked_results(ref_vec, candidate_vecs),
+        results=results,
     )
 
 
@@ -929,24 +1311,23 @@ async def similarity_text_to_image(
         raise HTTPException(status_code=400, detail="images cannot be empty.")
 
     preset = _resolve_preset(model)
-    ref_vec = _embed_text_vec(text, preset)
-
-    candidate_vecs = []
-    for i, file in enumerate(images):
-        image = await _read_image_upload(file)
-        candidate_vecs.append((file.filename or f"image_{i}", _embed_image_vec(image, preset)))
+    cand_items = [
+        (file.filename or f"image_{i}", await _read_image_upload(file))
+        for i, file in enumerate(images)
+    ]
+    results = await _run_gpu(_rank_text_to_image_similarity, text, cand_items, preset)
 
     return SimilarityResponse(
         model_preset=preset,
         model_name=MODEL_CONFIGS[preset]["model_name"],
         reference=text,
-        results=_ranked_results(ref_vec, candidate_vecs),
+        results=results,
     )
 
 
 @app.post("/simillarity/text", response_model=SimilarityResponse, include_in_schema=False)
-def misspelled_similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
-    return similarity_text(request)
+async def misspelled_similarity_text(request: TextSimilarityRequest) -> SimilarityResponse:
+    return await similarity_text(request)
 
 
 @app.post("/simillarity/image", response_model=SimilarityResponse, include_in_schema=False)
@@ -968,21 +1349,28 @@ async def misspelled_similarity_text_to_image(
 # ---------------------------------------------------------------------
 # Optional Qdrant search (test UI only)
 # ---------------------------------------------------------------------
-def _extract_vector_params(vectors: object) -> tuple[int | None, str | None]:
-    """Pull (size, distance) from a Qdrant collection's vectors config.
+def _extract_vector_params(vectors: object) -> tuple[int | None, str | None, str | None]:
+    """Pull (size, distance, name) from a Qdrant collection's vectors config.
 
-    Handles both the unnamed default vector (``{"size": .., "distance": ..}``)
-    and named-vector maps (``{"name": {"size": ..}}``), taking the first named
-    config in the latter case.
+    Handles both the unnamed default vector (``{"size": .., "distance": ..}`` →
+    name ``None``) and named-vector maps (``{"dense": {"size": ..}}`` → that
+    name). For a named map we prefer the configured dense vector and otherwise
+    fall back to the first named config. ``name`` is ``None`` only for an unnamed
+    (legacy single-vector) collection.
     """
     if not isinstance(vectors, dict):
-        return None, None
+        return None, None, None
     if "size" in vectors:
-        return vectors.get("size"), vectors.get("distance")
-    for cfg in vectors.values():
-        if isinstance(cfg, dict) and "size" in cfg:
-            return cfg.get("size"), cfg.get("distance")
-    return None, None
+        return vectors.get("size"), vectors.get("distance"), None
+    name = (
+        QDRANT_DENSE_VECTOR_NAME
+        if QDRANT_DENSE_VECTOR_NAME in vectors
+        else next(iter(vectors), None)
+    )
+    cfg = vectors.get(name) if name is not None else None
+    if isinstance(cfg, dict) and "size" in cfg:
+        return cfg.get("size"), cfg.get("distance"), name
+    return None, None, name
 
 
 async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResponse:
@@ -1020,7 +1408,7 @@ async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResp
     status.collection_exists = True
     status.points_count = result.get("points_count")
     vectors = (((result.get("config") or {}).get("params") or {}).get("vectors"))
-    size, distance = _extract_vector_params(vectors)
+    size, distance, _name = _extract_vector_params(vectors)
     status.vector_size = size
     status.distance = distance
     status.dim_matches = size == model_dim
@@ -1030,6 +1418,28 @@ async def _fetch_qdrant_status(preset: str = DEFAULT_PRESET) -> QdrantStatusResp
             f"{model_dim}-dim. Rebuild the collection with deedlit.vision embeddings to enable search."
         )
     return status
+
+
+async def _resolve_search_vector_name() -> str | None:
+    """Which named vector to query, or ``None`` for an unnamed collection.
+
+    deedlit.search owns the shared collection with NAMED vectors (dense+sparse),
+    so the test-UI search must address the dense vector by name. Only a legacy
+    single-vector (unnamed) collection yields ``None``. On any read failure we
+    assume the named dense vector — that's the current architecture, and a wrong
+    guess surfaces as the real Qdrant error rather than a silent empty result.
+    """
+    url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}"
+    try:
+        async with httpx.AsyncClient(timeout=QDRANT_TIMEOUT) as client:
+            resp = await client.get(url)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return QDRANT_DENSE_VECTOR_NAME
+    result = resp.json().get("result", {}) or {}
+    vectors = (((result.get("config") or {}).get("params") or {}).get("vectors"))
+    _size, _distance, name = _extract_vector_params(vectors)
+    return name
 
 
 async def _qdrant_search(vector: list[float], limit: int, preset: str = DEFAULT_PRESET) -> list[QdrantSearchResult]:
@@ -1042,7 +1452,11 @@ async def _qdrant_search(vector: list[float], limit: int, preset: str = DEFAULT_
         raise HTTPException(status_code=409, detail=status.detail or "Qdrant collection vector size mismatch.")
 
     url = f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search"
-    payload = {"vector": vector, "limit": limit, "with_payload": True}
+    # Named-vector collections require the query vector to be addressed by name;
+    # an unnamed (legacy) collection takes the bare list.
+    name = await _resolve_search_vector_name()
+    query_vector: object = {"name": name, "vector": vector} if name else vector
+    payload = {"vector": query_vector, "limit": limit, "with_payload": True}
     try:
         async with httpx.AsyncClient(timeout=QDRANT_TIMEOUT) as client:
             resp = await client.post(url, json=payload)
@@ -1091,7 +1505,7 @@ async def qdrant_search_text(request: QdrantTextSearchRequest) -> QdrantSearchRe
     if not request.text.strip():
         raise HTTPException(status_code=400, detail="text cannot be empty.")
     preset = _resolve_preset(request.model)
-    vector = _embed_text_vec(request.text, preset).float().cpu().tolist()
+    vector = await _run_gpu(_embed_text_list, request.text, preset)
     results = await _qdrant_search(vector, request.limit, preset)
     return QdrantSearchResponse(
         collection=QDRANT_COLLECTION,
@@ -1120,7 +1534,7 @@ async def qdrant_search_image(
 ) -> QdrantSearchResponse:
     preset = _resolve_preset(model)
     image = await _read_image_upload(file)
-    vector = _embed_image_vec(image, preset).float().cpu().tolist()
+    vector = await _run_gpu(_embed_image_list, image, preset)
     results = await _qdrant_search(vector, limit, preset)
     return QdrantSearchResponse(
         collection=QDRANT_COLLECTION,

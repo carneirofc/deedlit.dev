@@ -16,8 +16,30 @@ x-app-healthcheck: &app-healthcheck
   retries: 20
   start_period: 10s
 
+# OpenTelemetry export target for the Python services (zero-code tracing via the
+# opentelemetry-instrument entrypoint in each Dockerfile). Spans go to the Alloy
+# OTLP/http receiver, which forwards to Tempo. Alloy is profile-gated, so when it
+# isn't running the exporter just drops spans (no startup dependency). Each
+# service adds its own OTEL_SERVICE_NAME so Tempo separates them. Merge with
+# `<<: *otel-env` into a service's environment.
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+
+# Host path of the image library — bind-mounted read-only into every ingest
+# container so they can scan local folders. Set IMAGE_LIBRARY_ROOT_HOST in
+# .env to override (e.g. /mnt/nas/images on Linux, D:/images on Windows).
+# Inside containers the mount lands at /library.
+x-library-volume: &library-volume
+  - "${IMAGE_LIBRARY_ROOT_HOST:-K:/}:/library:ro"
+
 services:
   # --- Datastores --------------------------------------------------------
+  # Postgres is the source of truth and also the DURABILITY layer for ingest
+  # state: the source-folder registry (inventories), the per-image task ledger,
+  # the coarse JOB history, and the persisted ingest config overrides
+  # (settings table) all live here, so they survive a service restart. The
+  # postgres_data volume below is what makes that persistence durable.
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -25,6 +47,50 @@ services:
       POSTGRES_USER: imageapp
       POSTGRES_PASSWORD: imageapp
       POSTGRES_DB: imageapp
+    # Performance tuning over the alpine image's tiny defaults (128MB
+    # shared_buffers / 4MB work_mem) that lag under the ingest write burst + the
+    # catalog browse/count/tag-report reads. Defaults here are CONSERVATIVE so the
+    # stack boots on a small host (e.g. Docker Desktop): shared_buffers is the
+    # only real boot-time allocation, kept at 256MB. On a big box scale UP via env
+    # (shared_buffers ~= 25% RAM, effective_cache_size ~= 50-75% RAM), e.g.
+    #   POSTGRES_SHARED_BUFFERS=2GB POSTGRES_EFFECTIVE_CACHE_SIZE=6GB ...
+    # The WAL / SSD-cost / parallel knobs below cost no startup memory.
+    # synchronous_commit stays ON — Postgres is the ingest durability layer.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}"
+      - "-c"
+      - "shared_buffers=${POSTGRES_SHARED_BUFFERS:-2GB}"
+      - "-c"
+      - "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-6GB}"
+      - "-c"
+      - "maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-512MB}"
+      - "-c"
+      - "work_mem=${POSTGRES_WORK_MEM:-32MB}"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      # SSD-friendly planner costs + deeper async I/O queue.
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "effective_io_concurrency=200"
+      # Parallel query workers (browse/count over a large catalog).
+      - "-c"
+      - "max_worker_processes=8"
+      - "-c"
+      - "max_parallel_workers=8"
+      - "-c"
+      - "max_parallel_workers_per_gather=2"
+    # /dev/shm for parallel-query + large work_mem hash/sort spills; Docker's 64MB
+    # default can throw "could not resize shared memory segment" under load.
+    shm_size: ${POSTGRES_SHM_SIZE:-512mb}
     ports:
       - "5432:5432"
     volumes:
@@ -42,6 +108,13 @@ services:
       NEO4J_AUTH: neo4j/password
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      # Memory tuning over the small community defaults (a growing graph spills to
+      # disk and lags). heap initial == max avoids GC resize pauses; pagecache
+      # should ideally hold the whole graph store. Env-overridable — shrink on a
+      # low-RAM host (NEO4J_HEAP=1G NEO4J_PAGECACHE=512M) or grow on a big box.
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-2G}
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -55,13 +128,34 @@ services:
       retries: 20
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # GPU-accelerated index build by default (this stack runs on the GPU box).
+    # The gpu-nvidia image + QDRANT__GPU__INDEXING speed up HNSW INDEX BUILDING
+    # (bulk ingest + POST /rebuild on large libraries) — query execution is always
+    # CPU in Qdrant, so this does not change search latency, only how fast a large
+    # collection becomes searchable. Needs the device reservation below + the
+    # NVIDIA container runtime on the host.
+    # CPU-only host (no NVIDIA runtime, e.g. CI): override both envs AND drop the
+    # `deploy:` block — a GPU reservation makes `docker compose up` fail with
+    # "could not select device driver" when no GPU is present:
+    #     QDRANT_IMAGE=qdrant/qdrant:latest QDRANT_GPU_INDEXING=false docker compose up -d
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:gpu-nvidia-latest}
     restart: unless-stopped
     ports:
       - "6333:6333"
       - "6334:6334"
+    environment:
+      # Qdrant reads nested config from QDRANT__<SECTION>__<KEY>. gpu.indexing=true
+      # builds HNSW on the GPU; it no-ops (CPU build) on the non-GPU image.
+      QDRANT__GPU__INDEXING: "${QDRANT_GPU_INDEXING:-true}"
     volumes:
       - qdrant_data:/qdrant/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
       interval: 10s
@@ -87,12 +181,90 @@ services:
       timeout: 5s
       retries: 20
 
+  # Redis: a BOUNDED, ephemeral hot shield for image bytes in front of RustFS.
+  # It is NOT the primary cache — image responses are content-addressed by sha256
+  # and served with `Cache-Control: immutable` + an ETag, so the browser/CDN do
+  # the heavy lifting; Redis only spares RustFS on cold-browser repeat loads.
+  # maxmemory + allkeys-lru cap it so a large library can never grow it toward
+  # host RAM (the old config had no limit and a 7-day TTL -> unbounded). No
+  # persistence: it's a throwaway cache, so don't write image bytes to disk.
+  # REDIS_URL=redis://localhost:6379 in comfyhelper .env.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    mem_limit: 640m
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # RabbitMQ: durable transport for the async index/label task queues (ADR 0001).
+  # Queues survive a broker restart: they are declared durable=True and messages
+  # publish in PERSISTENT delivery mode (deedlit.ingest/broker.py), and the
+  # rabbitmq_data volume below holds the Mnesia store (durable queue defs +
+  # persistent messages). The management plugin (15672) backs the in-app queue
+  # visualization (#29) and is the deep-link target for power debugging. The
+  # ingest fast path publishes tasks here; ingest-worker replicas consume them.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: deedlit
+      RABBITMQ_DEFAULT_PASS: deedlit
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # management UI / HTTP API
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # --- Web apps -----------------------------------------------------------
+  # Build context is the monorepo root because comfyhelper depends on the
+  # @deedlit.dev/ui workspace package. Only needs the API gateway URL at
+  # runtime (all reads/writes go through api:8000, not direct DB access).
+  comfyhelper:
+    build:
+      context: .
+      dockerfile: deedlit.dev.comfyhelper/Dockerfile
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      NODE_ENV: production
+      DEEDLIT_API_URL: http://api:8000
+      REDIS_URL: redis://redis:6379
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+      OTEL_SERVICE_NAME: comfyhelper
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    depends_on:
+      api: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
   # --- Owning services ---------------------------------------------------
   catalog:
     build: { context: ./deedlit.catalog }
     restart: unless-stopped
     ports: ["8001:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-catalog
       DATABASE_URL: postgresql://imageapp:imageapp@postgres:5432/imageapp
       OBJECT_STORE_ENDPOINT: http://rustfs:9000
       OBJECT_STORE_ACCESS_KEY: rustfsadmin
@@ -108,6 +280,8 @@ services:
     restart: unless-stopped
     ports: ["8002:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-search
       QDRANT_URL: http://qdrant:6333
     depends_on:
       qdrant: { condition: service_healthy }
@@ -118,6 +292,8 @@ services:
     restart: unless-stopped
     ports: ["8003:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-graph
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: password
@@ -130,6 +306,28 @@ services:
     build: { context: ./deedlit.metadata }
     restart: unless-stopped
     ports: ["8005:8000"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-metadata
+    healthcheck: *app-healthcheck
+
+  # Agno AgentOS image-labeling agent. Talks to a llama-server (vision GGUF) on
+  # the HOST — reached via host.docker.internal, not a compose service. Readiness
+  # depends on that external server, so nothing hard-depends on it (the ingest
+  # hook degrades gracefully when it's unreachable).
+  labelagent:
+    build: { context: ./deedlit.labelagent }
+    restart: unless-stopped
+    ports: ["8006:8000"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-labelagent
+      LABELAGENT_LLM_BASE_URL: ${LABELAGENT_LLM_BASE_URL:-http://host.docker.internal:8888/v1}
+      LABELAGENT_MODEL_ID: ${LABELAGENT_MODEL_ID:-local-vlm}
+      LABELAGENT_MAX_TOKENS: ${LABELAGENT_MAX_TOKENS:-1024}
+      LABELAGENT_THINKING_BUDGET: ${LABELAGENT_THINKING_BUDGET:-256}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck: *app-healthcheck
 
   ingest:
@@ -137,30 +335,139 @@ services:
     restart: unless-stopped
     ports: ["8004:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest
       METADATA_URL: http://metadata:8000
       VISION_URL: http://vision:8000
       CATALOG_URL: http://catalog:8000
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
+      # Optional AI labeling enrichment (best-effort; unset => disabled).
+      LABELAGENT_URL: http://labelagent:8000
+      # RabbitMQ for the async ingest DAG task queues (ADR 0001/0002). Ingest is
+      # fully queue-driven: a folder scan publishes one `ingest` task per file and
+      # the worker pool catalogs + projects them. RabbitMQ is a HARD dependency —
+      # a publish failure marks the file failed and the next scan re-enqueues it.
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      # Producer parallelism (ADR 0002). INGEST_CONCURRENCY bounds how many
+      # `ingest` tasks a folder scan publishes concurrently.
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-4}
+      # Background schedulers (0/unset disables each). Folder scan re-walks the
+      # configured-folder registry on each folder's own interval; label backfill
+      # periodically relabels images missing an AI description; orphan prune
+      # periodically sweeps orphaned Asset/Tag nodes from Neo4j (graph POST /prune).
+      FOLDER_SCAN_TICK_SECONDS: ${FOLDER_SCAN_TICK_SECONDS:-60}
+      LABEL_BACKFILL_INTERVAL_SECONDS: ${LABEL_BACKFILL_INTERVAL_SECONDS:-0}
+      ORPHAN_PRUNE_INTERVAL_SECONDS: ${ORPHAN_PRUNE_INTERVAL_SECONDS:-0}
+      # Backpressure: a folder-scan tick is skipped while `ingest` already holds
+      # this many ready tasks, so the producer can't outrun a down/slow worker and
+      # pile up unbounded duplicate ingest tasks (0 disables the gate).
+      FOLDER_SCAN_MAX_INGEST_BACKLOG: ${FOLDER_SCAN_MAX_INGEST_BACKLOG:-5000}
+      # Browser-reachable base URL of the comfyhelper UI. Embedded into each
+      # search point's payload as image_url/thumbnail_url (the image proxy
+      # endpoints), so override it to the real public URL in deployment.
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+      # Host image library is mounted at /library; register folders using this
+      # container-side path (e.g. /library/comfyui/output).
+      IMAGE_LIBRARY_ROOT: ${IMAGE_LIBRARY_ROOT:-/library}
+    volumes: *library-volume
     depends_on:
       metadata: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
     healthcheck: *app-healthcheck
+
+  # FAST worker pool (ADR 0002): same image as ingest, run via worker.py. Drains
+  # the cheap, parallel stages (ingest fast path + embed + index), NOT the LLM
+  # `label` queue. Tune throughput with TASK_PREFETCH (per-worker concurrency) +
+  # WORKER_THREADS (the executor that runs the sync httpx calls) and scale out:
+  #   docker compose up -d --scale ingest-worker=4
+  # No HTTP server, so no healthcheck.
+  ingest-worker:
+    build: { context: ./deedlit.ingest }
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "python", "worker.py"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest-worker
+      QUEUES: ${INGEST_WORKER_QUEUES:-ingest,embed.dense,embed.sparse,index.search,index.graph}
+      TASK_PREFETCH: ${TASK_PREFETCH:-16}
+      WORKER_THREADS: ${WORKER_THREADS:-64}
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      METADATA_URL: http://metadata:8000
+      VISION_URL: http://vision:8000
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+      LABELAGENT_URL: http://labelagent:8000
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+      IMAGE_LIBRARY_ROOT: ${IMAGE_LIBRARY_ROOT:-/library}
+    volumes: *library-volume
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+      metadata: { condition: service_healthy }
+
+  # LLM worker (ADR 0002): drains ONLY the `label` queue. The label queue is an
+  # EXCLUSIVE consumer with prefetch 1 (enforced in broker.py), so the
+  # single-threaded llama-server is never hit concurrently — keep this at ONE
+  # replica (a second would be rejected by the broker anyway). Slow + isolated, so
+  # backlog here never blocks the fast pool above.
+  ingest-worker-label:
+    build: { context: ./deedlit.ingest }
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "python", "worker.py"]
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-ingest-worker-label
+      QUEUES: label
+      AMQP_URL: ${AMQP_URL:-amqp://deedlit:deedlit@rabbitmq:5672/}
+      METADATA_URL: http://metadata:8000
+      VISION_URL: http://vision:8000
+      CATALOG_URL: http://catalog:8000
+      SEARCH_URL: http://search:8000
+      GRAPH_URL: http://graph:8000
+      LABELAGENT_URL: http://labelagent:8000
+      COMFYHELPER_PUBLIC_URL: ${COMFYHELPER_PUBLIC_URL:-http://localhost:3000}
+      IMAGE_LIBRARY_ROOT: ${IMAGE_LIBRARY_ROOT:-/library}
+    volumes: *library-volume
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+      metadata: { condition: service_healthy }
 
   # --- Gateway -----------------------------------------------------------
   api:
     build: { context: ./deedlit.api }
     restart: unless-stopped
-    ports: ["8080:8000"]
+    ports: ["8088:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-api
       CATALOG_URL: http://catalog:8000
       SEARCH_URL: http://search:8000
       GRAPH_URL: http://graph:8000
       INGEST_URL: http://ingest:8000
+      # Text search encodes the query via vision before hitting search, and the
+      # status dashboard probes vision+metadata, so the gateway must reach both.
+      # Inside the compose network they are the `vision`/`metadata` hosts, NOT
+      # localhost (the clients.py defaults are for the bare-metal dev layout).
+      # NB: vision is profile-gated ([vision]/[full]) — bring the stack up with
+      # `--profile vision` (or full) for gateway text search to work.
+      VISION_URL: http://vision:8000
+      METADATA_URL: http://metadata:8000
+      # RabbitMQ management HTTP API — backs the in-app queue-visualization page
+      # (#29). The gateway is the ONLY thing that talks to the management API
+      # (creds stay server-side). Inside the compose network the broker is the
+      # `rabbitmq` host, not localhost.
+      RABBITMQ_MGMT_URL: ${RABBITMQ_MGMT_URL:-http://rabbitmq:15672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-deedlit}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-deedlit}
     depends_on:
       catalog: { condition: service_healthy }
       search: { condition: service_healthy }
       graph: { condition: service_healthy }
       ingest: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
     healthcheck: *app-healthcheck
 
   # --- GPU vision (profile-gated; needs NVIDIA runtime) ------------------
@@ -170,9 +477,16 @@ services:
     restart: unless-stopped
     ports: ["8000:8000"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: deedlit-vision
       COMFYUI_ROOT: /comfyui
-      CLIP_DEVICE: cuda
+      CLIP_DEVICE: ${CLIP_DEVICE:-cuda}
+      # Pin to the single smaller tower (vit_h). Without CLIP_MODELS set, the
+      # default enabled set is "vit_h,big_g" — leaving the 3.7 GB big_g tower
+      # loadable on request, which on a tight box exhausts VRAM / Windows commit
+      # (os error 1455). Enable only vit_h so big_g can never be loaded.
       CLIP_MODEL_PRESET: vit_h
+      CLIP_MODELS: vit_h
       CLIP_FP16: "true"
     volumes:
       - "${COMFYUI_ROOT_HOST:-K:/comfyui/ComfyUI_windows_portable/ComfyUI}:/comfyui:ro"
@@ -269,6 +583,7 @@ volumes:
   qdrant_data:
   rustfs_data:
   rustfs_logs:
+  rabbitmq_data:
   loki_data:
   tempo_data:
   alloy_data:

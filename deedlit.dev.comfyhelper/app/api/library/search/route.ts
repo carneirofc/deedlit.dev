@@ -8,27 +8,26 @@ export const dynamic = "force-dynamic";
 /**
  * Browse / metadata / hybrid search. Proxies to the gateway POST /search.
  *
- * NOTE: the gateway's search contract takes { query, limit, filter } only — it
- * has no offset/pagination and no graphScope resolution. We therefore page on
- * the client by slicing the gateway result; graphScope is accepted but ignored
- * here (the gateway exposes no graph-scope resolution endpoint). The gateway
- * encodes the text `query` into vectors via deedlit.vision before searching, so
- * an empty `query` returns no results (filter-only browse is not yet supported).
+ * Pagination is now REAL server-side offset (gateway -> deedlit.search Qdrant
+ * offset), so each page queries the WHOLE matching set and returns exactly one
+ * window — no client-side slicing of a fixed top-K, and no O(offset^2) re-fetch.
+ * graphScope is accepted by the schema but unsupported by the gateway (no
+ * graph-scope resolution endpoint), so it is destructured out. The gateway
+ * encodes the text `query` into vectors via deedlit.vision; an empty `query`
+ * falls back to a paged catalog browse.
  */
 export async function POST(request: Request) {
   return handleRoute(async () => {
     const body = MetadataSearchRequestSchema.parse(await request.json());
-    // graphScope is accepted by the schema but unsupported by the gateway (no
-    // graph-scope resolution endpoint); destructure it out so it isn't sent.
     const { query, limit, offset, graphScope, ...filters } = body;
     void graphScope;
     const res = await search({
       query: query ?? "",
-      limit: Math.max(limit + offset, limit),
+      limit,
+      offset,
       filter: buildSearchFilter(filters),
     });
-    const all = hitsToCompactResults(res.hits);
-    const results = offset > 0 ? all.slice(offset, offset + limit) : all.slice(0, limit);
+    const results = hitsToCompactResults(res.hits);
     return jsonOk({ results, count: results.length });
   });
 }

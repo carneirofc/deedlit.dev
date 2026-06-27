@@ -26,6 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import broker as broker_module
 import jobs as jobs_module
 import pipeline
 
@@ -55,41 +56,48 @@ def _wait_for(client: TestClient, job_id: str, statuses: set[str], timeout: floa
 
 @pytest.fixture
 def mock_projections(monkeypatch):
-    """Mock catalog list + search/graph coverage probes + rebuild triggers.
+    """Mock catalog list + the four per-stage coverage probes + per-stage pubs.
 
-    Catalog has A, B, C. Search has A, B (C missing). Graph has A (B, C missing).
-    So search-drift = {C}, graph-drift = {B, C}.
+    Catalog has A, B, C.
+      A: dense+sparse blobs, search point, graph node — fully projected.
+      B: dense+sparse blobs + graph node, but NO search point -> index.search.
+      C: nothing — no dense, no sparse, no search, no graph.
+    So per-stage drift is: embed.dense={C}, embed.sparse={C},
+    index.search={B} (B has both vectors but no point; C's vectors are missing so
+    its embed stages fan in instead), index.graph={C}.
     """
     state: dict = {
-        "search_ids": {SHA_A, SHA_B},
-        "graph_ids": {SHA_A},
-        "rebuilds": [],
+        "dense_ids": {SHA_A, SHA_B},
+        "sparse_ids": {SHA_A, SHA_B},
+        "search_ids": {SHA_A},
+        "graph_ids": {SHA_A, SHA_B},
+        "pub": {"embed.dense": [], "embed.sparse": [], "index.search": [], "index.graph": []},
     }
 
     monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A, SHA_B, SHA_C])
+    monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1] if sha in state["dense_ids"] else None)
+    monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": []} if sha in state["sparse_ids"] else None)
     monkeypatch.setattr(pipeline, "search_has", lambda sha: sha in state["search_ids"])
     monkeypatch.setattr(pipeline, "graph_has", lambda sha: sha in state["graph_ids"])
 
-    def fake_rebuild_search():
-        state["rebuilds"].append("search")
-        state["search_ids"] = {SHA_A, SHA_B, SHA_C}
+    def _record(key):
+        async def pub(sha256, parent_op_id=None):
+            state["pub"][key].append(sha256)
+        return pub
 
-    def fake_rebuild_graph():
-        state["rebuilds"].append("graph")
-        state["graph_ids"] = {SHA_A, SHA_B, SHA_C}
-
-    monkeypatch.setattr(pipeline, "rebuild_search", fake_rebuild_search)
-    monkeypatch.setattr(pipeline, "rebuild_graph", fake_rebuild_graph)
+    monkeypatch.setattr(broker_module, "publish_embed_dense_task", _record("embed.dense"))
+    monkeypatch.setattr(broker_module, "publish_embed_sparse_task", _record("embed.sparse"))
+    monkeypatch.setattr(broker_module, "publish_index_search_task", _record("index.search"))
+    monkeypatch.setattr(broker_module, "publish_index_graph_task", _record("index.graph"))
     return state
 
 
 # ---------------------------------------------------------------------------
-# (1) detects drift + (2) triggers repair + (3) per-image status report
+# (1) detects per-stage drift + (2) re-enqueues the right stage + (3) report
 # ---------------------------------------------------------------------------
-def test_reconcile_detects_drift_and_repairs_via_rebuild(fresh_store, mock_projections):
-    # Force full-rebuild repair (drift exceeds the per-image threshold of 0).
+def test_reconcile_detects_drift_and_reenqueues_per_stage(fresh_store, mock_projections):
     with TestClient(app_module.app) as client:
-        r = client.post("/reconcile", json={"perImageMax": 0})
+        r = client.post("/reconcile", json={})
         assert r.status_code == 202
         body = r.json()
         assert body["type"] == "reconcile"
@@ -103,37 +111,51 @@ def test_reconcile_detects_drift_and_repairs_via_rebuild(fresh_store, mock_proje
         job = fresh_store.get(job_id)
         report = job.report
 
-    # Per-image projection status report.
+    # Per-image stage status report.
     images = report["images"]
-    assert images[SHA_A]["in_search"] is True
-    assert images[SHA_A]["in_graph"] is True
-    assert images[SHA_A]["repaired"] is False
+    assert images[SHA_A]["enqueued"] == []  # fully projected
 
-    # C was missing from both -> repaired by both rebuilds.
-    assert images[SHA_C]["in_search"] is False
-    assert images[SHA_C]["in_graph"] is False
-    assert images[SHA_C]["repaired"] is True
+    # B: both vectors present but no search point -> only index.search.
+    assert images[SHA_B]["dense"] is True and images[SHA_B]["sparse"] is True
+    assert images[SHA_B]["in_search"] is False
+    assert images[SHA_B]["enqueued"] == ["index.search"]
 
-    # B was missing from graph only.
-    assert images[SHA_B]["in_search"] is True
-    assert images[SHA_B]["in_graph"] is False
-    assert images[SHA_B]["repaired"] is True
+    # C: nothing present -> embed.dense + embed.sparse + index.graph (NOT
+    # index.search: its vectors are missing, so the embed stages fan it in).
+    assert images[SHA_C]["enqueued"] == ["embed.dense", "embed.sparse", "index.graph"]
 
-    # Summary drift sets.
-    assert set(report["search_drift"]) == {SHA_C}
-    assert set(report["graph_drift"]) == {SHA_B, SHA_C}
+    # Per-stage drift + repair strategy.
+    assert report["drift"]["embed.dense"] == [SHA_C]
+    assert report["drift"]["embed.sparse"] == [SHA_C]
+    assert report["drift"]["index.search"] == [SHA_B]
+    assert report["drift"]["index.graph"] == [SHA_C]
+    assert report["repair_strategy"] == "enqueue-per-stage"
 
-    # Repair used the full rebuild-from-catalog path for both projections.
-    assert set(mock_projections["rebuilds"]) == {"search", "graph"}
+    # Exactly the right stage task published per drifted image.
+    assert mock_projections["pub"]["embed.dense"] == [SHA_C]
+    assert mock_projections["pub"]["embed.sparse"] == [SHA_C]
+    assert mock_projections["pub"]["index.search"] == [SHA_B]
+    assert mock_projections["pub"]["index.graph"] == [SHA_C]
 
 
-def test_reconcile_no_drift_does_not_rebuild(fresh_store, monkeypatch):
+def test_reconcile_no_drift_enqueues_nothing(fresh_store, monkeypatch):
     monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A])
+    monkeypatch.setattr(pipeline, "load_dense_blob", lambda sha: [0.1])
+    monkeypatch.setattr(pipeline, "load_sparse_blob", lambda sha: {"indices": []})
     monkeypatch.setattr(pipeline, "search_has", lambda sha: True)
     monkeypatch.setattr(pipeline, "graph_has", lambda sha: True)
-    rebuilds: list[str] = []
-    monkeypatch.setattr(pipeline, "rebuild_search", lambda: rebuilds.append("search"))
-    monkeypatch.setattr(pipeline, "rebuild_graph", lambda: rebuilds.append("graph"))
+    published: list[str] = []
+
+    def _record(_key):
+        async def pub(sha256, parent_op_id=None):
+            published.append(sha256)
+        return pub
+
+    for name in (
+        "publish_embed_dense_task", "publish_embed_sparse_task",
+        "publish_index_search_task", "publish_index_graph_task",
+    ):
+        monkeypatch.setattr(broker_module, name, _record(name))
 
     with TestClient(app_module.app) as client:
         job_id = client.post("/reconcile", json={}).json()["id"]
@@ -141,39 +163,9 @@ def test_reconcile_no_drift_does_not_rebuild(fresh_store, monkeypatch):
         assert final["status"] == "completed"
         report = fresh_store.get(job_id).report
 
-    assert rebuilds == []
-    assert report["search_drift"] == []
-    assert report["graph_drift"] == []
-    assert report["images"][SHA_A]["repaired"] is False
-
-
-# ---------------------------------------------------------------------------
-# Per-image repair path (few drifters -> targeted reindex, not full rebuild)
-# ---------------------------------------------------------------------------
-def test_reconcile_few_drifters_repairs_per_image(fresh_store, monkeypatch):
-    monkeypatch.setattr(pipeline, "list_catalog_sha256", lambda: [SHA_A, SHA_B])
-    monkeypatch.setattr(pipeline, "search_has", lambda sha: sha == SHA_A)
-    monkeypatch.setattr(pipeline, "graph_has", lambda sha: True)
-
-    rebuilds: list[str] = []
-    monkeypatch.setattr(pipeline, "rebuild_search", lambda: rebuilds.append("search"))
-    monkeypatch.setattr(pipeline, "rebuild_graph", lambda: rebuilds.append("graph"))
-
-    reindexed: list[str] = []
-    monkeypatch.setattr(pipeline, "reindex_image", lambda sha: reindexed.append(sha))
-
-    with TestClient(app_module.app) as client:
-        # perImageMax high enough that 1 drifter goes the per-image route.
-        job_id = client.post("/reconcile", json={"perImageMax": 5}).json()["id"]
-        final = _wait_for(client, job_id, {"completed", "failed"})
-        assert final["status"] == "completed"
-        report = fresh_store.get(job_id).report
-
-    # Only B drifted (search). Per-image reindex used, no full rebuild.
-    assert reindexed == [SHA_B]
-    assert rebuilds == []
-    assert report["images"][SHA_B]["repaired"] is True
-    assert report["repair_strategy"] == "per-image"
+    assert published == []
+    assert all(report["drift"][s] == [] for s in report["drift"])
+    assert report["images"][SHA_A]["enqueued"] == []
 
 
 # ---------------------------------------------------------------------------
