@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]>=0.35.0" \
     "python-multipart>=0.0.9" \
     "pydantic>=2.0" \
+    "pillow>=10.0.0" \
     "opentelemetry-distro>=0.48b0" \
     "opentelemetry-exporter-otlp-proto-http>=1.27.0" \
     "opentelemetry-instrumentation-fastapi>=0.48b0" \
