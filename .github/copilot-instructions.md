@@ -3,12 +3,12 @@
 ## Workspace Map
 - `deedlit.dev/` is the public-facing Next.js site for the deedlit.dev landing experience, books, gallery, and service descriptions.
 - `deedlit.dev.comfyhelper/` is the Next.js app for managing ComfyUI image libraries, metadata, notes, and scan workflows.
-- `deedlit.dev.ui/` is the shared React UI package consumed by both apps as `@deedlit.dev/ui`.
+- `deedlit.dev.ui/` is the shared React UI package consumed by both apps as `@carneirofc/ui`.
 
 ## Monorepo Rules
 - Start in the package that owns the behavior. Do not edit multiple packages unless the change genuinely crosses package boundaries.
 - Put reusable, app-agnostic UI primitives in `deedlit.dev.ui`; keep app-specific components inside the app that owns the domain logic.
-- Before assuming a component should be copied into an app, check whether `@deedlit.dev/ui` already has a suitable primitive.
+- Before assuming a component should be copied into an app, check whether `@carneirofc/ui` already has a suitable primitive.
 - Root scripts orchestrate the workspace, but package-local scripts remain the source of truth for package-specific build, dev, and test commands.
 - When changing either Next.js app, account for the shared UI build step. Both apps already depend on `deedlit.dev.ui` being built before development or production builds.
 

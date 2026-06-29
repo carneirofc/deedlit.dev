@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "dev": "mprocs",
-    "build:ui": "npm run build -w @deedlit.dev/ui",
+    "build:ui": "npm run build -w @carneirofc/ui",
     "build:dev": "npm run build:ui && npm run build -w deedlit.dev",
     "build:comfyhelper": "npm run build:ui && npm run build -w deedlit.dev.comfyhelper",
     "build": "npm run build:ui && npm run build -w deedlit.dev && npm run build -w deedlit.dev.comfyhelper",

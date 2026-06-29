@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { CodeBlock, CopyButton } from "@deedlit.dev/ui";
+import { CodeBlock, CopyButton } from "@carneirofc/ui";
 
 import { getIngestConfig, updateIngestConfig, type IngestConfig } from "@/lib/api-client";
 import {

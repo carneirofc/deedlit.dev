@@ -20,7 +20,7 @@ import {
   StatusBadge,
   SurfacePanel,
   TextInput,
-} from "@deedlit.dev/ui";
+} from "@carneirofc/ui";
 import type { LocalServiceApp, ServiceIcon } from "@/features/services/types";
 import { useServiceAccessibility } from "@/features/services/hooks/useServiceAccessibility";
 

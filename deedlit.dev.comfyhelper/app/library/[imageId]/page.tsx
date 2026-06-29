@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
-import { CopyButton } from "@deedlit.dev/ui";
+import { CopyButton } from "@carneirofc/ui";
 
 import { useActivity } from "@/lib/store/activity";
 import { useSettings } from "@/lib/store/settings";

@@ -16,9 +16,9 @@ This package is the public-facing Next.js site for deedlit.dev. It handles the l
 - Gallery and static content should remain easy to prerender and SEO-friendly.
 
 ## Shared UI Rules
-- Reuse `@deedlit.dev/ui` before adding one-off primitives in this app.
+- Reuse `@carneirofc/ui` before adding one-off primitives in this app.
 - Keep app-specific composition in this package, but move generic controls or reusable surfaces into `deedlit.dev.ui`.
-- Import the shared design language from `@deedlit.dev/ui` rather than creating conflicting styles.
+- Import the shared design language from `@carneirofc/ui` rather than creating conflicting styles.
 
 ## PWA And Frontend Concerns
 - Keep service-worker and icon behavior consistent with the existing `public/` assets.

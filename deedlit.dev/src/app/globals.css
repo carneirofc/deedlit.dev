@@ -4,10 +4,10 @@
 @source "../components/**/*.{ts,tsx,js,jsx,mdx}";
 @source "../features/**/*.{ts,tsx,js,jsx,mdx}";
 @source "../lib/**/*.{ts,tsx,js,jsx}";
-@source "@deedlit.dev/ui";
+@source "@carneirofc/ui";
 @source "../../../deedlit.dev.ui/src/**/*.{ts,tsx,js,jsx}";
 /* Shared visual system. Keep app-level globals thin for reuse. */
-@import "@deedlit.dev/ui/styles.css";
+@import "@carneirofc/ui/styles.css";
 
 /* Legacy app token aliases used by existing feature components. */
 :root {
@@ -59,7 +59,7 @@ html {
   }
 }
 
-/* .section-anchor + animation utilities promoted to @deedlit.dev/ui styles.css */
+/* .section-anchor + animation utilities promoted to @carneirofc/ui styles.css */
 
 .focus-ring:focus-visible {
   outline: none;

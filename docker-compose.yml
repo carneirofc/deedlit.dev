@@ -237,7 +237,7 @@ services:
 
   # --- Web apps -----------------------------------------------------------
   # Build context is the monorepo root because comfyhelper depends on the
-  # @deedlit.dev/ui workspace package. Only needs the API gateway URL at
+  # @carneirofc/ui workspace package. Only needs the API gateway URL at
   # runtime (all reads/writes go through api:8000, not direct DB access).
   comfyhelper:
     build:

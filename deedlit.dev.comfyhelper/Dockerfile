@@ -1,6 +1,6 @@
 # Multi-stage build for the deedlit.dev.comfyhelper Next.js app.
 # Build context MUST be the monorepo root (see docker-compose.yml: context: ..)
-# because comfyhelper depends on the workspace package @deedlit.dev/ui.
+# because comfyhelper depends on the workspace package @carneirofc/ui.
 
 # ---- deps + build --------------------------------------------------------
 FROM node:22-bookworm-slim AS build

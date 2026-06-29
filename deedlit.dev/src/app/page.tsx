@@ -7,7 +7,7 @@ import {
   SectionLabel,
   StatusBadge,
   SurfacePanel
-} from "@deedlit.dev/ui";
+} from "@carneirofc/ui";
 import { BooksSection } from "@/features/books/components/BooksSection";
 import { books } from "@/features/books/data/books";
 import { GallerySection } from "@/features/gallery/components/GallerySection";

@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
-  transpilePackages: ["@deedlit.dev/ui"],
+  transpilePackages: ["@carneirofc/ui"],
   // Native / server-only packages must not be bundled by the Next compiler.
   // The OpenTelemetry instrumentations use Node module hooks (require/import-in-
   // the-middle) and must stay external so they can patch pg/@aws-sdk at runtime.
@@ -18,12 +18,12 @@ const nextConfig: NextConfig = {
   ],
   turbopack: {
     resolveAlias: {
-      "@deedlit.dev/ui": "../deedlit.dev.ui/src/index.ts",
-      "@deedlit.dev/ui/styles.css": "../deedlit.dev.ui/styles/styles.css"
+      "@carneirofc/ui": "../deedlit.dev.ui/src/index.ts",
+      "@carneirofc/ui/styles.css": "../deedlit.dev.ui/styles/styles.css"
     }
   },
   webpack(config) {
-    config.resolve.alias["@deedlit.dev/ui"] = path.resolve(__dirname, "../deedlit.dev.ui/src/index.ts");
+    config.resolve.alias["@carneirofc/ui"] = path.resolve(__dirname, "../deedlit.dev.ui/src/index.ts");
     return config;
   },
   images: {

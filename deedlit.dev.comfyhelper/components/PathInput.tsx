@@ -1,6 +1,6 @@
 "use client";
 
-import { PathInput as UiPathInput } from "@deedlit.dev/ui";
+import { PathInput as UiPathInput } from "@carneirofc/ui";
 
 import { hasMixedSeparators, isAlreadyConfigured } from "@/lib/library/paths";
 import { usePathPreview } from "@/lib/library/use-path-preview";

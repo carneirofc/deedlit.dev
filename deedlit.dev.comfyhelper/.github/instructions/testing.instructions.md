@@ -11,7 +11,7 @@ description: "Use when editing Playwright tests or Playwright configuration in d
 - Interactive debugging is available through `npm run test:e2e:ui`.
 
 ## Core Rules
-- Prefer semantic selectors first, then `data-testid` via the `testId` prop on `@deedlit.dev/ui` components when semantics are insufficient.
+- Prefer semantic selectors first, then `data-testid` via the `testId` prop on `@carneirofc/ui` components when semantics are insufficient.
 - Keep assertions strict. Fix the behavior or the state setup instead of weakening checks.
 - Avoid broad `waitForTimeout` sleeps. Wait on visible UI transitions, network responses, or stable route state.
 - Reset or isolate scan/database state so tests do not depend on previous runs.

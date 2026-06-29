@@ -1,7 +1,7 @@
 # Deedlit UI — Copilot Instructions
 
 ## What This Package Owns
-This package is the shared React UI library used by both Next.js apps. It owns reusable presentation primitives, icons, and the shared design-token layer exported as `@deedlit.dev/ui`.
+This package is the shared React UI library used by both Next.js apps. It owns reusable presentation primitives, icons, and the shared design-token layer exported as `@carneirofc/ui`.
 
 ## Component Rules
 - Build app-agnostic primitives here, not app-specific domain components.

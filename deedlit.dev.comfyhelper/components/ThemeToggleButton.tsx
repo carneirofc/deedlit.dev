@@ -1,5 +1,5 @@
 "use client";
 
-export { ThemeToggleButton } from "@deedlit.dev/ui";
+export { ThemeToggleButton } from "@carneirofc/ui";
 
 

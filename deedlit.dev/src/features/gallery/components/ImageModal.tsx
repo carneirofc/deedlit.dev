@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import Image from "next/image";
 import { FiX } from "react-icons/fi";
-import { DownloadIcon, OutlineButton } from "@deedlit.dev/ui";
+import { DownloadIcon, OutlineButton } from "@carneirofc/ui";
 import type { ImageAsset } from "@/features/gallery/types";
 
 interface ImageModalProps {

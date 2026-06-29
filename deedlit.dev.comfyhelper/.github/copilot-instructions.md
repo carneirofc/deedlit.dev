@@ -35,8 +35,8 @@ This package is the Next.js application for browsing and managing local ComfyUI 
 - Be careful around scan-job persistence. The scan store already includes stale-job recovery; changes around job lifecycle should preserve that self-healing behavior rather than layering on a second recovery mechanism.
 
 ## Shared UI Rules
-- Reuse `@deedlit.dev/ui` primitives before building app-local controls.
-- Keep token-driven styling aligned with `@deedlit.dev/ui/styles.css`.
+- Reuse `@carneirofc/ui` primitives before building app-local controls.
+- Keep token-driven styling aligned with `@carneirofc/ui/styles.css`.
 - App-specific components can live in `app/` or `components/`, but they should still compose shared primitives instead of reinventing them.
 - Use the `testId` prop on shared UI components when a stable selector is needed for tests.
 

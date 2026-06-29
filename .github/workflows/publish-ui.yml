@@ -1,0 +1,47 @@
+name: Publish UI package
+
+# Builds and publishes @carneirofc/ui to GitHub Packages when a GitHub Release
+# is published. The release tag (e.g. v0.2.0) drives the published version, so
+# the npm version always matches the Release.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://npm.pkg.github.com
+          scope: '@carneirofc'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set version from release tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Publishing @carneirofc/ui@${VERSION}"
+          npm version "$VERSION" \
+            --workspace @carneirofc/ui \
+            --no-git-tag-version \
+            --allow-same-version
+
+      - name: Build UI package
+        run: npm run build:ui
+
+      - name: Publish to GitHub Packages
+        run: npm publish --workspace @carneirofc/ui
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

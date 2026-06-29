@@ -1,7 +1,7 @@
 "use client";
 
-import { ThemeToggleButton as BaseThemeToggleButton } from "@deedlit.dev/ui";
-import type { ThemeMode, ThemeToggleButtonProps as BaseThemeToggleButtonProps } from "@deedlit.dev/ui";
+import { ThemeToggleButton as BaseThemeToggleButton } from "@carneirofc/ui";
+import type { ThemeMode, ThemeToggleButtonProps as BaseThemeToggleButtonProps } from "@carneirofc/ui";
 
 const THEME_COOKIE = "deedlit-theme";
 

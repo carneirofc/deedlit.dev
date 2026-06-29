@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { TagSelect } from "@deedlit.dev/ui";
+import { TagSelect } from "@carneirofc/ui";
 
 import type { ExportKind } from "@/lib/library/bulk-export";
 

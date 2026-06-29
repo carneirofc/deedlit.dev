@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
-import { Gallery } from "@deedlit.dev/ui";
+import { Gallery } from "@carneirofc/ui";
 import { GalleryFilters } from "@/features/gallery/components/GalleryFilters";
 import { ImageModal } from "@/features/gallery/components/ImageModal";
 import { useGalleryFilters } from "@/features/gallery/hooks/useGalleryFilters";

@@ -29,7 +29,7 @@ import {
   TextInput,
   Toast,
   WarningList,
-} from "@deedlit.dev/ui";
+} from "@carneirofc/ui";
 import { toggleStringInList } from "@/lib/list-utils";
 
 const INITIAL_POSITIVE_FILTERS = ["masterpiece", "cinematic lighting", "depth of field"];

@@ -2,15 +2,15 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  transpilePackages: ["@deedlit.dev/ui"],
+  transpilePackages: ["@carneirofc/ui"],
   turbopack: {
     resolveAlias: {
-      "@deedlit.dev/ui": "../deedlit.dev.ui/src/index.ts",
-      "@deedlit.dev/ui/styles.css": "../deedlit.dev.ui/styles/styles.css"
+      "@carneirofc/ui": "../deedlit.dev.ui/src/index.ts",
+      "@carneirofc/ui/styles.css": "../deedlit.dev.ui/styles/styles.css"
     }
   },
   webpack(config) {
-    config.resolve.alias["@deedlit.dev/ui"] = require("path").resolve(__dirname, "../deedlit.dev.ui/src/index.ts");
+    config.resolve.alias["@carneirofc/ui"] = require("path").resolve(__dirname, "../deedlit.dev.ui/src/index.ts");
     return config;
   },
   experimental: {

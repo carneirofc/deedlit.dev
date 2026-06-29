@@ -3,8 +3,8 @@
 This package contains app-agnostic UI building blocks and the shared visual system.
 
 Usage:
-- Import components from `@deedlit.dev/ui`.
-- Import the design system stylesheet from `@deedlit.dev/ui/styles.css` once in your app shell.
+- Import components from `@carneirofc/ui`.
+- Import the design system stylesheet from `@carneirofc/ui/styles.css` once in your app shell.
 
 Conventions:
 - Prefer `testId` for test selectors (mapped to `data-testid`).

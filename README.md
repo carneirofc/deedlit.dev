@@ -19,7 +19,7 @@ for the full design.
 |---|---|---|
 | [`deedlit.dev`](./deedlit.dev/) | 3001 | Public Next.js site — home, books, gallery, services |
 | [`deedlit.dev.comfyhelper`](./deedlit.dev.comfyhelper/) | 3000 | ComfyHelper UI for the image library |
-| [`deedlit.dev.ui`](./deedlit.dev.ui/) | — | Shared `@deedlit.dev/ui` component library |
+| [`deedlit.dev.ui`](./deedlit.dev.ui/) | — | Shared `@carneirofc/ui` component library |
 
 ### Services (FastAPI, `uv` per-package venv)
 
@@ -94,7 +94,7 @@ single compose file for the repo).
 ```
 deedlit.dev/              ← landing site (Next.js)
 deedlit.dev.comfyhelper/  ← ComfyHelper image-library UI (Next.js)
-deedlit.dev.ui/           ← shared component library (@deedlit.dev/ui)
+deedlit.dev.ui/           ← shared component library (@carneirofc/ui)
 deedlit.<service>/        ← FastAPI services (api, catalog, search, graph,
                             ingest, metadata, labelagent, vision)
 contracts/                ← OpenAPI design sketches per service surface

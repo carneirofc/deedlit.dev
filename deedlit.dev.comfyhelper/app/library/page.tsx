@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Gallery, TagSelect } from "@deedlit.dev/ui";
+import { Gallery, TagSelect } from "@carneirofc/ui";
 
 import { BulkActionBar, type BulkBusy } from "@/app/library/components/BulkActionBar";
 import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";

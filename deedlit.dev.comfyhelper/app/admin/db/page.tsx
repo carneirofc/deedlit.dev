@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { CopyButton } from "@deedlit.dev/ui";
+import { CopyButton } from "@carneirofc/ui";
 
 import { deleteImages } from "@/lib/library/bulk-delete";
 

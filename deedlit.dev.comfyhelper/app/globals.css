@@ -4,9 +4,9 @@
 @source "../components/**/*.{ts,tsx,js,jsx,mdx}";
 @source "../lib/**/*.{ts,tsx,js,jsx}";
 @source "../../deedlit.dev.ui/src/**/*.{ts,tsx}";
-@source "@deedlit.dev/ui";
+@source "@carneirofc/ui";
 /* Shared visual system. Keep app-level globals thin for reuse. */
-@import "@deedlit.dev/ui/styles.css";
+@import "@carneirofc/ui/styles.css";
 
 /* Ultrawide breakpoints. Tailwind v4 stops at 2xl (1536px); these let dense
    grids add columns on wide desktops instead of stretching cards. */
