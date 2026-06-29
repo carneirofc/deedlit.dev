@@ -28,8 +28,9 @@ Don't go hunting for these every session — they are version-managed, not on th
 
 ## Package Ownership
 - `deedlit.dev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
-- `deedlit.dev.comfyhelper/`: generated-image library — metadata extraction, PostgreSQL (canonical) + Neo4j (graph) + Qdrant (vectors), RustFS/S3 object storage, REST APIs, and MCP tools. See `deedlit.dev.comfyhelper/IMAGE_LIBRARY.md`.
+- `deedlit.dev.comfyhelper/`: generated-image library **UI** (Next.js) — talks to the `deedlit.api` gateway. See `deedlit.dev.comfyhelper/IMAGE_LIBRARY.md` for the backend architecture.
 - `deedlit.dev.ui/`: shared UI components, icons, tokens, CSS variables, and app-agnostic presentation primitives.
+- `deedlit.<service>/`: FastAPI image-library services (`api`, `catalog`, `search`, `graph`, `ingest`, `metadata`, `labelagent`, `vision`) — database-per-service, HTTP-only, `uv`-managed. Each owns its store and is the sole writer of it.
 
 ## Working Rules
 - Make the smallest package-local change that solves the task.
@@ -42,6 +43,7 @@ Don't go hunting for these every session — they are version-managed, not on th
 - `deedlit.dev/`: start from `src/app/`, `src/features/`, and `scripts/`.
 - `deedlit.dev.comfyhelper/`: start from `app/`, `lib/`, `prisma/`, and `.github/instructions/`.
 - `deedlit.dev.ui/`: start from `src/`, `styles/`, and the package exports in `package.json`.
+- `deedlit.<service>/`: start from `app.py` (FastAPI entry), the package module (`<service>/`), `pyproject.toml`, and `tests/`. Ingest also has `worker.py` (the queue consumer).
 
 ## Command Reference
 - Build shared UI: `npm run build:ui`

@@ -1,34 +1,31 @@
-# Generated-Image Library
+# ComfyHelper — Generated-Image Library UI
 
-Next.js app for ingesting, searching, and exploring a generated-image library
-(ComfyUI / Automatic1111 outputs) with metadata extraction, graph relationship
-exploration, vector similarity search, optional external vision enrichment, REST
-APIs, and an MCP tool surface for external LLM agents.
+Next.js frontend for ingesting, searching, and exploring a generated-image library
+(ComfyUI / Automatic1111 outputs): metadata-rich browsing, hybrid vector search,
+graph relationship exploration, queue/health dashboards, and an MCP tool surface
+for external agents.
 
-The full architecture, configuration, REST/MCP reference, and data-quality rules
-live in **[`IMAGE_LIBRARY.md`](./IMAGE_LIBRARY.md)**.
-
-## Stack
-
-- **Next.js 16** — UI + API route handlers + MCP endpoint
-- **PostgreSQL** — canonical source of truth (replaces the old SQLite/Prisma backend)
-- **Neo4j** — rebuildable relationship graph projection
-- **Qdrant** — rebuildable image-embedding projection (similarity / near-dup)
-- **RustFS** — S3-compatible object storage for thumbnails + cached embeddings
-
-PostgreSQL is canonical; Neo4j, Qdrant, and RustFS are all derived/rebuildable.
+The image-library backend lives in sibling **FastAPI** services; this app talks to
+the [`deedlit.api`](../deedlit.api/) gateway. The full architecture, data flow, and
+data-quality rules are in **[`IMAGE_LIBRARY.md`](./IMAGE_LIBRARY.md)**.
 
 ## Run
 
+From the repo root (starts datastores, services, and both web apps):
+
 ```bash
-docker compose up -d        # postgres + neo4j + qdrant + rustfs
-cp .env.example .env.local  # defaults match docker-compose
-npm install
-npm run dev                 # http://localhost:3000  (redirects to /library)
+npm run infra:up        # postgres + neo4j + qdrant + rustfs + rabbitmq + redis + o11y
+npm run dev:migrate     # apply catalog migrations
+npm run dev             # all apps + services via mprocs
 ```
 
-Run the whole thing (app included) in containers with
-`docker compose --profile app up -d`.
+ComfyHelper alone (gateway must already be running):
+
+```bash
+npm run dev:comfyhelper # http://localhost:3000  (redirects to /library)
+```
+
+See the root [`README.md`](../README.md) for the full topology and ports.
 
 ## Using node
 
@@ -41,8 +38,6 @@ fnm env --use-on-cd --shell powershell | Out-String | Invoke-Expression
 ## Notes
 
 - Intended for local / self-hosted use. Security is intentionally open in v1; the
-  service layer + typed APIs + MCP tools are the seam where auth will attach.
+  gateway + typed service APIs + MCP tools are the seam where auth will attach.
 - Server-side logs use `pino` (`pino-pretty` outside production); set `LOG_LEVEL`
   to change verbosity.
-- The PostgreSQL schema is created lazily on first API call, so the app boots
-  even when the databases are down.
