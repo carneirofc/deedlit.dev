@@ -1,10 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { PathInput as UiPathInput } from "@deedlit.dev/ui";
 
-import { FolderIcon } from "@deedlit.dev/ui";
-
-import { DirectoryPicker } from "@/components/DirectoryPicker";
 import { hasMixedSeparators, isAlreadyConfigured } from "@/lib/library/paths";
 import { usePathPreview } from "@/lib/library/use-path-preview";
 
@@ -88,71 +85,16 @@ function PathPreviewLine({
 }
 
 /**
- * A text input for a server-side filesystem path paired with a "Browse" button
- * that opens the {@link DirectoryPicker}.  The text field stays fully editable
- * (type/paste a path) while the picker offers point-and-click navigation.
- * With `showPreview`, a live validation line appears beneath it.
+ * App adapter over the shared {@link UiPathInput}. Adds comfyhelper's live path
+ * validation (via {@link usePathPreview}) as the package component's `preview`
+ * slot, keeping filesystem/API coupling out of the shared package.
  */
-export function PathInput({
-  value,
-  onChange,
-  onEnter,
-  placeholder,
-  disabled,
-  className,
-  inputClassName,
-  buttonClassName,
-  pickerTitle,
-  inputTestId,
-  buttonTestId,
-  showPreview,
-  knownPaths,
-}: PathInputProps) {
-  const [pickerOpen, setPickerOpen] = useState(false);
-
+export function PathInput({ showPreview, knownPaths, ...rest }: PathInputProps) {
   return (
-    <div className={`flex flex-col gap-1 ${className ?? ""}`}>
-      <div className="flex gap-2">
-        <input
-          className={inputClassName}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && onEnter) onEnter();
-          }}
-          placeholder={placeholder}
-          disabled={disabled}
-          spellCheck={false}
-          data-testid={inputTestId}
-        />
-        <button
-          type="button"
-          className={buttonClassName}
-          onClick={() => setPickerOpen(true)}
-          disabled={disabled}
-          title="Browse folders"
-          data-testid={buttonTestId}
-        >
-          <span className="inline-flex items-center gap-1.5">
-            <FolderIcon className="h-4 w-4" />
-            Browse
-          </span>
-        </button>
-      </div>
-
-      {showPreview && <PathPreviewLine value={value} knownPaths={knownPaths} />}
-
-      <DirectoryPicker
-        open={pickerOpen}
-        initialPath={value}
-        title={pickerTitle}
-        onClose={() => setPickerOpen(false)}
-        onSelect={(path) => {
-          onChange(path);
-          setPickerOpen(false);
-        }}
-      />
-    </div>
+    <UiPathInput
+      {...rest}
+      preview={showPreview ? <PathPreviewLine value={rest.value} knownPaths={knownPaths} /> : undefined}
+    />
   );
 }
 
