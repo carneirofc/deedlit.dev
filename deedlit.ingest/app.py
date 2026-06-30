@@ -315,6 +315,20 @@ async def enqueue_label_task(req: SingleTaskRequest) -> dict:
     return {"status": "queued" if ok else "publish_failed", "sha256": req.sha256, "type": "label"}
 
 
+@app.get("/maintenance/missing-files")
+async def missing_files(limit: int = Query(default=500, ge=0, le=5000)) -> dict:
+    """Scan the catalog for images whose on-disk source file has vanished.
+
+    Walks catalog truth and probes ``os.path.exists`` for every record with a
+    local filepath (blob-only ``s3://`` fallbacks are skipped). Synchronous so the
+    admin can REVIEW the orphaned entries before cleaning them up via the existing
+    batch-delete. ``limit`` caps the returned list; the count is exact regardless.
+    Read-only — deletes nothing. The blocking catalog paging + stat calls run off
+    the event loop.
+    """
+    return await asyncio.to_thread(pipeline.scan_missing_files, limit)
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     job = store.get(job_id)

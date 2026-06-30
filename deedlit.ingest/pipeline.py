@@ -547,6 +547,69 @@ def list_catalog_filepaths_under(folder: str) -> set[str]:
     return out
 
 
+def scan_missing_files(limit: int = 0) -> dict[str, Any]:
+    """Find cataloged images whose on-disk source file has vanished.
+
+    Pages catalog ``GET /images`` (the source of truth) and, for each record with
+    a LOCAL ``filepath``, probes ``os.path.exists`` on the shared host filesystem
+    ingest walks. Blob-only records (``s3://`` fallback paths, written when ingest
+    captured no source path) are skipped — they were never on disk, so their
+    absence there is not a missing file.
+
+    Returns ``{checked, missing, missing_count, truncated}`` where ``missing`` is
+    a list of ``{sha256, filepath, filename, directory}``. ``limit`` (>0) caps how
+    many entries are RETURNED; the scan still walks the whole catalog, so
+    ``missing_count`` is the exact total and ``truncated`` flags that more matched
+    than were returned.
+    """
+    missing: list[dict[str, Any]] = []
+    missing_total = 0
+    checked = 0
+    truncated = False
+    offset = 0
+    while True:
+        resp = httpx.get(
+            f"{CATALOG_URL}/images",
+            params={"limit": CATALOG_PAGE_SIZE, "offset": offset},
+            timeout=HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        rows = resp.json() or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fp = row.get("filepath")
+            sha = row.get("sha256")
+            if not fp or not sha:
+                continue
+            # Blob-only fallback paths (no captured source) were never on disk.
+            if fp.startswith("s3://") or fp.startswith("blob:"):
+                continue
+            checked += 1
+            if not os.path.exists(fp):
+                missing_total += 1
+                if not limit or len(missing) < limit:
+                    missing.append(
+                        {
+                            "sha256": sha,
+                            "filepath": fp,
+                            "filename": row.get("filename"),
+                            "directory": row.get("directory"),
+                        }
+                    )
+                else:
+                    truncated = True
+        if len(rows) < CATALOG_PAGE_SIZE:
+            break
+        offset += CATALOG_PAGE_SIZE
+    return {
+        "checked": checked,
+        "missing": missing,
+        "missing_count": missing_total,
+        "truncated": truncated,
+    }
+
+
 async def search_has(sha256: str) -> bool:
     """Coverage probe: is ``sha256`` present in the search (Qdrant) projection?
 

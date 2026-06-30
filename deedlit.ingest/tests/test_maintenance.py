@@ -302,3 +302,75 @@ def test_unknown_type_is_rejected(fresh_store):
     with TestClient(app_module.app) as client:
         r = client.post("/jobs", json={"type": "not-a-real-type"})
         assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# (6) missing-files scan — orphaned catalog entries (source file vanished)
+# ---------------------------------------------------------------------------
+def test_missing_files_reports_only_vanished_local_sources(fresh_store, tmp_path, monkeypatch):
+    present = tmp_path / "here.png"
+    present.write_bytes(_png_bytes((1, 2, 3)))
+    gone = tmp_path / "gone.png"  # never created -> orphaned catalog entry
+
+    rows = [
+        {"sha256": "a" * 64, "filepath": str(present), "filename": "here.png"},
+        {"sha256": "b" * 64, "filepath": str(gone), "filename": "gone.png"},
+        # Blob-only fallback path was never on disk — must be skipped, not "missing".
+        {"sha256": "c" * 64, "filepath": "s3://images/" + "c" * 64},
+    ]
+
+    class _FakeResp:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    pages = iter([rows, []])
+
+    def fake_get(url, params=None, timeout=None):
+        return _FakeResp(next(pages, []))
+
+    monkeypatch.setattr(pipeline.httpx, "get", fake_get)
+
+    with TestClient(app_module.app) as client:
+        r = client.get("/maintenance/missing-files")
+        assert r.status_code == 200
+        body = r.json()
+
+    assert body["checked"] == 2  # the s3:// row is skipped before the stat probe
+    assert body["missing_count"] == 1
+    assert [m["sha256"] for m in body["missing"]] == ["b" * 64]
+    assert body["truncated"] is False
+
+
+def test_missing_files_limit_truncates_but_counts_all(fresh_store, tmp_path, monkeypatch):
+    rows = [
+        {"sha256": chr(ord("a") + i) * 64, "filepath": str(tmp_path / f"gone_{i}.png")}
+        for i in range(3)
+    ]
+
+    class _FakeResp:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    pages = iter([rows, []])
+    monkeypatch.setattr(
+        pipeline.httpx, "get", lambda *a, **k: _FakeResp(next(pages, []))
+    )
+
+    with TestClient(app_module.app) as client:
+        body = client.get("/maintenance/missing-files", params={"limit": 2}).json()
+
+    assert body["missing_count"] == 3  # exact total despite the cap
+    assert len(body["missing"]) == 2  # only `limit` returned
+    assert body["truncated"] is True

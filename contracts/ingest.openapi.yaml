@@ -46,6 +46,19 @@ paths:
       parameters: [ { name: id, in: path, required: true, schema: { type: string } } ]
       summary: Cancel a running job
       responses: { "200": { description: Cancelling } }
+  /maintenance/missing-files:
+    get:
+      summary: Find cataloged images whose on-disk source file vanished
+      description: >
+        Read-only scan of catalog truth against the ingest worker's host
+        filesystem: every record with a LOCAL filepath is probed with
+        `os.path.exists` (blob-only `s3://` fallback paths are skipped). Backs the
+        admin's missing-file cleanup review, which then un-indexes the stale
+        records via the gateway's batch-delete. `limit` caps the returned list;
+        `missing_count` is the exact total regardless.
+      parameters: [ { name: limit, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 5000, default: 500 }, description: "Cap on entries returned (the scan still walks the whole catalog)" } ]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/MissingFilesResult" } } } }
   /activity:
     get:
       summary: Live work snapshot (in-flight count, throughput, current op)
@@ -80,6 +93,22 @@ components:
         type: { type: string, enum: [reindex-one-image, rescan-files, rebuild-search, rebuild-graph, rebuild-thumbnails, reconcile, label-backfill, prune-graph-orphans] }
         sha256: { type: [string, "null"], pattern: "^[a-f0-9]{64}$", description: "for reindex-one-image" }
       required: [type]
+    MissingFile:
+      type: object
+      properties:
+        sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+        filepath: { type: string, description: "On-disk source path that no longer exists" }
+        filename: { type: [string, "null"] }
+        directory: { type: [string, "null"] }
+      required: [sha256, filepath]
+    MissingFilesResult:
+      type: object
+      properties:
+        checked: { type: integer, description: "Records probed (those with a local filepath; blob-only skipped)" }
+        missing: { type: array, items: { $ref: "#/components/schemas/MissingFile" }, description: "Orphaned entries, capped at the requested limit" }
+        missing_count: { type: integer, description: "Exact total of orphaned entries (may exceed missing.length)" }
+        truncated: { type: boolean, description: "True when more matched than were returned" }
+      required: [checked, missing, missing_count, truncated]
     Job:
       type: object
       properties:
