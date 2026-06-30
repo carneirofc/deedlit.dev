@@ -16,7 +16,7 @@ type RouteContext = { params: Promise<{ imageId: string }> };
 // the result in Redis, and serves it with immutable HTTP caching so the browser
 // then keeps it. 512px covers small-to-spacious cells at 2x DPR.
 const GRID_MAX_EDGE = 512;
-const GRID_QUALITY = 78;
+const GRID_QUALITY = 90;
 
 /**
  * Serve the small grid-tile derivative of an image (lazy, on first request).
@@ -58,8 +58,26 @@ export async function GET(request: Request, context: RouteContext) {
     if (!res.ok || !res.body) return jsonError("Image not found.", res.status === 404 ? 404 : 502);
 
     const src = Buffer.from(await res.arrayBuffer());
-    const out = await sharp(src)
-      .rotate() // honor EXIF orientation
+
+    // If the source is already at or below grid size, downscaling is a no-op and
+    // re-encoding would only soften an already-small image. Serve the original
+    // bytes untouched (the upstream thumbnail is already viewer-grade WebP).
+    const pipeline = sharp(src).rotate(); // honor EXIF orientation
+    const meta = await pipeline.metadata();
+    const maxEdge = Math.max(meta.width ?? 0, meta.height ?? 0);
+    if (maxEdge > 0 && maxEdge <= GRID_MAX_EDGE) {
+      const ct = res.headers.get("content-type") ?? "image/webp";
+      setCachedImage(imageId, "grid", src, ct).catch(() => {});
+      return new Response(src as unknown as BodyInit, {
+        headers: {
+          "cache-control": IMAGE_CACHE_CONTROL,
+          etag,
+          "content-type": ct,
+        },
+      });
+    }
+
+    const out = await pipeline
       .resize(GRID_MAX_EDGE, GRID_MAX_EDGE, { fit: "inside", withoutEnlargement: true })
       .webp({ quality: GRID_QUALITY })
       .toBuffer();
