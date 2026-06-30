@@ -7,5 +7,6 @@
     "declarationMap": false,
     "emitDeclarationOnly": false
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/**/*.stories.ts", "src/**/*.stories.tsx", "src/**/*.mdx"]
 }

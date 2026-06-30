@@ -1,0 +1,21 @@
+/* Storybook canvas stylesheet — mirrors how the consuming apps wire Tailwind v4.
+   `@import "tailwindcss"` first, then the shared design-system tokens + @theme,
+   then register the component source so the right utilities get generated. */
+@import "tailwindcss";
+@import "../styles/styles.css";
+
+@source "../src/**/*.{ts,tsx}";
+
+/* Make the preview canvas reflect the active theme tokens. The dark variant is
+   driven by `data-theme="dark"` on <html> (see preview.ts toolbar), exactly as
+   the apps toggle it. */
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--text-0);
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+}

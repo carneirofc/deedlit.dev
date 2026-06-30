@@ -1,0 +1,93 @@
+import { Meta } from "@storybook/addon-docs/blocks";
+
+<Meta title="Introduction" />
+
+# @carneirofc/ui
+
+App-agnostic UI building blocks and the shared visual system for the deedlit.dev
+workspace. These primitives back both `deedlit.dev` and `deedlit.dev.comfyhelper`.
+
+## Using the library
+
+```tsx
+import { OutlineButton, SurfacePanel, TextInput } from "@carneirofc/ui";
+// Import the design-system stylesheet once in your app shell:
+import "@carneirofc/ui/styles.css";
+```
+
+## Component catalog
+
+The library splits into **foundations** (the design tokens and style utilities)
+and **components** (the React building blocks). Everything below is exported
+from the package entry point and documented in the sidebar.
+
+### Foundations
+
+- **Surfaces & Backgrounds** — page-wash, surface and `--ui-bg-*` token families.
+- **Colors** — accent, text/ink and status palettes.
+- **Typography** — the `text-ui-*` size ramp and `ui-text-*` label/body classes.
+- **Borders & Shadows** — `border-ui-*` utilities, panel borders and elevation.
+- **Cyber Styles** — the signature `.cyber-*` glass + neon class set.
+
+### Layout & surfaces
+
+`SurfacePanel` · `CyberPanel` / `CyberSubpanel` · `DockPanel` · `PageHeader` ·
+`PanelSectionHeader` · `SectionLabel` · `CollapsiblePanel`
+
+### Forms & controls
+
+`OutlineButton` · `CopyButton` · `TextInput` · `TextAreaInput` · `SelectInput` ·
+`Checkbox` · `SegmentedControl` · `DropdownMenu`
+
+### Feedback & status
+
+`StatusBadge` · `StatusMessage` · `StatusBanner` · `Toast` · `WarningList` ·
+`EmptyState` · `ScanProgress` · `ConfirmationDialog` · `Modal`
+
+### Data display
+
+`Table` · `KeyValueField` · `InfoChip` · `CodeBlock` · `PromptBlock` ·
+`MetadataInfoBlock` · `Pagination` · `Icons`
+
+### Media & metadata
+
+`MediaStage` · `MetadataTabBar` · `Gallery`
+
+### App-coupled primitives
+
+These reach a backend filesystem-browse endpoint or carry app-specific data, so
+they live in the package but are not part of the presentational story set:
+`DirectoryPicker` · `PathInput` · `TagSelect` · `FilterSelectionCard` ·
+`ThemeToggleButton`.
+
+## Conventions
+
+- **Token-driven theming.** Components style themselves through CSS variables
+  defined in `styles/styles.css`. Light/dark is switched by setting
+  `data-theme="dark"` on the document element — use the **Theme** toolbar control
+  above to preview both.
+- **`testId` for selectors.** Prefer `testId` (mapped to `data-testid`) over
+  class-based selectors in tests.
+- **`className` for overrides.** Components stay presentation-focused; pass
+  `className` to tweak, and reach for shared primitives (`SurfacePanel`,
+  `TextInput`, `SelectInput`, `StatusBadge`) before writing one-off class bundles.
+
+## Adding a story
+
+Co-locate a `*.stories.tsx` file next to the component in `src/`:
+
+```tsx
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import MyComponent from "./MyComponent";
+
+const meta = {
+  title: "Components/MyComponent",
+  component: MyComponent,
+  tags: ["autodocs"],
+} satisfies Meta<typeof MyComponent>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const Default: Story = { args: {} };
+```

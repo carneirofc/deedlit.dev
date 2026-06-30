@@ -21,7 +21,9 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node ./scripts/fix-esm-imports.mjs"
+    "build": "tsc -p tsconfig.build.json && node ./scripts/fix-esm-imports.mjs",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
   },
   "sideEffects": [
     "./styles/styles.css"
@@ -46,8 +48,17 @@
     "react-dom": "^19"
   },
   "devDependencies": {
+    "@storybook/addon-a11y": "^10.4.6",
+    "@storybook/addon-docs": "^10.4.6",
+    "@storybook/react-vite": "^10.4.6",
+    "@tailwindcss/vite": "^4.3.1",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^5.9.3"
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "storybook": "^10.4.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.0"
   }
 }
+
