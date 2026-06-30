@@ -1,5 +1,73 @@
+/* ============================================================
+ * Webfonts — Display: Sora (geometric humanist sans).
+ * Mono: IBM Plex Mono. Both from Google Fonts (gstatic woff2).
+ * Synced from the deedlit.dev design system; if you self-host
+ * licensed binaries, repoint these @font-face src URLs.
+ * ============================================================ */
+
+/* Sora — 400 / 500 / 600 / 700 */
+@font-face {
+  font-family: "Sora";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSdSnk-DGQ.woff2) format("woff2");
+}
+@font-face {
+  font-family: "Sora";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSc6nk-DGQ.woff2) format("woff2");
+}
+@font-face {
+  font-family: "Sora";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSfWnU-DGQ.woff2) format("woff2");
+}
+@font-face {
+  font-family: "Sora";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSfsnU-DGQ.woff2) format("woff2");
+}
+
+/* IBM Plex Mono — 400 / 500 */
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/ibmplexmono/v19/-F63fjptAgt5VM-kVkqdyU8n1iIq131nj-otFQ.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url(https://fonts.gstatic.com/s/ibmplexmono/v19/-F63fjptAgt5VM-kVkqdyU8n1iIq1391j-otFZ6Z.woff2) format("woff2");
+}
+
 :root {
   --app-sidebar-width: 88px;
+
+  /* Brand families — pinned by the design system (host may override). */
+  --font-display: "Sora";
+  --font-mono: "IBM Plex Mono";
+
+  /* Corner-radius scale — tightened for a crisper neon read.
+   * Components re-round the whole system from these tokens. */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-panel: 20px;
+  --radius-pill: 9999px;
+
   --ui-font-2xs: clamp(0.6875rem, 0.67rem + 0.08vw, 0.75rem);
   --ui-font-xs: clamp(0.75rem, 0.73rem + 0.1vw, 0.8125rem);
   --ui-font-sm: clamp(0.8125rem, 0.79rem + 0.12vw, 0.875rem);
@@ -367,12 +435,14 @@ html[data-theme="dark"] {
 
 body {
   min-height: 100vh;
+  margin: 0;
   color: var(--text-0);
   background:
     radial-gradient(1400px 920px at -8% -12%, color-mix(in oklab, var(--accent-cyan) 34%, transparent), transparent 68%),
     radial-gradient(1250px 840px at 110% -18%, color-mix(in oklab, var(--accent-pink) 28%, transparent), transparent 69%),
     radial-gradient(1200px 700px at 50% 115%, color-mix(in oklab, var(--accent-lime) 15%, transparent), transparent 72%),
     linear-gradient(155deg, var(--bg-0) 0%, var(--bg-1) 46%, var(--bg-2) 100%);
+  background-attachment: fixed;
   font-family: var(--font-display), sans-serif;
   font-size: var(--ui-font-md);
   letter-spacing: 0.01em;
@@ -381,6 +451,7 @@ body {
     "liga" 1,
     "calt" 1;
   text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
   position: relative;
   transition: background 260ms ease, color 220ms ease;
 }
@@ -586,6 +657,113 @@ textarea {
 
 .cyber-muted {
   color: var(--text-2);
+}
+
+/* ── Interaction layer (synced from the design system) ─────────
+ * Hover lift, press (scale-down), focus ring and disabled states
+ * live in CSS so they respond to real :hover / :active /
+ * :focus-visible events (inline styles can't carry pseudo-classes). */
+
+/* Shared button interaction layer — applied on top of a variant class. */
+.ob-btn {
+  position: relative;
+  transition:
+    color 160ms ease, background-color 160ms ease, border-color 160ms ease,
+    box-shadow 160ms ease, transform 120ms cubic-bezier(.2, .8, .3, 1.2), filter 160ms ease;
+}
+.ob-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+.ob-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.95);
+  transition-duration: 60ms;
+}
+.ob-btn:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent-cyan) 70%, transparent);
+  outline-offset: 2px;
+}
+.ob-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
+  box-shadow: none;
+  filter: saturate(0.7);
+}
+
+/* Neutral & danger button variants (states need CSS, not inline). */
+.cyber-button-neutral {
+  border: 1px solid var(--ui-border-strong);
+  background: var(--panel-white);
+  color: var(--ui-ink-accent);
+  box-shadow: 0 10px 24px -18px color-mix(in oklab, var(--ui-border-active) 45%, transparent);
+}
+.cyber-button-neutral:hover:not(:disabled) {
+  border-color: var(--ui-border-active);
+  background: var(--ui-bg-soft);
+  box-shadow: 0 16px 28px -20px color-mix(in oklab, var(--ui-border-active) 62%, transparent);
+}
+.cyber-button-neutral:active:not(:disabled) {
+  background: var(--ui-bg-active);
+}
+
+.cyber-button-danger {
+  border: 1px solid color-mix(in oklab, var(--accent-pink) 30%, var(--ui-border-strong));
+  background: var(--ui-bg-card);
+  color: var(--status-error-text);
+  box-shadow: 0 10px 24px -18px rgba(225, 29, 72, 0.35);
+}
+.cyber-button-danger:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--accent-pink) 55%, var(--ui-border-strong));
+  background: var(--ui-bg-prompt-negative);
+  box-shadow: 0 16px 28px -20px rgba(225, 29, 72, 0.5);
+}
+.cyber-button-danger:active:not(:disabled) {
+  filter: brightness(0.97);
+}
+
+/* Accent/ghost press states (hover already defined above). */
+.cyber-button:active:not(:disabled) {
+  box-shadow:
+    inset 0 2px 5px color-mix(in oklab, var(--accent-cyan) 30%, transparent),
+    var(--shadow-sm);
+}
+.cyber-button-ghost:active:not(:disabled) {
+  background: color-mix(in oklab, var(--surface-0) 70%, var(--accent-cyan) 30%);
+}
+
+/* Small icon / utility buttons (copy, dialog close, gallery nav, theme
+ * toggle) — same hover-lift / press / focus language as OutlineButton. */
+.cyber-icon-btn {
+  cursor: pointer;
+  transition:
+    color 160ms ease, background-color 160ms ease, border-color 160ms ease,
+    box-shadow 160ms ease, transform 120ms cubic-bezier(.2, .8, .3, 1.2);
+}
+.cyber-icon-btn:hover:not(:disabled) {
+  border-color: var(--panel-border-strong);
+  background: color-mix(in oklab, var(--surface-0) 70%, var(--accent-cyan) 30%);
+  color: var(--text-0);
+  transform: translateY(-1px);
+}
+.cyber-icon-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.9);
+  transition-duration: 60ms;
+}
+.cyber-icon-btn:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent-cyan) 70%, transparent);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cyber-icon-btn,
+  .cyber-icon-btn:hover,
+  .cyber-icon-btn:active {
+    transform: none;
+    transition: none;
+  }
+}
+
+.cyber-input::placeholder {
+  color: var(--ui-ink-faint);
 }
 
 .app-sidebar-shell {
@@ -862,4 +1040,63 @@ textarea {
 
 .duration-300 {
   animation-duration: 300ms;
+}
+
+/* ── Interactive card hovers (ServiceCard, GalleryTile) ──────────────
+ * Synced from the design system: lift + neon edge on hover, press
+ * settle on active, image zoom for gallery tiles. */
+.product-card {
+  transition: transform 180ms cubic-bezier(.2, .8, .3, 1.2), border-color 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
+}
+.product-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--panel-border-strong);
+  box-shadow: var(--shadow-lg), 0 0 0 1px color-mix(in oklab, var(--accent-cyan) 18%, transparent);
+}
+.product-card:active {
+  transform: translateY(0) scale(0.99);
+  transition-duration: 80ms;
+}
+
+.gallery-tile {
+  transition: transform 180ms cubic-bezier(.2, .8, .3, 1.2), border-color 180ms ease, box-shadow 180ms ease;
+}
+.gallery-tile:hover {
+  transform: translateY(-2px);
+  border-color: var(--panel-border-strong);
+  box-shadow: var(--shadow-lg);
+}
+.gallery-tile:active {
+  transform: translateY(0) scale(0.99);
+  transition-duration: 80ms;
+}
+.gallery-tile:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent-cyan) 70%, transparent);
+  outline-offset: 2px;
+}
+.gallery-tile img {
+  transition: transform 320ms cubic-bezier(.2, .7, .3, 1);
+}
+.gallery-tile:hover img {
+  transform: scale(1.04);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-in {
+    animation: none;
+  }
+  .ob-btn,
+  .ob-btn:hover,
+  .ob-btn:active,
+  .product-card,
+  .product-card:hover,
+  .product-card:active,
+  .gallery-tile,
+  .gallery-tile:hover,
+  .gallery-tile:active,
+  .gallery-tile img,
+  .gallery-tile:hover img {
+    transform: none;
+    transition: none;
+  }
 }
