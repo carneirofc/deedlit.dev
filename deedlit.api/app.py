@@ -375,6 +375,22 @@ async def put_ingest_config(payload: dict[str, Any]) -> Any:
         raise HTTPException(status_code=502, detail=f"ingest unavailable: {exc.detail}")
 
 
+@app.get("/maintenance/missing-files")
+async def missing_files(limit: int = 500) -> Any:
+    """Scan for cataloged images whose on-disk source file vanished (proxy to
+    ingest, which owns the host filesystem). Read-only — backs the admin's
+    missing-file cleanup review. Degrades to an empty result when ingest is down
+    so the panel stays renderable."""
+    try:
+        return await clients.ingest(
+            "GET", "/maintenance/missing-files", params={"limit": limit}
+        )
+    except DownstreamError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"ingest unavailable: {exc.detail}"
+        ) from exc
+
+
 @app.get("/fs/browse")
 async def fs_browse(path: str | None = None) -> Any:
     """List a directory on the ingest host for the admin folder picker.

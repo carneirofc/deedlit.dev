@@ -182,6 +182,19 @@ paths:
     get:
       summary: List jobs (proxy to ingest) for the dashboard
       responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } } }
+  /maintenance/missing-files:
+    get:
+      summary: Find cataloged images whose source file vanished (proxy to ingest)
+      description: >
+        Read-only scan: forwards to deedlit.ingest (the host-FS owner), which
+        probes every catalog record's local filepath with os.path.exists. Backs
+        the admin's missing-file cleanup review; the surfaced entries are then
+        un-indexed via POST /images/batch-delete.
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 500 }, description: "Cap on entries returned (the scan still walks the whole catalog)" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+        "502": { description: ingest unavailable }
   /blobs/{sha256}/{kind}:
     get:
       summary: Stream image bytes (thumbnail/embedding) from catalog

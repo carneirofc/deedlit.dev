@@ -1304,3 +1304,30 @@ def test_health_dashboard_degraded_when_one_down(rec, client):
     statuses = {s["name"]: s["status"] for s in body["services"]}
     assert statuses["graph"] == "down"
     assert statuses["catalog"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# GET /maintenance/missing-files proxies to ingest (host-FS owner)
+# ---------------------------------------------------------------------------
+def test_missing_files_proxies_to_ingest(rec, client):
+    payload = {
+        "checked": 3,
+        "missing": [{"sha256": "b" * 64, "filepath": "K:/gone.png"}],
+        "missing_count": 1,
+        "truncated": False,
+    }
+    rec.on("GET", "/maintenance/missing-files", lambda r: payload)
+
+    r = client.get("/maintenance/missing-files", params={"limit": 100})
+    assert r.status_code == 200
+    assert r.json() == payload
+    # Only ingest was hit (it owns the filesystem the catalog paths live on).
+    assert _bases(rec) == {clients.INGEST_URL}
+
+
+def test_missing_files_502_when_ingest_down(rec, client):
+    rec.on("GET", "/maintenance/missing-files", lambda r: httpx.Response(500))
+
+    r = client.get("/maintenance/missing-files")
+    assert r.status_code == 502
+    assert _bases(rec) == {clients.INGEST_URL}
