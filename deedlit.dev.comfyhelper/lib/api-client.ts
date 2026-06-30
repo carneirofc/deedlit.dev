@@ -333,6 +333,50 @@ export async function batchDeleteImages(
   };
 }
 
+/** One cataloged image whose on-disk source file has vanished. */
+export interface MissingFile {
+  sha256: string;
+  filepath: string;
+  filename?: string | null;
+  directory?: string | null;
+}
+
+/** Result of the missing-file scan (gateway GET /maintenance/missing-files). */
+export interface MissingFilesResult {
+  /** Records probed (those with a local filepath; blob-only entries skipped). */
+  checked: number;
+  /** The orphaned entries, capped at the requested `limit`. */
+  missing: MissingFile[];
+  /** Exact total of orphaned entries (may exceed `missing.length`). */
+  missingCount: number;
+  /** True when more entries matched than were returned. */
+  truncated: boolean;
+}
+
+/**
+ * Scan the catalog for images whose source file vanished from disk. Proxies the
+ * gateway GET /maintenance/missing-files (routed to deedlit.ingest, the host-FS
+ * owner). Read-only — pairs with {@link batchDeleteImages} to clean up the stale
+ * catalog records the scan surfaces.
+ */
+export async function findMissingFiles(
+  limit = 500,
+  signal?: AbortSignal,
+): Promise<MissingFilesResult> {
+  const res = await request<{
+    checked?: number;
+    missing?: MissingFile[];
+    missing_count?: number;
+    truncated?: boolean;
+  }>("/maintenance/missing-files", { query: { limit }, signal });
+  return {
+    checked: Number(res?.checked ?? 0),
+    missing: Array.isArray(res?.missing) ? res.missing : [],
+    missingCount: Number(res?.missing_count ?? 0),
+    truncated: Boolean(res?.truncated),
+  };
+}
+
 export interface GatewaySearchRequest {
   query: string;
   limit?: number;

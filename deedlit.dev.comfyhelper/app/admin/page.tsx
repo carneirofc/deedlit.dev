@@ -140,6 +140,28 @@ interface ActionRun {
   result: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Missing-files cleanup (#) — find catalog entries whose source file vanished
+// from disk, then un-index the selected stale records via batch-delete.
+// ---------------------------------------------------------------------------
+
+interface MissingFile {
+  sha256: string;
+  filepath: string;
+  filename?: string | null;
+  directory?: string | null;
+}
+
+interface MissingFilesResult {
+  checked: number;
+  missing: MissingFile[];
+  missingCount: number;
+  truncated: boolean;
+}
+
+// Scan deep enough to surface a meaningful batch in one pass; the API caps it.
+const MISSING_SCAN_LIMIT = 2000;
+
 function jobStatusColor(status: string): string {
   switch (status) {
     case "running":
@@ -172,6 +194,16 @@ export default function AdminPage() {
 
   // Maintenance
   const [runs, setRuns] = useState<Record<string, ActionRun>>({});
+
+  // Missing-files cleanup
+  const [missingState, setMissingState] = useState<
+    "idle" | "scanning" | "done" | "error"
+  >("idle");
+  const [missing, setMissing] = useState<MissingFilesResult | null>(null);
+  const [missingError, setMissingError] = useState<string | null>(null);
+  const [selectedMissing, setSelectedMissing] = useState<Set<string>>(new Set());
+  const [deletingMissing, setDeletingMissing] = useState(false);
+  const [missingNotice, setMissingNotice] = useState<string | null>(null);
 
   // Jobs
   const [jobs, setJobs] = useState<JobSummary[]>([]);
@@ -303,6 +335,78 @@ export default function AdminPage() {
           result: e instanceof Error ? e.message : "failed",
         },
       }));
+    }
+  };
+
+  const scanMissingFiles = async () => {
+    setMissingState("scanning");
+    setMissingError(null);
+    setMissingNotice(null);
+    setSelectedMissing(new Set());
+    try {
+      const res = await fetch(
+        `/api/library/maintenance/missing-files?limit=${MISSING_SCAN_LIMIT}`,
+      );
+      const body = (await res.json()) as MissingFilesResult & { error?: string };
+      if (!res.ok) throw new Error(body?.error || `scan failed (${res.status})`);
+      setMissing(body);
+      // Pre-select everything found — the common case is "clean up all of these".
+      setSelectedMissing(new Set(body.missing.map((m) => m.sha256)));
+      setMissingState("done");
+    } catch (e) {
+      setMissingError(e instanceof Error ? e.message : "Scan failed");
+      setMissingState("error");
+    }
+  };
+
+  const toggleMissing = (sha256: string) =>
+    setSelectedMissing((prev) => {
+      const next = new Set(prev);
+      if (next.has(sha256)) next.delete(sha256);
+      else next.add(sha256);
+      return next;
+    });
+
+  const toggleAllMissing = () =>
+    setSelectedMissing((prev) => {
+      const all = missing?.missing ?? [];
+      if (prev.size === all.length) return new Set();
+      return new Set(all.map((m) => m.sha256));
+    });
+
+  const deleteSelectedMissing = async () => {
+    const ids = Array.from(selectedMissing);
+    if (ids.length === 0) return;
+    setDeletingMissing(true);
+    setMissingError(null);
+    setMissingNotice(null);
+    try {
+      const j = await fetchJson<{ deleted?: string[] }>(
+        `Clean up ${ids.length} stale entr${ids.length === 1 ? "y" : "ies"}`,
+        "/api/library/images/batch-delete",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ids }),
+        },
+      );
+      const deleted = new Set(Array.isArray(j.deleted) ? j.deleted : ids);
+      // Drop the cleaned-up entries from the list and the selection.
+      setMissing((prev) =>
+        prev
+          ? {
+              ...prev,
+              missing: prev.missing.filter((m) => !deleted.has(m.sha256)),
+              missingCount: Math.max(0, prev.missingCount - deleted.size),
+            }
+          : prev,
+      );
+      setSelectedMissing(new Set());
+      setMissingNotice(`Cleaned up ${deleted.size} stale catalog entr${deleted.size === 1 ? "y" : "ies"}.`);
+    } catch (e) {
+      setMissingError(e instanceof Error ? e.message : "Cleanup failed");
+    } finally {
+      setDeletingMissing(false);
     }
   };
 
@@ -530,6 +634,109 @@ export default function AdminPage() {
             );
           })}
         </div>
+      </section>
+
+      {/* Missing files — find catalog entries whose source file vanished and
+          clean up the stale records. */}
+      <section className={cls.card} data-testid="missing-files-panel">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-ui-sm font-semibold text-ui-ink-title">Missing files</h2>
+            <p className="text-ui-2xs text-ui-ink-muted">
+              Find cataloged images whose source file vanished from disk, then un-index the stale entries.
+            </p>
+          </div>
+          <button
+            className={cls.btn}
+            onClick={scanMissingFiles}
+            disabled={missingState === "scanning"}
+            data-testid="missing-scan"
+          >
+            {missingState === "scanning" ? "Scanning…" : "Scan for missing files"}
+          </button>
+        </div>
+
+        {missingError && (
+          <p className="text-ui-sm text-rose-500" data-testid="missing-error">
+            {missingError}
+          </p>
+        )}
+        {missingNotice && (
+          <p className="text-ui-sm text-emerald-500" data-testid="missing-notice">
+            {missingNotice}
+          </p>
+        )}
+
+        {missing && (
+          <div className="mt-2 flex flex-col gap-3" data-testid="missing-results">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui-2xs text-ui-ink-muted">
+              <span>
+                Checked <span className="tabular-nums text-ui-ink">{missing.checked}</span> · found{" "}
+                <span className="tabular-nums text-ui-ink">{missing.missingCount}</span> missing
+              </span>
+              {missing.truncated && (
+                <span className="text-amber-500">
+                  showing first {missing.missing.length} — re-scan after cleanup for the rest
+                </span>
+              )}
+            </div>
+
+            {missing.missing.length === 0 ? (
+              <p className="text-ui-sm text-emerald-500" data-testid="missing-empty">
+                No missing files — every cataloged image still has its source on disk.
+              </p>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
+                    <input
+                      type="checkbox"
+                      className="rounded"
+                      checked={selectedMissing.size === missing.missing.length && missing.missing.length > 0}
+                      onChange={toggleAllMissing}
+                      data-testid="missing-select-all"
+                    />
+                    Select all ({selectedMissing.size}/{missing.missing.length})
+                  </label>
+                  <button
+                    className={`${cls.btn} border-rose-500/50 text-rose-500 hover:bg-rose-500/10`}
+                    onClick={deleteSelectedMissing}
+                    disabled={deletingMissing || selectedMissing.size === 0}
+                    data-testid="missing-delete-selected"
+                  >
+                    {deletingMissing
+                      ? "Cleaning up…"
+                      : `Delete ${selectedMissing.size} selected entr${selectedMissing.size === 1 ? "y" : "ies"}`}
+                  </button>
+                </div>
+
+                <ul className="flex max-h-96 flex-col gap-0.5 overflow-y-auto rounded-lg border border-ui-border/50 bg-ui-bg p-2">
+                  {missing.missing.map((m) => (
+                    <li key={m.sha256}>
+                      <label className="flex cursor-pointer items-start gap-2 rounded-md px-1.5 py-1 hover:bg-ui-bg-soft/60">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5 rounded"
+                          checked={selectedMissing.has(m.sha256)}
+                          onChange={() => toggleMissing(m.sha256)}
+                          data-testid={`missing-row-${m.sha256}`}
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-ui-xs text-ui-ink" title={m.filepath}>
+                            {m.filepath}
+                          </span>
+                          <span className="block truncate font-mono text-ui-2xs text-ui-ink-muted">
+                            {m.sha256.slice(0, 16)}…
+                          </span>
+                        </span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Jobs */}
