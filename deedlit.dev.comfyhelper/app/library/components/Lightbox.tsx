@@ -68,6 +68,9 @@ interface LightboxProps {
   fetchNotes?: (imageId: string) => Promise<LightboxNote[]>;
   /** Create a plain-text note attached to an image. */
   onCreateNote?: (imageId: string, text: string) => Promise<void>;
+  /** Un-index the current image (catalog + search + graph; original kept on
+   * disk). Resolves once it's gone so the viewer can advance off it. */
+  onDelete?: (imageId: string) => Promise<void>;
 }
 
 const ctrlBtn =
@@ -105,6 +108,7 @@ export function Lightbox({
   onRating,
   fetchNotes,
   onCreateNote,
+  onDelete,
 }: LightboxProps) {
   // Track the displayed image by *id*, not by position. The result list can
   // reorder, grow (load-more) or have rows spliced under the viewer; an index
@@ -133,6 +137,11 @@ export function Lightbox({
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  // Delete confirmation — a two-step click so the destructive action is never a
+  // single misclick away.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Resolve the live position of the tracked image each render. If it vanished
   // (the list changed under us) land on the original open slot, clamped — a rare
@@ -229,10 +238,12 @@ export function Lightbox({
     return () => { alive = false; };
   }, [notesOpen, current?.imageId, fetchNotes]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Reset notes when navigating to a new image (stale data from the old one).
+  // Reset notes + any pending delete confirmation when navigating to a new
+  // image (stale data / a primed confirm from the old one).
   useEffect(() => {
     setNotes([]);
     setNoteDraft("");
+    setConfirmingDelete(false);
   }, [current?.imageId]);
 
   // Fetch image detail when the details panel is open or the image changes.
@@ -342,6 +353,28 @@ export function Lightbox({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [go, goToIndex, onClose, toggleFullscreen]);
+
+  // Un-index the current image, then land on a neighbour so the viewer keeps
+  // flowing — next image if there is one, else the previous, else close when the
+  // last picture is removed. The neighbour id is captured before deletion so it
+  // survives the list shrinking underneath us.
+  const handleDelete = useCallback(async () => {
+    const cur = live.current;
+    const list = cur.items;
+    const i = cur.index;
+    const victim = list[i];
+    if (!onDelete || !victim || deleting) return;
+    const neighbour = list[i + 1] ?? list[i - 1] ?? null;
+    setDeleting(true);
+    try {
+      await onDelete(victim.imageId);
+      setConfirmingDelete(false);
+      if (neighbour) setCurrentId(neighbour.imageId);
+      else onClose();
+    } finally {
+      setDeleting(false);
+    }
+  }, [onDelete, deleting, onClose]);
 
   if (!current) return null;
 
@@ -510,6 +543,46 @@ export function Lightbox({
               Notes{notes.length > 0 ? ` (${notes.length})` : ""}
             </button>
           )}
+
+          {/* Delete (un-index) — two-step: the first click primes a rose confirm
+              button, the second removes the image and advances the viewer. */}
+          {onDelete &&
+            (confirmingDelete ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="grid h-9 w-auto place-items-center gap-1.5 rounded-lg bg-rose-500/90 px-2.5 text-ui-2xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-60"
+                  title="Remove this image from the library (original kept on disk)"
+                >
+                  {deleting ? "Removing…" : "Delete?"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDelete(false)}
+                  disabled={deleting}
+                  className={ctrlBtn}
+                  title="Cancel"
+                >
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                    <path d="M18 6 6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmingDelete(true)}
+                className={`${ctrlBtn} hover:border-rose-500/70 hover:text-rose-400`}
+                title="Delete this image from the library"
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                  <path d="M10 11v6M14 11v6" />
+                </svg>
+              </button>
+            ))}
 
           <button type="button" onClick={onClose} className={ctrlBtn} title="Close (Esc)">
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">

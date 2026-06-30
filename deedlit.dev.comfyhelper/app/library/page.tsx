@@ -627,6 +627,27 @@ export default function LibraryPage() {
     }
   }, [selected, exitSelectMode]);
 
+  // Delete a single image (from the lightbox). Reuses the batch un-index path
+  // with a one-id list; on success the row leaves the grid and any selection.
+  // Throws on failure so the viewer keeps the image on screen and surfaces why.
+  const deleteOne = useCallback(async (imageId: string) => {
+    setError(null);
+    const { deleted, failed } = await deleteImages([imageId]);
+    if (deleted.length > 0) {
+      setResults((prev) => prev.filter((r) => r.imageId !== imageId));
+      setSelected((prev) => {
+        if (!prev.has(imageId)) return prev;
+        const next = new Set(prev);
+        next.delete(imageId);
+        return next;
+      });
+      return;
+    }
+    const reason = failed[0]?.error ?? "Delete failed";
+    setError(`Delete failed: ${reason}`);
+    throw new Error(reason);
+  }, []);
+
   // Fan a metadata edit out over the selected rows. `build` produces the PATCH
   // body per row (so tag add/remove can compute a per-image final list); `patch`
   // mirrors that change onto the loaded grid row so the cards update without a
@@ -1850,21 +1871,18 @@ export default function LibraryPage() {
           renderResultGallery(displayResults, 0)
         ))}
 
-      {/* Infinite-scroll sentinel + manual "Load more" fallback */}
+      {/* Infinite-scroll sentinel + always-visible "Load more" button. The
+          sentinel only auto-loads when infinite scroll is on; the button is
+          always shown so the user can force the next page when a short grid
+          never scrolls far enough to trip the observer. */}
       {hasMore && (
         <>
           <div ref={sentinelRef} aria-hidden="true" className="h-1" />
-          {!settings.infiniteScroll ? (
-            <div className="flex justify-center pt-2">
-              <button className={cls.btn} onClick={loadMore} disabled={loading}>
-                {loading ? "Loading…" : "Load more"}
-              </button>
-            </div>
-          ) : (
-            loading && (
-              <p className="pt-2 text-center text-ui-xs text-ui-ink-muted">Loading…</p>
-            )
-          )}
+          <div className="flex justify-center pt-2">
+            <button className={cls.btn} onClick={loadMore} disabled={loading}>
+              {loading ? "Loading…" : "Load more"}
+            </button>
+          </div>
         </>
       )}
 
@@ -1958,6 +1976,7 @@ export default function LibraryPage() {
           onRating={rateImage}
           fetchNotes={fetchNotesForImage}
           onCreateNote={createNoteForImage}
+          onDelete={deleteOne}
         />
       )}
     </div>
