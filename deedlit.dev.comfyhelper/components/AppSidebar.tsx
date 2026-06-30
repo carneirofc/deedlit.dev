@@ -36,6 +36,16 @@ const icon = {
       <path d="m9 12 2 2 4-4" />
     </svg>
   ),
+  manage: (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="4" y1="12" x2="20" y2="12" />
+      <line x1="4" y1="18" x2="20" y2="18" />
+      <circle cx="9" cy="6" r="2" />
+      <circle cx="15" cy="12" r="2" />
+      <circle cx="8" cy="18" r="2" />
+    </svg>
+  ),
   health: (
     <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 fill-none stroke-current" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
@@ -118,11 +128,14 @@ const NAV_ITEMS: NavItem[] = [
     icon: icon.library,
     match: (p) => (p === "/library" || p.startsWith("/library/")) && !p.startsWith("/library/settings"),
   },
-  { href: "/admin", label: "Backend Admin", testId: "admin", icon: icon.admin, match: (p) => p === "/admin" },
-  { href: "/admin/health", label: "System Health", testId: "health", icon: icon.health, match: (p) => p.startsWith("/admin/health") },
-  { href: "/admin/queues", label: "Queues", testId: "queues", icon: icon.queues, match: (p) => p.startsWith("/admin/queues") },
-  { href: "/admin/db", label: "Database (power tools)", testId: "db", icon: icon.db, match: (p) => p.startsWith("/admin/db") },
-  { href: "/admin/cache", label: "Image Cache", testId: "cache", icon: icon.cache, match: (p) => p.startsWith("/admin/cache") },
+  {
+    href: "/manage",
+    label: "Manage",
+    testId: "manage",
+    icon: icon.manage,
+    // Stays active across every management surface (the hub + all /admin pages).
+    match: (p) => p === "/manage" || p.startsWith("/admin"),
+  },
   { href: "/library/settings", label: "Settings", testId: "settings", icon: icon.settings, match: (p) => p.startsWith("/library/settings") },
 ];
 
