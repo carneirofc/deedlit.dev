@@ -210,3 +210,11 @@ graphify-out/cache/semantic/dcd3fb232b6085349fe7aafa7e3c0d418b7658fb1940753566e5
 graphify-out/cache/semantic/e9414750caff797439015108a7771cee6b81b0cbd5375f8d68eef2e8996a9b09.json
 graphify-out/cache/semantic/eecb507bffd2b105a745c16f984aeee6ac4cd8a8bdde9effaf62994892e5df86.json
 graphify-out/cache/semantic/f994b81605a3dbf0a7efdc92bf7d6a8848967eb416e91a181facbcb13424e337.json
+
+# design-sync (claude.ai/design sync) — transient build/verification artifacts
+/ds-bundle/
+/.ds-sync/
+/.design-sync/sb-reference/
+/.design-sync/learnings/
+/.design-sync/.cache/
+/.design-sync/node_modules
