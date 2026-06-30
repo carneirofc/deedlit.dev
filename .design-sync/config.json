@@ -1,0 +1,31 @@
+{
+  "pkg": "@carneirofc/ui",
+  "shape": "storybook",
+  "storybookConfigDir": "deedlit.dev.ui/.storybook",
+  "storybookStatic": ".design-sync/sb-reference",
+  "buildCmd": "cd deedlit.dev.ui && npm run build",
+  "readmeHeader": ".design-sync/conventions.md",
+  "titleMap": {
+    "CyberPanels": "CyberPanel",
+    "Icons": null,
+    "Borders&Shadows": null,
+    "Colors": null,
+    "CyberStyles": null,
+    "Surfaces&Backgrounds": null,
+    "Typography": null
+  },
+  "overrides": {
+    "CodeBlock": { "cardMode": "column" },
+    "CollapsiblePanel": { "cardMode": "column" },
+    "CyberPanel": { "cardMode": "column" },
+    "KeyValueField": { "cardMode": "column" },
+    "PanelSectionHeader": { "cardMode": "column" },
+    "PromptBlock": { "cardMode": "column" },
+    "ScanProgress": { "cardMode": "column" },
+    "SurfacePanel": { "cardMode": "column" },
+    "Table": { "cardMode": "column" },
+    "DockPanel": { "cardMode": "single", "primaryStory": "Default" },
+    "Toast": { "cardMode": "single", "primaryStory": "Default" },
+    "WarningList": { "skip": ["components-warninglist--empty"] }
+  }
+}
