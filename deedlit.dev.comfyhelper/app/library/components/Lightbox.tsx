@@ -137,6 +137,11 @@ export function Lightbox({
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState(false);
+
+  // Whether the main viewer image failed to load (bad blob, gateway error,
+  // network hiccup) — without this the spinner spins forever with no way out.
+  const [imgError, setImgError] = useState(false);
 
   // Delete confirmation — a two-step click so the destructive action is never a
   // single misclick away.
@@ -224,6 +229,7 @@ export function Lightbox({
   // Reset the load state whenever the displayed image changes.
   useEffect(() => {
     setImgLoaded(false);
+    setImgError(false);
   }, [current?.imageId, fullResolution]);
 
   // Fetch notes for the current image when the notes panel is open.
@@ -252,10 +258,14 @@ export function Lightbox({
     let alive = true;
     setDetailLoading(true);
     setDetail(null);
+    setDetailError(false);
     fetch(`/api/library/images/${current.imageId}`)
-      .then((r) => r.json())
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
+        return r.json();
+      })
       .then((j) => { if (alive) setDetail(j); })
-      .catch(() => {})
+      .catch(() => { if (alive) setDetailError(true); })
       .finally(() => { if (alive) setDetailLoading(false); });
     return () => { alive = false; };
   }, [detailsOpen, current?.imageId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -420,7 +430,9 @@ export function Lightbox({
             onClick={() => setPlaying((p) => !p)}
             className={`${ctrlBtn} ${playing ? "border-accent-cyan text-accent-cyan" : ""}`}
             aria-pressed={playing}
+            aria-label={playing ? "Pause slideshow" : "Play slideshow"}
             title={playing ? "Pause slideshow (Space)" : "Play slideshow (Space)"}
+            data-testid="lightbox-toggle-slideshow"
           >
             {playing ? (
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
@@ -439,7 +451,9 @@ export function Lightbox({
             onClick={toggleFullscreen}
             className={`${ctrlBtn} ${isFullscreen ? "border-accent-cyan text-accent-cyan" : ""}`}
             aria-pressed={isFullscreen}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
             title={isFullscreen ? "Exit fullscreen (F)" : "Enter fullscreen (F)"}
+            data-testid="lightbox-toggle-fullscreen"
           >
             {isFullscreen ? (
               <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -459,6 +473,7 @@ export function Lightbox({
               className={`${ctrlBtn} w-auto px-2 text-ui-2xs font-semibold ${fullResolution ? "border-accent-cyan text-accent-cyan" : ""}`}
               aria-pressed={fullResolution}
               title={fullResolution ? "Showing HD original — switch to thumbnail" : "Showing thumbnail — switch to HD original"}
+              data-testid="lightbox-toggle-resolution"
             >
               HD
             </button>
@@ -470,6 +485,7 @@ export function Lightbox({
               onClick={() => onSimilar(current)}
               className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium`}
               title="Find similar images"
+              data-testid="lightbox-find-similar"
             >
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                 <circle cx="11" cy="11" r="7" />
@@ -485,6 +501,7 @@ export function Lightbox({
             className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${detailsOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
             aria-pressed={detailsOpen}
             title="Toggle details panel"
+            data-testid="lightbox-toggle-details"
           >
             <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
               <circle cx="12" cy="12" r="9" />
@@ -496,7 +513,9 @@ export function Lightbox({
             href={`/library/${current.imageId}`}
             prefetch={false}
             className={`${ctrlBtn} text-ui-2xs`}
+            aria-label="Open full details page"
             title="Open full details page"
+            data-testid="lightbox-open-details-page"
           >
             <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
@@ -520,6 +539,7 @@ export function Lightbox({
                   }`}
                   title={`${n}★${current.rating === n ? " — click to clear" : ""}`}
                   aria-label={`Rate ${n} star${n === 1 ? "" : "s"}`}
+                  data-testid={`lightbox-rate-star-${n}`}
                 >
                   ★
                 </button>
@@ -535,6 +555,7 @@ export function Lightbox({
               className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${notesOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
               aria-pressed={notesOpen}
               title="Toggle notes panel"
+              data-testid="lightbox-toggle-notes"
             >
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
@@ -555,6 +576,7 @@ export function Lightbox({
                   disabled={deleting}
                   className="grid h-9 w-auto place-items-center gap-1.5 rounded-lg bg-rose-500/90 px-2.5 text-ui-2xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-60"
                   title="Remove this image from the library (original kept on disk)"
+                  data-testid="lightbox-delete-confirm"
                 >
                   {deleting ? "Removing…" : "Delete?"}
                 </button>
@@ -563,7 +585,9 @@ export function Lightbox({
                   onClick={() => setConfirmingDelete(false)}
                   disabled={deleting}
                   className={ctrlBtn}
+                  aria-label="Cancel delete"
                   title="Cancel"
+                  data-testid="lightbox-delete-cancel"
                 >
                   <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                     <path d="M18 6 6 18M6 6l12 12" />
@@ -575,7 +599,9 @@ export function Lightbox({
                 type="button"
                 onClick={() => setConfirmingDelete(true)}
                 className={`${ctrlBtn} hover:border-rose-500/70 hover:text-rose-400`}
+                aria-label="Delete image"
                 title="Delete this image from the library"
+                data-testid="lightbox-delete-request"
               >
                 <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                   <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
@@ -584,7 +610,14 @@ export function Lightbox({
               </button>
             ))}
 
-          <button type="button" onClick={onClose} className={ctrlBtn} title="Close (Esc)">
+          <button
+            type="button"
+            onClick={onClose}
+            className={ctrlBtn}
+            aria-label="Close"
+            title="Close (Esc)"
+            data-testid="lightbox-close"
+          >
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
               <path d="M18 6 6 18M6 6l12 12" />
             </svg>
@@ -620,6 +653,7 @@ export function Lightbox({
                 placeholder="Add a note…"
                 value={noteDraft}
                 onChange={(e) => setNoteDraft(e.target.value)}
+                data-testid="lightbox-note-input"
                 onKeyDown={async (e) => {
                   if (e.key === "Enter" && noteDraft.trim() && !noteSaving) {
                     setNoteSaving(true);
@@ -638,6 +672,7 @@ export function Lightbox({
               <button
                 className="rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-1.5 text-ui-xs font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50"
                 disabled={!noteDraft.trim() || noteSaving}
+                data-testid="lightbox-note-add"
                 onClick={async () => {
                   if (!noteDraft.trim() || noteSaving) return;
                   setNoteSaving(true);
@@ -665,6 +700,9 @@ export function Lightbox({
       {detailsOpen && (
         <aside className="flex w-[min(20rem,80vw)] shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-r border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm sm:w-96">
           {detailLoading && <p className="text-ui-xs text-ui-ink-muted">Loading…</p>}
+          {detailError && !detailLoading && (
+            <p className="text-ui-xs text-rose-400">Couldn&apos;t load details for this image.</p>
+          )}
           {detail && <LightboxDetailPanel detail={detail} imageId={current.imageId} />}
         </aside>
       )}
@@ -699,14 +737,25 @@ export function Lightbox({
           disabled={atStart}
           aria-label="Previous image"
           className={`${navBtn} left-2 sm:left-4`}
+          data-testid="lightbox-nav-prev"
         >
           <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="m15 18-6-6 6-6" />
           </svg>
         </button>
 
-        {!imgLoaded && (
+        {!imgLoaded && !imgError && (
           <div className="absolute inset-0 m-auto h-8 w-8 animate-pulse rounded-full border-2 border-ui-border/50 border-t-accent-cyan" aria-hidden="true" />
+        )}
+        {imgError && (
+          <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 text-ui-ink-muted">
+            <svg viewBox="0 0 24 24" className="h-8 w-8" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="2" />
+              <path d="m3 16 5-5c.9-.9 2.1-.9 3 0l5 5M14 13l1.5-1.5c.9-.9 2.1-.9 3 0L21 14M8 9a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" />
+              <path d="M4 4l16 16" />
+            </svg>
+            <p className="text-ui-xs">Failed to load image.</p>
+          </div>
         )}
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
@@ -715,7 +764,8 @@ export function Lightbox({
           alt={current.summary}
           decoding="async"
           onLoad={() => setImgLoaded(true)}
-          className={`max-h-full max-w-full object-contain transition-opacity duration-200 ${imgLoaded ? "opacity-100" : "opacity-0"}`}
+          onError={() => { setImgLoaded(true); setImgError(true); }}
+          className={`max-h-full max-w-full object-contain transition-opacity duration-200 ${imgLoaded && !imgError ? "opacity-100" : "opacity-0"}`}
         />
 
         {/* Quality indicator — what's actually on screen right now. */}
@@ -741,6 +791,7 @@ export function Lightbox({
           disabled={atEnd}
           aria-label="Next image"
           className={`${navBtn} right-2 sm:right-4`}
+          data-testid="lightbox-nav-next"
         >
           <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="m9 18 6-6-6-6" />
@@ -767,6 +818,7 @@ export function Lightbox({
               onClick={() => setCurrentId(it.imageId)}
               aria-label={`Go to image ${i + 1}`}
               aria-current={i === index}
+              data-testid={`lightbox-filmstrip-thumb-${it.imageId}`}
               className={`relative h-14 w-14 shrink-0 overflow-hidden rounded-md border transition ${
                 i === index
                   ? "border-accent-cyan ring-2 ring-accent-cyan/40"
@@ -787,6 +839,7 @@ export function Lightbox({
             onClick={onLoadMore}
             disabled={loadingMore}
             className="grid h-14 w-14 shrink-0 place-items-center rounded-md border border-dashed border-ui-border/60 text-ui-2xs text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan disabled:opacity-50"
+            data-testid="lightbox-filmstrip-load-more"
           >
             {loadingMore ? "…" : "More"}
           </button>
@@ -828,6 +881,7 @@ function LightboxDetailPanel({ detail, imageId }: { detail: ImageDetail; imageId
                 href={`/library?tags=${encodeURIComponent(t.normalizedName || t.name)}`}
                 prefetch={false}
                 className="rounded-full bg-ui-bg px-2 py-0.5 text-ui-2xs text-ui-ink-muted transition hover:text-accent-cyan"
+                data-testid={`lightbox-detail-tag-${t.normalizedName}`}
               >
                 {t.name}
               </Link>
@@ -877,6 +931,7 @@ function LightboxDetailPanel({ detail, imageId }: { detail: ImageDetail; imageId
           href={`/library/${imageId}`}
           prefetch={false}
           className="inline-flex items-center gap-1 text-ui-2xs text-accent-cyan hover:underline"
+          data-testid="lightbox-detail-open-full-page"
         >
           Open full details
           <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
