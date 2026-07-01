@@ -351,6 +351,7 @@ export function Gallery<T>({
       {spacer("__top", topSpacer)}
       {sliceItems.map((item, i) => {
         const index = winStart + i;
+        const itemKey = getKey(item);
         const selected = isSelected?.(item) ?? false;
         const href = getHref?.(item);
         const ctx: GalleryItemContext = {
@@ -389,11 +390,23 @@ export function Gallery<T>({
         // over the app's cursor-zoom-in.
         const armTitle = armed ? "Ctrl/Cmd-click to select" : undefined;
         const media = href ? (
-          <a href={href} onClick={onMediaClick} title={armTitle} className={cn("block", list && "shrink-0", mediaClassName, armed && "cursor-pointer")}>
+          <a
+            href={href}
+            onClick={onMediaClick}
+            title={armTitle}
+            data-testid={`gallery-item-media-${itemKey}`}
+            className={cn("block", list && "shrink-0", mediaClassName, armed && "cursor-pointer")}
+          >
             {mediaInner}
           </a>
         ) : (
-          <button type="button" onClick={onMediaClick} title={armTitle} className={cn("block text-left", list && "shrink-0", mediaClassName, armed && "cursor-pointer")}>
+          <button
+            type="button"
+            onClick={onMediaClick}
+            title={armTitle}
+            data-testid={`gallery-item-media-${itemKey}`}
+            className={cn("block text-left", list && "shrink-0", mediaClassName, armed && "cursor-pointer")}
+          >
             {mediaInner}
           </button>
         );
@@ -417,6 +430,7 @@ export function Gallery<T>({
             onClick={() => onToggleSelect?.(item)}
             aria-pressed={selected}
             aria-label={selected ? "Deselect" : "Select"}
+            data-testid={`gallery-item-select-${itemKey}`}
             className={list ? "shrink-0" : "absolute left-1.5 top-1.5 z-10"}
           >
             <SelectCheck checked={selected} />
@@ -426,8 +440,9 @@ export function Gallery<T>({
         if (list) {
           return (
             <div
-              key={getKey(item)}
+              key={itemKey}
               data-gallery-item=""
+              data-testid={`gallery-item-${itemKey}`}
               data-index={index}
               className={cn(
                 "group flex items-center gap-3",
@@ -449,8 +464,9 @@ export function Gallery<T>({
 
         return (
           <div
-            key={getKey(item)}
+            key={itemKey}
             data-gallery-item=""
+            data-testid={`gallery-item-${itemKey}`}
             data-index={index}
             className={cn(
               "group relative",

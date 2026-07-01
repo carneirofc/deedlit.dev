@@ -94,6 +94,7 @@ function ComparePageInner() {
                   href={`/library/${img.id}`}
                   prefetch={false}
                   className="overflow-hidden rounded-xl border border-ui-border/60 hover:border-accent-cyan"
+                  data-testid={`compare-image-link-${img.id}`}
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
@@ -113,6 +114,7 @@ function ComparePageInner() {
                       router.replace(`/library/compare?ids=${next.join(",")}`);
                     }}
                     className="shrink-0 text-ui-2xs text-ui-ink-muted hover:text-rose-500"
+                    data-testid={`compare-remove-image-${img.id}`}
                   >
                     remove
                   </button>

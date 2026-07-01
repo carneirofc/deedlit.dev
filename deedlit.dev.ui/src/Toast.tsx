@@ -75,6 +75,7 @@ const Toast = forwardRef<HTMLDivElement, ToastProps>(function Toast(
             aria-label={closeLabel}
             title={closeLabel}
             onClick={onClose}
+            data-testid={testId ? `${testId}-dismiss` : undefined}
             className="absolute top-2 right-2 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-[color:var(--ui-ink-subtle)] transition hover:bg-[color:var(--ui-bg-soft)] hover:text-[color:var(--ui-ink-strong)] active:scale-95"
           >
             <span aria-hidden="true" className="text-ui-sm leading-none">

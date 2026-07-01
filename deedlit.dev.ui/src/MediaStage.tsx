@@ -47,6 +47,7 @@ export default function MediaStage({
               type="button"
               onClick={() => onNavigate(-1)}
               aria-label={previousLabel}
+              data-testid="media-stage-previous"
               className={cn(
                 "group absolute inset-y-0 left-0 flex h-full w-1/3 cursor-pointer items-center justify-start pl-3 transition hover:bg-linear-to-r hover:from-black/25",
                 previousOverlayClassName,
@@ -60,6 +61,7 @@ export default function MediaStage({
               type="button"
               onClick={() => onNavigate(1)}
               aria-label={nextLabel}
+              data-testid="media-stage-next"
               className={cn(
                 "group absolute inset-y-0 right-0 flex h-full w-1/3 cursor-pointer items-center justify-end pr-3 transition hover:bg-linear-to-l hover:from-black/25",
                 nextOverlayClassName,

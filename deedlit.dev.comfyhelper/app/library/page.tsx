@@ -1306,6 +1306,7 @@ export default function LibraryPage() {
           return (
             <>
               <a
+                data-testid={`library-image-card-link-${r.imageId}`}
                 href={`/library/${r.imageId}`}
                 onClick={(e) => {
                   if (ctx.selectMode) {
@@ -1342,6 +1343,7 @@ export default function LibraryPage() {
       }}
       renderOverlay={(r) => (
         <button
+          data-testid={`library-image-card-similar-${r.imageId}`}
           onClick={() => findSimilar(r.imageId, r.thumbnailUrl, r.summary)}
           className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
           title="Find similar images"
@@ -1366,6 +1368,7 @@ export default function LibraryPage() {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
+            data-testid="library-select-mode-toggle"
             onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
             disabled={results.length === 0}
             aria-pressed={selectMode}
@@ -1383,6 +1386,7 @@ export default function LibraryPage() {
             {selectMode ? "Done" : "Select"}
           </button>
           <button
+            data-testid="library-slideshow-start"
             onClick={() => openLightbox(0, true)}
             disabled={results.length === 0}
             className="flex items-center gap-1.5 rounded-lg border border-ui-border/60 bg-ui-bg px-2.5 py-1.5 text-ui-2xs font-medium text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan disabled:opacity-40"
@@ -1395,6 +1399,7 @@ export default function LibraryPage() {
           </button>
           {browsePath && (
             <button
+              data-testid="library-group-by-folder-toggle"
               onClick={() => setKey("groupBy", settings.groupBy === "folder" ? "none" : "folder")}
               aria-pressed={settings.groupBy === "folder"}
               className={`flex items-center gap-1.5 rounded-lg border bg-ui-bg px-2.5 py-1.5 text-ui-2xs font-medium transition ${
@@ -1413,6 +1418,7 @@ export default function LibraryPage() {
           <label className="flex items-center gap-1.5 rounded-lg border border-ui-border/60 bg-ui-bg px-2 py-1 text-ui-2xs text-ui-ink-muted">
             <span className="hidden sm:inline">Sort</span>
             <select
+              data-testid="library-sort-select"
               value={sortValue}
               onChange={(e) => changeSort(e.target.value as SortMode)}
               className="bg-transparent text-ui-2xs font-medium text-ui-ink outline-none"
@@ -1433,6 +1439,7 @@ export default function LibraryPage() {
             ] as Array<[ViewMode, string]>).map(([v, label]) => (
               <button
                 key={v}
+                data-testid={`library-view-mode-${v}`}
                 onClick={() => setKey("viewMode", v)}
                 aria-pressed={settings.viewMode === v}
                 className={`rounded-md px-2 py-1 text-ui-2xs font-medium transition ${
@@ -1468,6 +1475,7 @@ export default function LibraryPage() {
                 <path d="m21 21-4.3-4.3" />
               </svg>
               <input
+                data-testid="library-search-input"
                 className="w-full rounded-lg border border-ui-border/70 bg-ui-bg py-2 pl-9 pr-3 text-ui-sm outline-none focus:border-accent-cyan"
                 placeholder="Search prompts, tags, filenames — or describe what you want…"
                 value={query}
@@ -1476,6 +1484,7 @@ export default function LibraryPage() {
               />
             </div>
             <button
+              data-testid="library-search-by-image-toggle"
               className={`${cls.btn} flex items-center gap-1.5 ${imagePanelOpen ? cls.btnActive : ""}`}
               onClick={() => {
                 if (imagePanelOpen) {
@@ -1494,7 +1503,7 @@ export default function LibraryPage() {
               </svg>
               <span className="hidden sm:inline">By image</span>
             </button>
-            <button className={cls.btn} onClick={search} disabled={loading}>
+            <button data-testid="library-search-submit" className={cls.btn} onClick={search} disabled={loading}>
               {loading ? "Loading…" : "Search"}
             </button>
           </div>
@@ -1523,6 +1532,7 @@ export default function LibraryPage() {
                 <p className="truncate text-ui-xs text-ui-ink-muted">{similarRef.summary}</p>
               </div>
               <button
+                data-testid="library-similar-clear"
                 className="rounded-lg border border-ui-border/60 px-2 py-1 text-ui-xs text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan"
                 onClick={clearSimilar}
               >
@@ -1562,6 +1572,7 @@ export default function LibraryPage() {
                     <button
                       key={t}
                       type="button"
+                      data-testid={`library-tag-chip-${t}`}
                       aria-pressed={on}
                       onClick={() => {
                         const next = on
@@ -1583,6 +1594,7 @@ export default function LibraryPage() {
                 {allTags.length > TAG_CHIP_PREVIEW && (
                   <button
                     type="button"
+                    data-testid="library-tag-chips-expand"
                     onClick={() => setShowAllTagChips((v) => !v)}
                     className="rounded-full px-2.5 py-1 text-ui-2xs font-medium text-accent-cyan/80 transition hover:text-accent-cyan"
                   >
@@ -1599,6 +1611,7 @@ export default function LibraryPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
               <input
+                data-testid="library-filter-favorites-checkbox"
                 type="checkbox"
                 checked={favorites}
                 onChange={(e) => {
@@ -1610,6 +1623,7 @@ export default function LibraryPage() {
               Favorites only
             </label>
             <select
+              data-testid="library-filter-min-rating-select"
               className="rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-2 text-ui-xs outline-none focus:border-accent-cyan"
               value={minRating}
               onChange={(e) => {
@@ -1638,6 +1652,7 @@ export default function LibraryPage() {
                 <button
                   key={c}
                   type="button"
+                  data-testid={`library-filter-safety-${c}`}
                   aria-pressed={on}
                   onClick={() => {
                     const next = on ? safety.filter((x) => x !== c) : [...safety, c];
@@ -1664,6 +1679,7 @@ export default function LibraryPage() {
 
           {/* Advanced filters */}
           <button
+            data-testid="library-advanced-filters-toggle"
             className="flex items-center gap-1.5 self-start text-ui-xs font-medium text-ui-ink-muted transition hover:text-ui-ink"
             onClick={() => setShowAdvanced((v) => !v)}
           >
@@ -1692,6 +1708,7 @@ export default function LibraryPage() {
               <label className={`${cls.label} col-span-full`}>
                 Path contains
                 <input
+                  data-testid="library-filter-path-input"
                   className={cls.input}
                   placeholder="folder or filename fragment — e.g. 2024/portraits or _upscaled"
                   value={pathFilter}
@@ -1717,6 +1734,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 Model family
                 <input
+                  data-testid="library-filter-model-family-input"
                   className={cls.input}
                   placeholder="sdxl, pony, flux…"
                   value={modelFamily}
@@ -1727,6 +1745,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 Checkpoint
                 <input
+                  data-testid="library-filter-checkpoint-input"
                   className={cls.input}
                   placeholder="checkpoint name…"
                   value={checkpoint}
@@ -1736,6 +1755,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 LoRAs
                 <input
+                  data-testid="library-filter-loras-input"
                   className={cls.input}
                   placeholder="comma-separated"
                   value={loras}
@@ -1745,6 +1765,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 Source tool
                 <input
+                  data-testid="library-filter-source-tool-input"
                   className={cls.input}
                   placeholder="comfyui, a1111…"
                   value={sourceTool}
@@ -1754,6 +1775,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 Results: {limit}
                 <input
+                  data-testid="library-filter-limit-range"
                   type="range"
                   min={10}
                   max={200}
@@ -1766,6 +1788,7 @@ export default function LibraryPage() {
               <label className={cls.label}>
                 Min similarity: {minScore.toFixed(2)}
                 <input
+                  data-testid="library-filter-min-score-range"
                   type="range"
                   min={0}
                   max={1}
@@ -1788,6 +1811,7 @@ export default function LibraryPage() {
       {/* Freshness banner — newer images landed while browsing; reload from top. */}
       {hasNew && (
         <button
+          data-testid="library-freshness-refresh"
           onClick={() => doFetch(false)}
           className="sticky top-2 z-20 mx-auto flex items-center gap-2 rounded-full border border-accent-cyan/50 bg-accent-cyan/15 px-4 py-1.5 text-ui-xs font-medium text-accent-cyan shadow-sm backdrop-blur-sm transition hover:bg-accent-cyan/25"
         >
@@ -1844,6 +1868,7 @@ export default function LibraryPage() {
               return (
                 <section key={g.key || "__none"} className="flex min-w-0 flex-col gap-2">
                   <button
+                    data-testid={`library-group-toggle-${g.key}`}
                     onClick={() => toggleDir(g.key)}
                     aria-expanded={!collapsed}
                     className="flex w-full min-w-0 items-center gap-2 rounded-lg border border-ui-border/50 bg-ui-bg-soft/40 px-3 py-2 text-left transition hover:border-accent-cyan/60"
@@ -1889,6 +1914,7 @@ export default function LibraryPage() {
       {/* Ingest panel */}
       <section className={cls.card}>
         <button
+          data-testid="library-ingest-toggle"
           className="flex w-full items-center justify-between text-ui-sm font-medium text-ui-ink"
           onClick={() => setShowIngest(!showIngest)}
         >
@@ -1920,7 +1946,7 @@ export default function LibraryPage() {
                 placeholder="D:/images/generated"
                 pickerTitle="Choose a folder to ingest"
               />
-              <button className={cls.btn} onClick={startIngest}>
+              <button data-testid="library-ingest-start" className={cls.btn} onClick={startIngest}>
                 Start ingestion
               </button>
             </div>
@@ -2063,13 +2089,14 @@ function ImageDropzone({
         </p>
         {note && <p className="mt-1 text-ui-2xs text-ui-ink-muted/80">{note}</p>}
         <div className="mt-2 flex gap-2">
-          <button className={cls.btn} onClick={() => inputRef.current?.click()}>Choose file</button>
-          {preview && <button className={cls.btn} onClick={onClear}>Clear</button>}
+          <button data-testid="library-image-dropzone-choose-file" className={cls.btn} onClick={() => inputRef.current?.click()}>Choose file</button>
+          {preview && <button data-testid="library-image-dropzone-clear" className={cls.btn} onClick={onClear}>Clear</button>}
         </div>
       </div>
 
       <input
         ref={inputRef}
+        data-testid="library-image-dropzone-file-input"
         type="file"
         accept="image/*"
         className="hidden"

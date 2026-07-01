@@ -36,6 +36,7 @@ export type PromptBlockProps = Omit<HTMLAttributes<HTMLElement>, "children"> & {
   copied?: boolean;
   /** Called when the copy button is clicked. */
   onCopy?: () => void;
+  testId?: string;
 };
 
 /**
@@ -48,12 +49,18 @@ export type PromptBlockProps = Omit<HTMLAttributes<HTMLElement>, "children"> & {
  * ```
  */
 const PromptBlock = forwardRef<HTMLElement, PromptBlockProps>(
-  function PromptBlock({ label, children, tone = "neutral", copied, onCopy, className, ...props }, ref) {
+  function PromptBlock({ label, children, tone = "neutral", copied, onCopy, className, testId, ...props }, ref) {
     return (
-      <section ref={ref} className={className} {...props}>
+      <section ref={ref} data-testid={testId} className={className} {...props}>
         <div className="flex items-center justify-between gap-3">
           <SectionLabel>{label}</SectionLabel>
-          {onCopy && <CopyButton copied={copied} onClick={onCopy} />}
+          {onCopy && (
+            <CopyButton
+              copied={copied}
+              onClick={onCopy}
+              data-testid={testId ? `${testId}-copy` : undefined}
+            />
+          )}
         </div>
         <pre className={promptBlockTextVariants({ tone })}>
           {children}

@@ -434,7 +434,12 @@ export default function DbPage() {
                     >
                       {bulkBusy ? "Excluding…" : "Confirm exclude"}
                     </button>
-                    <button className={cls.btn} onClick={() => setConfirmingBulk(false)} disabled={bulkBusy}>
+                    <button
+                      className={cls.btn}
+                      onClick={() => setConfirmingBulk(false)}
+                      disabled={bulkBusy}
+                      data-testid="db-bulk-cancel"
+                    >
                       Cancel
                     </button>
                   </>
@@ -591,6 +596,7 @@ export default function DbPage() {
                   className={`${cls.input} mt-1 h-16`}
                   value={edit.negative}
                   onChange={(e) => setEdit({ ...edit, negative: e.target.value })}
+                  data-testid="db-edit-negative"
                 />
               </label>
               <label className="text-ui-xs text-ui-ink-muted">
@@ -627,6 +633,7 @@ export default function DbPage() {
                     className={`${cls.input} mt-1 w-20`}
                     value={edit.rating}
                     onChange={(e) => setEdit({ ...edit, rating: e.target.value })}
+                    data-testid="db-edit-rating"
                   />
                 </label>
                 <label className="mt-4 flex items-center gap-1.5 text-ui-xs text-ui-ink">
@@ -634,6 +641,7 @@ export default function DbPage() {
                     type="checkbox"
                     checked={edit.favorite}
                     onChange={(e) => setEdit({ ...edit, favorite: e.target.checked })}
+                    data-testid="db-edit-favorite"
                   />
                   favorite
                 </label>

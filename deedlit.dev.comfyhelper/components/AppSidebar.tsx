@@ -18,6 +18,7 @@ type ExternalItem = {
   href: string;
   label: string;
   icon: ReactNode;
+  testId: string;
 };
 
 // ── Icon set ──────────────────────────────────────────────────────────
@@ -140,11 +141,11 @@ const NAV_ITEMS: NavItem[] = [
 ];
 
 const EXTERNAL_ITEMS: ExternalItem[] = [
-  { href: "http://localhost:8000", label: "deedlit.vision — CLIP embedding API", icon: icon.vision },
-  { href: "http://localhost:8188", label: "ComfyUI", icon: icon.comfy },
-  { href: "http://localhost:7474", label: "Neo4j Browser", icon: icon.neo4j },
-  { href: "http://localhost:6333/dashboard", label: "Qdrant Dashboard", icon: icon.qdrant },
-  { href: "http://localhost:9001", label: "RustFS Console", icon: icon.rustfs },
+  { href: "http://localhost:8000", label: "deedlit.vision — CLIP embedding API", icon: icon.vision, testId: "vision" },
+  { href: "http://localhost:8188", label: "ComfyUI", icon: icon.comfy, testId: "comfyui" },
+  { href: "http://localhost:7474", label: "Neo4j Browser", icon: icon.neo4j, testId: "neo4j" },
+  { href: "http://localhost:6333/dashboard", label: "Qdrant Dashboard", icon: icon.qdrant, testId: "qdrant" },
+  { href: "http://localhost:9001", label: "RustFS Console", icon: icon.rustfs, testId: "rustfs" },
 ];
 
 function navItemClass(isActive: boolean): string {
@@ -184,6 +185,7 @@ function RailExternalLink({ item }: { item: ExternalItem }) {
       rel="noopener noreferrer"
       aria-label={item.label}
       title={item.label}
+      data-testid={`nav-external-link-${item.testId}`}
       className="app-sidebar-nav-item group relative grid h-11 w-11 place-items-center rounded-xl border transition hover:border-accent-cyan/60 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
     >
       {item.icon}
@@ -202,6 +204,7 @@ function SheetRow({
   isActive,
   external,
   onNavigate,
+  testId,
 }: {
   href: string;
   label: string;
@@ -209,6 +212,7 @@ function SheetRow({
   isActive?: boolean;
   external?: boolean;
   onNavigate: () => void;
+  testId?: string;
 }) {
   const className = `app-sidebar-nav-item flex items-center gap-3 rounded-xl border px-3 py-2.5 text-ui-sm font-medium transition ${
     isActive ? "app-sidebar-nav-item-active" : ""
@@ -229,13 +233,13 @@ function SheetRow({
 
   if (external) {
     return (
-      <a href={href} target="_blank" rel="noopener noreferrer" aria-label={label} className={className} onClick={onNavigate}>
+      <a href={href} target="_blank" rel="noopener noreferrer" aria-label={label} data-testid={testId} className={className} onClick={onNavigate}>
         {inner}
       </a>
     );
   }
   return (
-    <Link href={href} prefetch={false} aria-label={label} aria-current={isActive ? "page" : undefined} className={className} onClick={onNavigate}>
+    <Link href={href} prefetch={false} aria-label={label} aria-current={isActive ? "page" : undefined} data-testid={testId} className={className} onClick={onNavigate}>
       {inner}
     </Link>
   );
@@ -291,6 +295,7 @@ export function AppSidebar() {
           aria-label={menuOpen ? "Close navigation" : "Open navigation"}
           aria-expanded={menuOpen}
           aria-controls="mobile-nav-sheet"
+          data-testid="app-sidebar-mobile-menu-toggle"
           className="grid h-11 w-11 shrink-0 place-items-center rounded-xl border text-ui-ink-muted transition hover:bg-ui-bg-soft hover:text-ui-ink-title md:hidden"
         >
           <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -343,6 +348,7 @@ export function AppSidebar() {
                   iconNode={it.icon}
                   isActive={it.match(pathname)}
                   onNavigate={() => setMenuOpen(false)}
+                  testId={`sheet-nav-link-${it.testId}`}
                 />
               ))}
             </div>
@@ -358,6 +364,7 @@ export function AppSidebar() {
                   iconNode={it.icon}
                   external
                   onNavigate={() => setMenuOpen(false)}
+                  testId={`sheet-nav-link-${it.testId}`}
                 />
               ))}
             </div>

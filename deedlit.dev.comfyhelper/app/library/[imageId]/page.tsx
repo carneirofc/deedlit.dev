@@ -388,6 +388,7 @@ export default function ImageDetailPage() {
             onClick={() => setKey("viewerFullResolution", !settings.viewerFullResolution)}
             aria-pressed={settings.viewerFullResolution}
             title="Toggle full-resolution original"
+            data-testid="image-detail-quality-toggle"
             className={`absolute left-2 top-2 z-10 rounded-md border px-2 py-1 text-ui-2xs font-semibold backdrop-blur transition ${
               settings.viewerFullResolution
                 ? "border-accent-cyan bg-ui-bg/80 text-accent-cyan"
@@ -407,7 +408,7 @@ export default function ImageDetailPage() {
           <div className={panel}>
             <div className="flex items-center justify-between">
               <h1 className="truncate text-ui-lg font-semibold text-ui-ink-title">{detail.filename}</h1>
-              <button onClick={toggleFavorite} className="text-ui-xl" aria-label="favorite">
+              <button onClick={toggleFavorite} className="text-ui-xl" aria-label="favorite" data-testid="image-detail-favorite-toggle">
                 {detail.favorite ? "★" : "☆"}
               </button>
             </div>
@@ -427,6 +428,7 @@ export default function ImageDetailPage() {
                   }`}
                   title={`${n}★${detail.rating === n ? " — click to clear" : ""}`}
                   aria-label={`Rate ${n} star${n === 1 ? "" : "s"}`}
+                  data-testid={`image-detail-rate-star-${n}`}
                 >
                   ★
                 </button>
@@ -437,7 +439,9 @@ export default function ImageDetailPage() {
                   onClick={() => rateImage(null)}
                   disabled={ratingBusy}
                   className="ml-1 text-ui-2xs text-ui-ink-muted/60 transition hover:text-rose-400 disabled:opacity-50"
+                  aria-label="Clear rating"
                   title="Clear rating"
+                  data-testid="image-detail-clear-rating"
                 >
                   ✕
                 </button>
@@ -464,6 +468,7 @@ export default function ImageDetailPage() {
                     copied={pathCopied}
                     onClick={copyPath}
                     aria-label="Copy source file path"
+                    data-testid="image-detail-copy-path"
                   />
                 </div>
                 <p className="break-all font-mono text-ui-2xs text-ui-ink" title={detail.filePath}>
@@ -477,6 +482,7 @@ export default function ImageDetailPage() {
                 <button
                   onClick={() => setConfirmingDelete(true)}
                   className="text-ui-xs text-rose-400 transition hover:text-rose-300"
+                  data-testid="image-detail-remove-start"
                 >
                   Remove from library
                 </button>
@@ -491,6 +497,7 @@ export default function ImageDetailPage() {
                       onClick={removeFromLibrary}
                       disabled={deleting}
                       className="rounded-lg bg-rose-500/90 px-2.5 py-1 text-ui-xs font-medium text-white transition hover:bg-rose-500 disabled:opacity-60"
+                      data-testid="image-detail-remove-confirm"
                     >
                       {deleting ? "Removing…" : "Remove"}
                     </button>
@@ -498,6 +505,7 @@ export default function ImageDetailPage() {
                       onClick={() => setConfirmingDelete(false)}
                       disabled={deleting}
                       className="rounded-lg border border-ui-border/70 px-2.5 py-1 text-ui-xs transition hover:bg-ui-bg-soft disabled:opacity-60"
+                      data-testid="image-detail-remove-cancel"
                     >
                       Cancel
                     </button>
@@ -552,6 +560,7 @@ export default function ImageDetailPage() {
                     href={`/library?tags=${encodeURIComponent(t.normalizedName || t.name)}`}
                     prefetch={false}
                     className={`${chip} transition hover:text-accent-cyan`}
+                    data-testid={`image-detail-tag-link-${t.normalizedName}-${t.source}`}
                   >
                     {t.name}
                   </Link>
@@ -571,6 +580,7 @@ export default function ImageDetailPage() {
                     prefetch={false}
                     className="flex items-center gap-1 rounded-full bg-ui-bg px-2 py-0.5 text-ui-2xs text-ui-ink-muted transition hover:text-accent-cyan"
                     title={`${t.coOccurrence} images also tagged ${t.name}`}
+                    data-testid={`image-detail-related-tag-link-${t.name}`}
                   >
                     {t.name}
                     <span className="text-ui-ink-muted/60">{t.coOccurrence}</span>
@@ -618,6 +628,7 @@ export default function ImageDetailPage() {
               <button
                 onClick={loadDebug}
                 className="rounded-lg border border-ui-border/60 px-2 py-1 text-ui-xs text-ui-ink-muted hover:border-accent-cyan hover:text-accent-cyan"
+                data-testid="image-detail-vector-debug-toggle"
               >
                 {debugOpen ? "Hide" : "Show"} vector debug
               </button>
@@ -627,6 +638,7 @@ export default function ImageDetailPage() {
             <button
               onClick={() => setSuggestRequested(true)}
               className="rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-2 text-ui-sm font-medium transition hover:bg-accent-cyan/10"
+              data-testid="image-detail-load-similar"
             >
               Load similar images
             </button>
@@ -638,6 +650,7 @@ export default function ImageDetailPage() {
                   href={`/library/${s.imageId}`}
                   prefetch={false}
                   className="group relative overflow-hidden rounded-lg border border-ui-border/60 hover:border-accent-cyan"
+                  data-testid={`image-detail-similar-link-${s.imageId}`}
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img src={s.thumbnailUrl} alt={s.summary} loading="lazy" className="aspect-square w-full object-cover" />
@@ -686,11 +699,13 @@ export default function ImageDetailPage() {
             onChange={(e) => setNoteDraft(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") addNote(); }}
             disabled={noteSaving}
+            data-testid="image-detail-note-input"
           />
           <button
             className="rounded-lg border border-ui-border/70 bg-ui-bg-soft px-3 py-2 text-ui-xs font-medium transition hover:bg-accent-cyan/10 disabled:opacity-50"
             onClick={addNote}
             disabled={!noteDraft.trim() || noteSaving}
+            data-testid="image-detail-note-add"
           >
             {noteSaving ? "…" : "Add"}
           </button>

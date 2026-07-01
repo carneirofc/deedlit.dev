@@ -97,10 +97,10 @@ export function BulkActionBar(props: BulkActionBarProps) {
       className="sticky top-2 z-20 flex flex-wrap items-center gap-2 rounded-xl border border-accent-cyan/40 bg-ui-bg-soft/90 px-3 py-2 backdrop-blur-sm"
     >
       <span className="text-ui-sm font-medium text-ui-ink">{selectedCount} selected</span>
-      <button className={btn} onClick={onSelectAll} disabled={selectedCount === totalCount}>
+      <button className={btn} onClick={onSelectAll} disabled={selectedCount === totalCount} data-testid="bulk-action-select-all">
         Select all
       </button>
-      <button className={btn} onClick={onClear} disabled={none}>
+      <button className={btn} onClick={onClear} disabled={none} data-testid="bulk-action-clear-selection">
         Clear
       </button>
 
@@ -112,6 +112,7 @@ export function BulkActionBar(props: BulkActionBarProps) {
         onClick={() => onFavorite(true)}
         disabled={none || anyBusy}
         title="Mark selected as favorite"
+        data-testid="bulk-action-favorite"
       >
         <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="currentColor" aria-hidden="true">
           <path d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z" />
@@ -123,32 +124,33 @@ export function BulkActionBar(props: BulkActionBarProps) {
         onClick={() => onFavorite(false)}
         disabled={none || anyBusy}
         title="Remove favorite from selected"
+        data-testid="bulk-action-unfavorite"
       >
         Unfavorite
       </button>
 
       {/* Rating */}
-      <Menu label="Rating" open={menu === "rating"} onToggle={() => toggle("rating")} disabled={none || anyBusy} busy={busy === "rating"}>
+      <Menu label="Rating" open={menu === "rating"} onToggle={() => toggle("rating")} disabled={none || anyBusy} busy={busy === "rating"} testId="bulk-action-rating-toggle">
         {[5, 4, 3, 2, 1].map((n) => (
-          <MenuItem key={n} onClick={() => { onRating(n); setMenu(null); }}>
+          <MenuItem key={n} onClick={() => { onRating(n); setMenu(null); }} testId={`bulk-action-rating-set-${n}`}>
             {"★".repeat(n)}
             <span className="text-ui-ink-muted">{"☆".repeat(5 - n)}</span>
           </MenuItem>
         ))}
-        <MenuItem onClick={() => { onRating(0); setMenu(null); }}>Clear rating</MenuItem>
+        <MenuItem onClick={() => { onRating(0); setMenu(null); }} testId="bulk-action-rating-clear">Clear rating</MenuItem>
       </Menu>
 
       {/* Safety class */}
-      <Menu label="Safety" open={menu === "safety"} onToggle={() => toggle("safety")} disabled={none || anyBusy} busy={busy === "safety"}>
+      <Menu label="Safety" open={menu === "safety"} onToggle={() => toggle("safety")} disabled={none || anyBusy} busy={busy === "safety"} testId="bulk-action-safety-toggle">
         {SAFETY_CLASSES.map((c) => (
-          <MenuItem key={c} onClick={() => { onSafety(c); setMenu(null); }}>
+          <MenuItem key={c} onClick={() => { onSafety(c); setMenu(null); }} testId={`bulk-action-safety-set-${c}`}>
             {SAFETY_LABEL[c]}
           </MenuItem>
         ))}
       </Menu>
 
       {/* Tags add / remove */}
-      <Menu label="Tags" open={menu === "tags"} onToggle={() => toggle("tags")} disabled={none || anyBusy} busy={busy === "tags"} width="w-72">
+      <Menu label="Tags" open={menu === "tags"} onToggle={() => toggle("tags")} disabled={none || anyBusy} busy={busy === "tags"} width="w-72" testId="bulk-action-tags-toggle">
         <div className="flex flex-col gap-2 p-2">
           <TagSelect
             value={tagDraft}
@@ -156,12 +158,14 @@ export function BulkActionBar(props: BulkActionBarProps) {
             fetchSuggestions={fetchTagSuggestions}
             placeholder="type tags to add or remove…"
             variant="include"
+            testId="bulk-action-tags-select"
           />
           <div className="flex gap-2">
             <button
               className={`${btn} flex-1`}
               disabled={tagDraft.length === 0}
               onClick={() => { onAddTags(tagDraft); setTagDraft([]); setMenu(null); }}
+              data-testid="bulk-action-tags-add"
             >
               Add to selected
             </button>
@@ -169,6 +173,7 @@ export function BulkActionBar(props: BulkActionBarProps) {
               className={`${btn} flex-1`}
               disabled={tagDraft.length === 0}
               onClick={() => { onRemoveTags(tagDraft); setTagDraft([]); setMenu(null); }}
+              data-testid="bulk-action-tags-remove"
             >
               Remove
             </button>
@@ -177,18 +182,18 @@ export function BulkActionBar(props: BulkActionBarProps) {
       </Menu>
 
       {/* Export — complete canonical record vs. a simple basics-only subset. */}
-      <Menu label={busy === "export" ? "Exporting…" : "Export"} open={menu === "export"} onToggle={() => toggle("export")} disabled={none || anyBusy} busy={busy === "export"} width="w-60">
+      <Menu label={busy === "export" ? "Exporting…" : "Export"} open={menu === "export"} onToggle={() => toggle("export")} disabled={none || anyBusy} busy={busy === "export"} width="w-60" testId="bulk-action-export-toggle">
         <MenuLabel>Complete record</MenuLabel>
-        <MenuItem onClick={() => { onExport("complete-json"); setMenu(null); }}>JSON (.json)</MenuItem>
-        <MenuItem onClick={() => { onExport("complete-jsonl"); setMenu(null); }}>JSON Lines (.jsonl)</MenuItem>
+        <MenuItem onClick={() => { onExport("complete-json"); setMenu(null); }} testId="bulk-action-export-complete-json">JSON (.json)</MenuItem>
+        <MenuItem onClick={() => { onExport("complete-jsonl"); setMenu(null); }} testId="bulk-action-export-complete-jsonl">JSON Lines (.jsonl)</MenuItem>
         <MenuLabel>Simple · id · sha · path · basics</MenuLabel>
-        <MenuItem onClick={() => { onExport("simple-csv"); setMenu(null); }}>CSV (.csv)</MenuItem>
-        <MenuItem onClick={() => { onExport("simple-json"); setMenu(null); }}>JSON (.json)</MenuItem>
-        <MenuItem onClick={() => { onExport("simple-jsonl"); setMenu(null); }}>JSON Lines (.jsonl)</MenuItem>
+        <MenuItem onClick={() => { onExport("simple-csv"); setMenu(null); }} testId="bulk-action-export-simple-csv">CSV (.csv)</MenuItem>
+        <MenuItem onClick={() => { onExport("simple-json"); setMenu(null); }} testId="bulk-action-export-simple-json">JSON (.json)</MenuItem>
+        <MenuItem onClick={() => { onExport("simple-jsonl"); setMenu(null); }} testId="bulk-action-export-simple-jsonl">JSON Lines (.jsonl)</MenuItem>
       </Menu>
 
       {/* Filesystem move */}
-      <Menu label={busy === "move" ? "Moving…" : "Move"} open={menu === "move"} onToggle={() => toggle("move")} disabled={none || anyBusy} busy={busy === "move"} width="w-72">
+      <Menu label={busy === "move" ? "Moving…" : "Move"} open={menu === "move"} onToggle={() => toggle("move")} disabled={none || anyBusy} busy={busy === "move"} width="w-72" testId="bulk-action-move-toggle">
         <div className="flex flex-col gap-2 p-2">
           <p className="text-ui-2xs text-ui-ink-muted">Target folder (absolute path). Files are moved on disk; re-ingest the folder to update catalog paths.</p>
           <input
@@ -203,6 +208,7 @@ export function BulkActionBar(props: BulkActionBarProps) {
                 setMenu(null);
               }
             }}
+            data-testid="bulk-action-move-input"
           />
           <button
             className={btn}
@@ -213,6 +219,7 @@ export function BulkActionBar(props: BulkActionBarProps) {
               setMoveDraft("");
               setMenu(null);
             }}
+            data-testid="bulk-action-move-submit"
           >
             Move selected
           </button>
@@ -225,6 +232,7 @@ export function BulkActionBar(props: BulkActionBarProps) {
           onClick={onRequestDelete}
           disabled={none || anyBusy}
           className="rounded-lg border border-rose-500/60 px-3 py-2 text-ui-sm font-medium text-rose-400 transition hover:bg-rose-500/10 disabled:opacity-50"
+          data-testid="bulk-action-delete-request"
         >
           Delete
         </button>
@@ -237,10 +245,11 @@ export function BulkActionBar(props: BulkActionBarProps) {
             onClick={onConfirmDelete}
             disabled={busy === "delete"}
             className="rounded-lg bg-rose-500/90 px-3 py-2 text-ui-sm font-medium text-white transition hover:bg-rose-500 disabled:opacity-60"
+            data-testid="bulk-action-delete-confirm"
           >
             {busy === "delete" ? "Removing…" : "Remove"}
           </button>
-          <button onClick={onCancelDelete} disabled={busy === "delete"} className={btn}>
+          <button onClick={onCancelDelete} disabled={busy === "delete"} className={btn} data-testid="bulk-action-delete-cancel">
             Cancel
           </button>
         </div>
@@ -258,6 +267,7 @@ function Menu({
   busy,
   width = "w-44",
   children,
+  testId,
 }: {
   label: string;
   open: boolean;
@@ -266,6 +276,7 @@ function Menu({
   busy?: boolean;
   width?: string;
   children: React.ReactNode;
+  testId?: string;
 }) {
   return (
     <div className="relative">
@@ -275,6 +286,7 @@ function Menu({
         disabled={disabled}
         aria-expanded={open}
         aria-haspopup="menu"
+        data-testid={testId}
       >
         {label}
         <svg viewBox="0 0 24 24" className={`h-3 w-3 transition-transform ${open ? "rotate-180" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -299,12 +311,13 @@ function MenuLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function MenuItem({ onClick, children }: { onClick: () => void; children: React.ReactNode }) {
+function MenuItem({ onClick, children, testId }: { onClick: () => void; children: React.ReactNode; testId?: string }) {
   return (
     <button
       role="menuitem"
       onClick={onClick}
       className="flex w-full items-center gap-1 px-3 py-2 text-left text-ui-sm text-ui-ink transition hover:bg-accent-cyan/10"
+      data-testid={testId}
     >
       {children}
     </button>

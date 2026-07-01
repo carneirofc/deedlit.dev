@@ -22,6 +22,7 @@ function Slider({
   max,
   step,
   onChange,
+  testId,
 }: {
   label: string;
   value: number;
@@ -29,6 +30,7 @@ function Slider({
   max: number;
   step: number;
   onChange: (v: number) => void;
+  testId?: string;
 }) {
   return (
     <label className="flex flex-col gap-1 text-ui-xs text-ui-ink-muted">
@@ -43,6 +45,8 @@ function Slider({
         step={step}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
+        data-testid={testId}
+        aria-label={label}
         className="accent-accent-cyan"
       />
     </label>
@@ -123,24 +127,76 @@ export default function ClustersPage() {
       <section className={panel}>
         <div className="grid gap-4 lg:grid-cols-[1fr_1fr_1.2fr]">
           <div className="flex flex-col gap-3">
-            <Slider label="Sample size" value={sample} min={50} max={2000} step={50} onChange={setSample} />
-            <Slider label="Neighbours (k)" value={neighbors} min={2} max={20} step={1} onChange={setNeighbors} />
-            <Slider label="Similarity threshold" value={threshold} min={0} max={1} step={0.02} onChange={setThreshold} />
-            <Slider label="Resolution" value={resolution} min={0.2} max={3} step={0.1} onChange={setResolution} />
+            <Slider
+              label="Sample size"
+              value={sample}
+              min={50}
+              max={2000}
+              step={50}
+              onChange={setSample}
+              testId="clusters-slider-sample-size"
+            />
+            <Slider
+              label="Neighbours (k)"
+              value={neighbors}
+              min={2}
+              max={20}
+              step={1}
+              onChange={setNeighbors}
+              testId="clusters-slider-neighbors"
+            />
+            <Slider
+              label="Similarity threshold"
+              value={threshold}
+              min={0}
+              max={1}
+              step={0.02}
+              onChange={setThreshold}
+              testId="clusters-slider-threshold"
+            />
+            <Slider
+              label="Resolution"
+              value={resolution}
+              min={0.2}
+              max={3}
+              step={0.1}
+              onChange={setResolution}
+              testId="clusters-slider-resolution"
+            />
           </div>
 
           <div className="flex flex-col gap-2">
-            <input className={input} placeholder="tags, comma-separated" value={tags} onChange={(e) => setTags(e.target.value)} />
-            <input className={input} placeholder="model family (sdxl…)" value={modelFamily} onChange={(e) => setModelFamily(e.target.value)} />
+            <input
+              className={input}
+              placeholder="tags, comma-separated"
+              value={tags}
+              onChange={(e) => setTags(e.target.value)}
+              data-testid="clusters-filter-tags-input"
+            />
+            <input
+              className={input}
+              placeholder="model family (sdxl…)"
+              value={modelFamily}
+              onChange={(e) => setModelFamily(e.target.value)}
+              data-testid="clusters-filter-model-family-input"
+            />
             <div className="flex items-center gap-3">
               <label className="flex cursor-pointer items-center gap-1.5 text-ui-xs text-ui-ink">
-                <input type="checkbox" checked={favorites} onChange={(e) => setFavorites(e.target.checked)} className="rounded" />
+                <input
+                  type="checkbox"
+                  checked={favorites}
+                  onChange={(e) => setFavorites(e.target.checked)}
+                  className="rounded"
+                  data-testid="clusters-filter-favorites-checkbox"
+                />
                 Favorites
               </label>
               <select
                 className="rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-2 text-ui-xs outline-none"
                 value={minRating}
                 onChange={(e) => setMinRating(Number(e.target.value))}
+                data-testid="clusters-filter-min-rating-select"
+                aria-label="Minimum rating"
               >
                 <option value={0}>Any rating</option>
                 <option value={1}>★+</option>
@@ -150,7 +206,12 @@ export default function ClustersPage() {
                 <option value={5}>★★★★★</option>
               </select>
             </div>
-            <button className={btn} onClick={build} disabled={loading}>
+            <button
+              className={btn}
+              onClick={build}
+              disabled={loading}
+              data-testid="clusters-build-button"
+            >
               {loading ? "Clustering…" : "Build clusters"}
             </button>
           </div>
@@ -187,6 +248,7 @@ export default function ClustersPage() {
                 <button
                   key={c.id}
                   onClick={() => setSelected(selected === c.id ? null : c.id)}
+                  data-testid={`clusters-cluster-card-${c.id}`}
                   className={`flex flex-col gap-2 rounded-xl border bg-ui-bg-soft/40 p-2 text-left transition ${
                     selected === c.id ? "border-accent-cyan" : "border-ui-border/60 hover:border-accent-cyan/60"
                   }`}
@@ -228,14 +290,18 @@ export default function ClustersPage() {
                 <h2 className="text-ui-sm font-semibold text-ui-ink-title">
                   {selectedCluster.label} · {selectedCluster.size} images
                 </h2>
-                <button className="text-ui-xs text-ui-ink-muted hover:text-ui-ink" onClick={() => setSelected(null)}>
+                <button
+                  className="text-ui-xs text-ui-ink-muted hover:text-ui-ink"
+                  onClick={() => setSelected(null)}
+                  data-testid="clusters-selected-close"
+                >
                   close
                 </button>
               </div>
               <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8">
                 {selectedCluster.imageIds.map((id) => (
                   <div key={id} className="group relative overflow-hidden rounded-lg border border-ui-border/60">
-                    <Link href={`/library/${id}`} prefetch={false}>
+                    <Link href={`/library/${id}`} prefetch={false} data-testid={`clusters-image-link-${id}`}>
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
                         src={`/api/library/images/${id}/thumbnail`}
@@ -252,6 +318,8 @@ export default function ClustersPage() {
                           : "border-ui-border/50 bg-ui-bg/80 text-ui-ink opacity-0 group-hover:opacity-100"
                       }`}
                       title="Add to comparison"
+                      data-testid={`clusters-compare-toggle-${id}`}
+                      aria-label={tray.has(id) ? "Remove from comparison" : "Add to comparison"}
                     >
                       {tray.has(id) ? "✓" : "+"}
                     </button>

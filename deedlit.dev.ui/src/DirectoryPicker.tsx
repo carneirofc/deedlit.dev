@@ -132,6 +132,7 @@ export function DirectoryPicker({
           onClick={() => browse(data?.parent ?? null)}
           disabled={loading || !data?.path}
           tooltip="Up one level"
+          data-testid="directory-picker-up"
         >
           <svg
             aria-hidden="true"
@@ -159,7 +160,12 @@ export function DirectoryPicker({
           spellCheck={false}
           data-testid="directory-picker-path"
         />
-        <OutlineButton controlSize="sm" onClick={() => browse(manual.trim() || null)} disabled={loading}>
+        <OutlineButton
+          controlSize="sm"
+          onClick={() => browse(manual.trim() || null)}
+          disabled={loading}
+          data-testid="directory-picker-go"
+        >
           Go
         </OutlineButton>
       </div>
@@ -172,6 +178,7 @@ export function DirectoryPicker({
               key={root.path}
               type="button"
               onClick={() => browse(root.path)}
+              data-testid={`directory-picker-root-${root.path}`}
               className="rounded-full border border-ui-border bg-ui-bg-soft px-2.5 py-1 font-mono text-ui-2xs text-ui-ink-muted transition hover:border-accent-cyan hover:text-accent-cyan"
             >
               {root.label}
@@ -196,6 +203,7 @@ export function DirectoryPicker({
                   <button
                     type="button"
                     onClick={() => browse(entry.path)}
+                    data-testid={`directory-picker-entry-${entry.path}`}
                     className="flex w-full items-center gap-2 px-3 py-2 text-left text-ui-sm text-ui-ink transition hover:bg-accent-cyan/10"
                   >
                     <FolderIcon className="h-4 w-4 text-accent-cyan" />
@@ -226,13 +234,14 @@ export function DirectoryPicker({
             {current ?? "No folder selected"}
           </span>
           <div className="flex shrink-0 gap-2">
-            <OutlineButton variant="ghost" onClick={onClose}>
+            <OutlineButton variant="ghost" onClick={onClose} data-testid="directory-picker-cancel">
               Cancel
             </OutlineButton>
             <OutlineButton
               variant="accent"
               disabled={!current}
               onClick={() => current && onSelect(current)}
+              data-testid="directory-picker-select"
             >
               Select this folder
             </OutlineButton>

@@ -14,6 +14,7 @@ export type ScanProgressProps = {
   statusLabel?: string;
   /** Custom stage labels shown during indeterminate progress based on elapsed time. */
   stageLabels?: readonly string[];
+  testId?: string;
 };
 
 const DEFAULT_SCAN_STAGE_LABELS = [
@@ -55,6 +56,7 @@ const ScanProgress = forwardRef<HTMLDivElement, ScanProgressProps>(function Scan
   totalCount,
   statusLabel,
   stageLabels,
+  testId,
 }, ref) {
   const [progress, setProgress] = useState(8);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -100,6 +102,7 @@ const ScanProgress = forwardRef<HTMLDivElement, ScanProgressProps>(function Scan
   return (
     <div
       ref={ref}
+      data-testid={testId}
       className={cn("cyber-subpanel rounded-2xl px-3 py-3", className)}
       role="status"
       aria-live="polite"

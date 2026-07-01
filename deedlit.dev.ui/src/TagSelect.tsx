@@ -31,6 +31,8 @@ export interface TagSelectProps {
   maxSuggestions?: number;
   /** Override the wrapper class. */
   className?: string;
+  /** Prefix for data-testid attributes on the input, chips, and suggestions. */
+  testId?: string;
 }
 
 const VARIANT = {
@@ -62,6 +64,7 @@ function TagSelect({
   onCommit,
   maxSuggestions = 8,
   className,
+  testId,
 }: TagSelectProps) {
   const [draft, setDraft] = useState("");
   const [open, setOpen] = useState(false);
@@ -144,7 +147,7 @@ function TagSelect({
   };
 
   return (
-    <div className={cn("relative", className)}>
+    <div className={cn("relative", className)} data-testid={testId}>
       <div
         className={cn(
           "flex min-h-[2.5rem] flex-wrap items-center gap-1.5 rounded-lg border border-ui-border/70 bg-ui-bg px-2 py-1.5 text-ui-sm outline-none transition",
@@ -168,6 +171,7 @@ function TagSelect({
                 remove(tag);
               }}
               aria-label={`Remove ${tag}`}
+              data-testid={testId ? `${testId}-remove-${tag}` : undefined}
               className="opacity-70 transition hover:opacity-100"
             >
               ×
@@ -186,6 +190,7 @@ function TagSelect({
           onBlur={() => setTimeout(() => setOpen(false), 120)}
           onKeyDown={onKeyDown}
           placeholder={value.length === 0 ? placeholder : ""}
+          data-testid={testId ? `${testId}-input` : undefined}
           className="min-w-[6rem] flex-1 bg-transparent text-ui-sm outline-none placeholder:text-ui-ink-muted"
           role="combobox"
           aria-expanded={open}
@@ -209,6 +214,7 @@ function TagSelect({
                   add(s);
                 }}
                 onMouseEnter={() => setActive(i)}
+                data-testid={testId ? `${testId}-suggestion-${s}` : undefined}
                 className={cn(
                   "w-full truncate rounded-md px-2 py-1 text-left text-ui-xs transition",
                   i === active ? "bg-accent-cyan/15 text-accent-cyan" : "text-ui-ink hover:bg-ui-bg",

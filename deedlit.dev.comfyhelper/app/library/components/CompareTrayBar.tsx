@@ -27,6 +27,7 @@ export function CompareTrayBar() {
           aria-disabled={disabled}
           tabIndex={disabled ? -1 : undefined}
           className={className}
+          data-testid="compare-tray-compare-link"
         >
           Compare {count}
         </Link>

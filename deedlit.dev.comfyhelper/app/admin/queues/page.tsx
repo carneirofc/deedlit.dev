@@ -212,7 +212,12 @@ function MessageCard({ m, index }: { m: QueueMessage; index: number }) {
       {err != null && <div className="mt-1 break-words text-rose-500">{String(err)}</div>}
       {m.payload && (
         <details className="mt-1">
-          <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">payload</summary>
+          <summary
+            className="cursor-pointer text-ui-ink-muted hover:text-ui-ink"
+            data-testid={`queue-msg-payload-toggle-${index}`}
+          >
+            payload
+          </summary>
           <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
             {prettyJson(m.payload)}
           </pre>
@@ -220,7 +225,12 @@ function MessageCard({ m, index }: { m: QueueMessage; index: number }) {
       )}
       {hasHeaders && (
         <details className="mt-1">
-          <summary className="cursor-pointer text-ui-ink-muted hover:text-ui-ink">headers</summary>
+          <summary
+            className="cursor-pointer text-ui-ink-muted hover:text-ui-ink"
+            data-testid={`queue-msg-headers-toggle-${index}`}
+          >
+            headers
+          </summary>
           <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-ui-bg p-1.5 font-mono text-ui-ink-muted">
             {JSON.stringify(m.headers, null, 2)}
           </pre>

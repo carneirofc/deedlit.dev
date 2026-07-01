@@ -41,6 +41,7 @@ export default function MetadataTabBar({
           <TabsTrigger
             key={option.value}
             value={option.value}
+            data-testid={`metadata-tab-${option.value}`}
             className={cn("flex-1 py-1.5 text-ui-xs font-semibold", optionClassName)}
           >
             {option.label}

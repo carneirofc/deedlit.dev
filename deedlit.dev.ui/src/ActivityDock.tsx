@@ -107,6 +107,7 @@ function ActivityRow({ a, onDismiss }: { a: Activity; onDismiss: (id: string) =>
           onClick={() => onDismiss(a.id)}
           className="shrink-0 rounded text-ui-2xs text-ui-ink-muted transition hover:text-ui-ink"
           aria-label="Dismiss"
+          data-testid={`activity-dismiss-${a.id}`}
         >
           ×
         </button>

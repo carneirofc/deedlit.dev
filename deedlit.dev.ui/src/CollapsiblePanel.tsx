@@ -16,6 +16,7 @@ export type CollapsiblePanelProps = {
   triggerClassName?: string;
   contentClassName?: string;
   chevronClassName?: string;
+  testId?: string;
 };
 
 /**
@@ -33,6 +34,7 @@ export default function CollapsiblePanel({
   triggerClassName,
   contentClassName,
   chevronClassName,
+  testId,
 }: CollapsiblePanelProps) {
   const isControlled = isOpenProp !== undefined;
 
@@ -42,8 +44,10 @@ export default function CollapsiblePanel({
       defaultOpen={isControlled ? undefined : defaultOpen}
       onOpenChange={onToggle ? () => onToggle() : undefined}
       className={cn(className)}
+      data-testid={testId}
     >
       <CollapsibleTrigger
+        data-testid={testId ? `${testId}-trigger` : undefined}
         className={cn(
           "group/cp flex w-full items-center justify-between px-4 py-2.5 text-ui-sm font-medium text-ui-ink-secondary transition hover:bg-ui-bg-soft",
           triggerClassName,
@@ -59,7 +63,12 @@ export default function CollapsiblePanel({
         />
       </CollapsibleTrigger>
 
-      <CollapsibleContent className={contentClassName}>{children}</CollapsibleContent>
+      <CollapsibleContent
+        data-testid={testId ? `${testId}-content` : undefined}
+        className={contentClassName}
+      >
+        {children}
+      </CollapsibleContent>
     </Collapsible>
   );
 }

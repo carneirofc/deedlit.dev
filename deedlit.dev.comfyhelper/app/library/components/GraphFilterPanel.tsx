@@ -98,6 +98,7 @@ function EntitySuggest({
         aria-expanded={open}
         aria-controls={listId}
         aria-autocomplete="list"
+        data-testid="graph-filter-entity-input"
       />
       {open && !disabled && options.length > 0 && (
         <ul
@@ -114,6 +115,7 @@ function EntitySuggest({
                 className={`w-full truncate rounded-md px-2 py-1 text-left text-ui-xs transition ${
                   i === active ? "bg-accent-cyan/15 text-accent-cyan" : "text-ui-ink hover:bg-ui-bg"
                 }`}
+                data-testid={`graph-filter-entity-option-${o}`}
               >
                 {o}
               </button>
@@ -205,6 +207,7 @@ export function GraphFilterPanel({
             checked={useRelated}
             onChange={(e) => setUseRelated(e.target.checked)}
             className="rounded"
+            data-testid="graph-filter-use-related-checkbox"
           />
           Images sharing a tag/model with this one
         </label>
@@ -216,6 +219,7 @@ export function GraphFilterPanel({
           value={nodeType}
           onChange={(e) => { setNodeType(e.target.value as NodeType); setText(""); }}
           disabled={useRelated}
+          data-testid="graph-filter-node-type-select"
         >
           {NODE_TYPES.map((t) => (
             <option key={t} value={t}>
@@ -234,11 +238,11 @@ export function GraphFilterPanel({
       </div>
 
       <div className="mt-2 flex gap-2">
-        <button className={btn} onClick={() => apply()} disabled={checking}>
+        <button className={btn} onClick={() => apply()} disabled={checking} data-testid="graph-filter-apply">
           Apply filter
         </button>
         {active && (
-          <button className={btn} onClick={clear}>
+          <button className={btn} onClick={clear} data-testid="graph-filter-clear">
             Clear
           </button>
         )}

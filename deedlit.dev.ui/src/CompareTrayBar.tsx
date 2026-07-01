@@ -62,6 +62,7 @@ export function CompareTrayBar({
 
   return (
     <div
+      data-testid="compare-tray"
       className={cn(
         "pointer-events-none fixed inset-x-0 bottom-20 z-70 flex justify-center px-3 md:bottom-4",
         className,
@@ -71,7 +72,7 @@ export function CompareTrayBar({
         {label ? <span className="hidden px-1 text-ui-xs text-ui-ink-muted sm:block">{label}</span> : null}
         <div className="flex items-center gap-1.5">
           {items.map((item) => (
-            <div key={item.id} className="group relative">
+            <div key={item.id} className="group relative" data-testid={`compare-tray-item-${item.id}`}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={item.thumbnailUrl}
@@ -82,6 +83,7 @@ export function CompareTrayBar({
                 onClick={() => onRemove(item.id)}
                 className="absolute -right-1 -top-1 grid h-4 w-4 place-items-center rounded-full border border-ui-border/70 bg-ui-bg text-ui-2xs text-ui-ink-muted transition hover:text-rose-500"
                 aria-label={removeLabel}
+                data-testid={`compare-tray-remove-${item.id}`}
               >
                 ×
               </button>
@@ -98,6 +100,7 @@ export function CompareTrayBar({
         <button
           onClick={onClear}
           className="rounded-lg border border-ui-border/70 px-2.5 py-2 text-ui-xs text-ui-ink-muted transition hover:text-ui-ink"
+          data-testid="compare-tray-clear"
         >
           {clearLabel}
         </button>
