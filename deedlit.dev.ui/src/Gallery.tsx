@@ -155,11 +155,16 @@ export function Gallery<T>({
   const pageSize = windowing?.pageSize ?? DEFAULT_WINDOW_PAGE_SIZE;
   const windowCount = windowPages * pageSize;
   const behindCount = Math.floor((windowPages - 1) / 2) * pageSize;
-  const enabled = items.length > windowCount;
+  // Masonry flows column-major (CSS multi-column), so a contiguous index slice
+  // does NOT map to a vertical band of the viewport the way it does for a
+  // row-major grid/list — windowing it strands blank columns as you scroll. The
+  // window keys off row-major geometry, so it only engages for grid/list; masonry
+  // renders every item (its variable heights already keep the DOM modest).
+  const enabled = !masonry && items.length > windowCount;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Live grid geometry (columns + per-row pixel stride) measured from the DOM, so
-  // spacer heights stay exact for grid/list and close for masonry without us
+  // spacer heights stay exact for the windowed grid / list views without us
   // hard-coding any column scheme.
   const geomRef = useRef<{ cols: number; rowH: number }>({ cols: 1, rowH: 0 });
   const [range, setRange] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
@@ -181,26 +186,30 @@ export function Gallery<T>({
     }
     const cards = el.querySelectorAll<HTMLElement>("[data-gallery-item]");
     if (cards.length === 0) return;
-    const first = cards[0].getBoundingClientRect();
-    let cols = 1;
-    for (let i = 1; i < cards.length; i++) {
-      if (Math.abs(cards[i].getBoundingClientRect().top - first.top) <= 1) cols++;
-      else break;
-    }
-    let rowH = first.height;
-    for (let i = 1; i < cards.length; i++) {
-      const delta = cards[i].getBoundingClientRect().top - first.top;
-      if (delta > 1) {
-        rowH = delta;
-        break;
-      }
-    }
-    rowH = Math.max(rowH, 1);
+    const rects = Array.from(cards, (c) => c.getBoundingClientRect());
+    const first = rects[0];
+
+    // Columns = the number of distinct left edges among the mounted cards (the
+    // grid's column count; 1 for the list view). Rounded to swallow sub-pixel
+    // drift. This reads geometry directly, so it self-corrects after a resize.
+    const cols = Math.max(1, new Set(rects.map((r) => Math.round(r.left))).size);
+
+    // Per-row vertical stride, averaged over every mounted row rather than read
+    // from the first pair. That stays exact for a uniform grid and robust when
+    // rows differ in height (wrapped captions / mixed media), where a single-pair
+    // measure would drift. Clamped to >= 1 so a not-yet-laid-out grid (all cards
+    // still zero-height) can never divide by zero and strand the window.
+    const bottom = Math.max(...rects.map((r) => r.bottom));
+    const rowsMounted = Math.max(1, Math.ceil(rects.length / cols));
+    const rowH = Math.max(1, (bottom - first.top) / rowsMounted);
     geomRef.current = { cols, rowH };
 
+    // The first mounted card sits at viewport-Y `first.top`, so `-first.top`
+    // pixels of grid lie above the viewport — that many rows of stride gives the
+    // first item on screen. (No `window.scrollY` term: `first.top` is already
+    // relative to the viewport, so it encodes the scroll offset on its own.)
     const firstIdx = Number(cards[0].dataset.index) || 0;
-    const firstTopDoc = first.top + window.scrollY;
-    const rowsAbove = Math.round((window.scrollY - firstTopDoc) / rowH);
+    const rowsAbove = Math.round(-first.top / rowH);
     const viewportFirst = Math.max(0, firstIdx + rowsAbove * cols);
     let start = viewportFirst - behindCount;
     start = Math.max(0, Math.min(start, items.length - windowCount));
@@ -208,6 +217,24 @@ export function Gallery<T>({
     const end = Math.min(items.length, start + windowCount);
     setRange((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
   }, [items.length, windowCount, behindCount]);
+
+  // rAF-coalesced recompute: many scroll / resize / mutation signals collapse to
+  // one measure per frame. Shared by the scroll + resize listeners, the resize
+  // observer, and the re-anchor path so they can't stack redundant work.
+  const rafRef = useRef(0);
+  const scheduleRecompute = useCallback(() => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      recompute();
+    });
+  }, [recompute]);
+  useEffect(
+    () => () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
 
   // A new result set (or a head splice that changes the first item) re-anchors the
   // window to the top; otherwise re-derive it from scroll. Layout effect so the
@@ -223,30 +250,38 @@ export function Gallery<T>({
     if (firstKey !== prevFirstKey.current) {
       prevFirstKey.current = firstKey;
       setRange({ start: 0, end: Math.min(items.length, windowCount) });
+      // A remount or head splice can commit with the page already scrolled down
+      // (browser scroll restoration on nav). Re-derive from the real scroll next
+      // frame so the window tracks the viewport instead of staying at the top
+      // showing a blank spacer.
+      scheduleRecompute();
       return;
     }
     recompute();
-  }, [enabled, firstKey, items.length, windowCount, viewMode, recompute]);
+  }, [enabled, firstKey, items.length, windowCount, viewMode, recompute, scheduleRecompute]);
 
-  // Follow the scroll while windowed (rAF-coalesced) + on resize.
+  // Follow the scroll while windowed (rAF-coalesced), re-derive on viewport
+  // resize, and — via a ResizeObserver on the grid — whenever the grid's own
+  // height changes (cards growing as their images decode, captions wrapping, a
+  // column-count breakpoint). Without the observer the window could stay parked
+  // over stale geometry, mounting a slice that no longer overlaps the viewport.
+  // The mount-time call honours a scroll position already in place at mount
+  // (nav restore) even if no scroll event ever fires.
   useEffect(() => {
     if (!enabled) return;
-    let raf = 0;
-    const onScroll = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        recompute();
-      });
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    window.addEventListener("resize", onScroll);
+    const el = containerRef.current;
+    window.addEventListener("scroll", scheduleRecompute, { passive: true });
+    window.addEventListener("resize", scheduleRecompute);
+    const ro =
+      el && typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleRecompute) : null;
+    ro?.observe(el as Element);
+    scheduleRecompute();
     return () => {
-      if (raf) cancelAnimationFrame(raf);
-      window.removeEventListener("scroll", onScroll);
-      window.removeEventListener("resize", onScroll);
+      window.removeEventListener("scroll", scheduleRecompute);
+      window.removeEventListener("resize", scheduleRecompute);
+      ro?.disconnect();
     };
-  }, [enabled, recompute]);
+  }, [enabled, scheduleRecompute]);
 
   // The slice to mount + the spacer heights for the collapsed remainder. Before
   // the first measure (range.end === 0) fall back to the leading window so the
