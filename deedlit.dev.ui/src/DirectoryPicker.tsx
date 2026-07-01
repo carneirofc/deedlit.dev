@@ -2,8 +2,16 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./Dialog";
 import { ChevronRightIcon, DocumentIcon, FolderIcon } from "./Icons";
-import Modal from "./Modal";
 import OutlineButton from "./OutlineButton";
 
 interface FsEntry {
@@ -104,37 +112,19 @@ export function DirectoryPicker({
   const current = data?.path ?? null;
 
   return (
-    <Modal
+    <Dialog
       open={open}
-      onClose={onClose}
-      title={title}
-      description="Browse the server filesystem and choose a folder."
-      size="lg"
-      testId="directory-picker"
-      footer={
-        <div className="flex items-center justify-between gap-3">
-          <span
-            className="min-w-0 flex-1 truncate font-mono text-ui-xs text-ui-ink-muted"
-            title={current ?? undefined}
-          >
-            {current ?? "No folder selected"}
-          </span>
-          <div className="flex shrink-0 gap-2">
-            <OutlineButton variant="ghost" onClick={onClose}>
-              Cancel
-            </OutlineButton>
-            <OutlineButton
-              variant="accent"
-              disabled={!current}
-              data-modal-primary-action="true"
-              onClick={() => current && onSelect(current)}
-            >
-              Select this folder
-            </OutlineButton>
-          </div>
-        </div>
-      }
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
     >
+      <DialogContent size="lg" data-testid="directory-picker">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>Browse the server filesystem and choose a folder.</DialogDescription>
+        </DialogHeader>
+
+        <DialogBody>
       {/* Path bar: up · editable path · go */}
       <div className="flex flex-wrap items-center gap-2">
         <OutlineButton
@@ -226,7 +216,30 @@ export function DirectoryPicker({
           </ul>
         )}
       </div>
-    </Modal>
+        </DialogBody>
+
+        <DialogFooter className="justify-between gap-3">
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-ui-xs text-ui-ink-muted"
+            title={current ?? undefined}
+          >
+            {current ?? "No folder selected"}
+          </span>
+          <div className="flex shrink-0 gap-2">
+            <OutlineButton variant="ghost" onClick={onClose}>
+              Cancel
+            </OutlineButton>
+            <OutlineButton
+              variant="accent"
+              disabled={!current}
+              onClick={() => current && onSelect(current)}
+            >
+              Select this folder
+            </OutlineButton>
+          </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

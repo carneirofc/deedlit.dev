@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "ui-storybook",
+      "runtimeExecutable": "C:\\Users\\claud\\AppData\\Roaming\\fnm\\node-versions\\v24.13.1\\installation\\node.exe",
+      "runtimeArgs": ["C:\\Users\\claud\\__Code__\\deedlit.dev\\node_modules\\storybook\\dist\\bin\\dispatcher.js", "dev", "-p", "6006", "-c", "deedlit.dev.ui/.storybook", "--no-open", "--ci"],
+      "port": 6006
+    },
+    {
       "name": "deedlit.dev",
       "runtimeExecutable": "C:\\Users\\claud\\AppData\\Roaming\\fnm\\node-versions\\v24.13.1\\installation\\node.exe",
       "runtimeArgs": ["C:\\Users\\claud\\__Code__\\deedlit.dev\\node_modules\\next\\dist\\bin\\next", "dev", "deedlit.dev", "-p", "3001"],

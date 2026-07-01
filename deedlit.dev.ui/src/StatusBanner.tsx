@@ -1,21 +1,30 @@
 "use client";
 
 import { forwardRef, type HTMLAttributes, type ReactNode } from "react";
+import { cva, type VariantProps } from "class-variance-authority";
 
 import { cn } from "./utils";
 
 export type StatusBannerTone = "loading" | "error";
 
-export type StatusBannerProps = HTMLAttributes<HTMLParagraphElement> & {
-  tone: StatusBannerTone;
-  children: ReactNode;
-};
+export const statusBannerVariants = cva("rounded-lg border px-2 py-2 text-ui-xs", {
+  variants: {
+    tone: {
+      loading:
+        "border-[color:var(--ui-border)] bg-[color:var(--ui-bg-soft)] text-[color:var(--ui-ink-secondary)]",
+      error: "border-error-edge bg-error text-error-ink",
+    },
+  },
+  defaultVariants: {
+    tone: "loading",
+  },
+});
 
-const TONE_CLASSES: Record<StatusBannerTone, string> = {
-  loading:
-    "border-[color:var(--ui-border)] bg-[color:var(--ui-bg-soft)] text-[color:var(--ui-ink-secondary)]",
-  error: "border-error-edge bg-error text-error-ink",
-};
+export type StatusBannerProps = HTMLAttributes<HTMLParagraphElement> &
+  VariantProps<typeof statusBannerVariants> & {
+    tone: StatusBannerTone;
+    children: ReactNode;
+  };
 
 /**
  * Compact inline status banner for loading / error states inside panels.
@@ -31,11 +40,8 @@ const StatusBanner = forwardRef<HTMLParagraphElement, StatusBannerProps>(
       <p
         ref={ref}
         role={tone === "error" ? "alert" : "status"}
-        className={cn(
-          "rounded-lg border px-2 py-2 text-ui-xs",
-          TONE_CLASSES[tone],
-          className,
-        )}
+        data-slot="status-banner"
+        className={cn(statusBannerVariants({ tone }), className)}
         {...props}
       >
         {children}

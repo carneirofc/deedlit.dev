@@ -5,9 +5,14 @@ import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from
 
 import {
   CyberSubpanel,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
   FilterSelectionCard,
   InfoChip,
-  Modal,
   OutlineButton,
   PanelSectionHeader,
   ScanProgress,
@@ -401,23 +406,28 @@ export function UiShowcaseSection() {
         description="24 images were indexed and are now available in the gallery."
       />
 
-      <Modal
+      <Dialog
         open={isImageViewerOpen}
-        onClose={() => setIsImageViewerOpen(false)}
-        title="Image Viewer"
-        description="Demo preview modal used for focused media inspection."
-        size="lg"
+        onOpenChange={setIsImageViewerOpen}
       >
-        <div className="relative aspect-[16/9] overflow-hidden rounded-xl border border-[color:var(--ui-border)] bg-[color:var(--ui-bg-tint)]">
-          <Image
-            src="/globe.svg"
-            alt="Sample image viewer preview"
-            fill
-            sizes="(min-width: 1024px) 860px, 96vw"
-            className="object-contain p-6"
-          />
-        </div>
-      </Modal>
+        <DialogContent size="lg">
+          <DialogHeader>
+            <DialogTitle>Image Viewer</DialogTitle>
+            <DialogDescription>Demo preview modal used for focused media inspection.</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <div className="relative aspect-[16/9] overflow-hidden rounded-xl border border-[color:var(--ui-border)] bg-[color:var(--ui-bg-tint)]">
+              <Image
+                src="/globe.svg"
+                alt="Sample image viewer preview"
+                fill
+                sizes="(min-width: 1024px) 860px, 96vw"
+                className="object-contain p-6"
+              />
+            </div>
+          </DialogBody>
+        </DialogContent>
+      </Dialog>
     </section>
   );
 }

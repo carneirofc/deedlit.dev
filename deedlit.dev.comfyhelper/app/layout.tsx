@@ -3,8 +3,8 @@ import {
   IBM_Plex_Mono,
   Sora /*, Cinzel, Montserrat,*/,
 } from "next/font/google";
+import { ThemeToggleButton } from "@carneirofc/ui";
 import { AppSidebar } from "@/components/AppSidebar";
-import { ThemeToggleButton } from "@/components/ThemeToggleButton";
 import AppProviders from "@/lib/store/providers";
 import "./globals.css";
 

@@ -1,31 +1,39 @@
 "use client";
 
 import { forwardRef, type HTMLAttributes, type ReactNode } from "react";
+import { cva, type VariantProps } from "class-variance-authority";
 
 import { cn } from "./utils";
 
 export type EmptyStateTone = "default" | "subtle";
 
-export type EmptyStateProps = HTMLAttributes<HTMLParagraphElement> & {
-  children: ReactNode;
-  tone?: EmptyStateTone;
-  testId?: string;
-};
+export const emptyStateVariants = cva("text-ui-sm text-[color:var(--ui-ink-subtle)]", {
+  variants: {
+    tone: {
+      default: "rounded-xl border border-dashed border-ui-soft p-4",
+      subtle: "",
+    },
+  },
+  defaultVariants: {
+    tone: "default",
+  },
+});
 
-const TONE_CLASS_NAMES: Record<EmptyStateTone, string> = {
-  default:
-    "rounded-xl border border-dashed border-ui-soft p-4 text-ui-sm text-[color:var(--ui-ink-subtle)]",
-  subtle: "text-ui-sm text-[color:var(--ui-ink-subtle)]",
-};
+export type EmptyStateProps = HTMLAttributes<HTMLParagraphElement> &
+  VariantProps<typeof emptyStateVariants> & {
+    children: ReactNode;
+    testId?: string;
+  };
 
 const EmptyState = forwardRef<HTMLParagraphElement, EmptyStateProps>(
-  function EmptyState({ children, tone = "default", testId, className, ...props }, ref) {
+  function EmptyState({ children, tone, testId, className, ...props }, ref) {
     return (
       <p
         ref={ref}
         id={testId}
         data-testid={testId}
-        className={cn(TONE_CLASS_NAMES[tone], className)}
+        data-slot="empty-state"
+        className={cn(emptyStateVariants({ tone }), className)}
         {...props}
       >
         {children}

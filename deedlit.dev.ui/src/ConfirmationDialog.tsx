@@ -1,8 +1,13 @@
 "use client";
 
-import { forwardRef, useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
+import { forwardRef } from "react";
 
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogTitle,
+} from "./Dialog";
 import OutlineButton from "./OutlineButton";
 import { cn, SPACING_PATTERNS, BORDER_PATTERNS } from "./utils";
 
@@ -22,6 +27,12 @@ export type ConfirmationDialogProps = {
   testIdPrefix?: string;
 };
 
+/**
+ * Confirmation dialog driven by a `dialog` data object. Built on the accessible
+ * {@link Dialog} primitives, so it traps focus, restores focus on close, makes
+ * the background inert, and dismisses on `Escape`/backdrop — invoking
+ * `onClose(false)`. Mount it only while a confirmation is pending.
+ */
 const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(function ConfirmationDialog({
   dialog,
   onClose,
@@ -29,48 +40,28 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
   overlayClassName,
   testIdPrefix = "confirmation-dialog",
 }, ref) {
-  const acceptButtonRef = useRef<HTMLButtonElement | null>(null);
-
-  useEffect(() => {
-    const frameId = window.requestAnimationFrame(() => {
-      acceptButtonRef.current?.focus();
-    });
-
-    return () => window.cancelAnimationFrame(frameId);
-  }, [dialog]);
-
-  if (typeof document === "undefined") return null;
-
-  return createPortal(
-    <div
-      id={`${testIdPrefix}-overlay`}
-      data-testid={`${testIdPrefix}-overlay`}
-      className={cn(
-        "fixed inset-0 z-120 flex items-center justify-center overflow-y-auto bg-ui-overlay-soft p-4",
-        overlayClassName,
-      )}
-      role="dialog"
-      aria-modal="true"
-      aria-label={dialog.title}
-      onClick={() => onClose(false)}
+  return (
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose(false);
+      }}
     >
-      <div
+      <DialogContent
         ref={ref}
         id={testIdPrefix}
         data-testid={testIdPrefix}
-        className={cn(
-          "w-full max-w-180 overflow-hidden rounded-2xl border-ui-modal bg-ui-bg-card shadow-ui-strong",
-          className,
-        )}
-        onClick={(event) => event.stopPropagation()}
+        size="lg"
+        showCloseButton={false}
+        overlayClassName={cn("ui-anim-overlay z-120 bg-ui-overlay-soft", overlayClassName)}
+        aria-describedby={undefined}
+        className={cn("max-w-180", className)}
       >
         <div className={cn(BORDER_PATTERNS.bottomFaint, SPACING_PATTERNS.dialogSection)}>
           <p className="text-ui-sm font-semibold uppercase tracking-[0.08em] text-ui-ink-subtle">
             Confirm Action
           </p>
-          <h3 className="mt-1 text-ui-lg font-semibold text-ui-ink-strong">
-            {dialog.title}
-          </h3>
+          <DialogTitle className="mt-1 text-ui-lg">{dialog.title}</DialogTitle>
         </div>
 
         <div className={cn("max-h-[min(62dvh,36rem)] space-y-4 overflow-y-auto text-ui-sm text-ui-ink-accent", SPACING_PATTERNS.dialogSection)}>
@@ -98,15 +89,13 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
         </div>
 
         <div className={cn("flex items-center justify-end gap-2", BORDER_PATTERNS.topFaint, SPACING_PATTERNS.dialogSection)}>
+          <DialogClose asChild>
+            <OutlineButton data-testid={`${testIdPrefix}-cancel-button`} controlSize="md">
+              {dialog.cancelLabel ?? "Cancel"}
+            </OutlineButton>
+          </DialogClose>
           <OutlineButton
-            data-testid={`${testIdPrefix}-cancel-button`}
-            onClick={() => onClose(false)}
-            controlSize="md"
-          >
-            {dialog.cancelLabel ?? "Cancel"}
-          </OutlineButton>
-          <OutlineButton
-            ref={acceptButtonRef}
+            autoFocus
             data-testid={`${testIdPrefix}-accept-button`}
             onClick={() => onClose(true)}
             variant="accent"
@@ -115,9 +104,8 @@ const ConfirmationDialog = forwardRef<HTMLDivElement, ConfirmationDialogProps>(f
             {dialog.confirmLabel ?? "Confirm"}
           </OutlineButton>
         </div>
-      </div>
-    </div>,
-    document.body,
+      </DialogContent>
+    </Dialog>
   );
 });
 

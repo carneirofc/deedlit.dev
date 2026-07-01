@@ -2,8 +2,8 @@
 
 import type { ReactNode } from "react";
 
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./Collapsible";
 import { ChevronDownIcon } from "./Icons";
-import { useControllableState } from "./lib/use-controllable-state";
 import { cn } from "./utils";
 
 export type CollapsiblePanelProps = {
@@ -18,6 +18,11 @@ export type CollapsiblePanelProps = {
   chevronClassName?: string;
 };
 
+/**
+ * Convenience disclosure panel built on the {@link Collapsible} primitives.
+ * Gains a real `aria-controls` link between trigger and content plus an
+ * animated height transition, while keeping the simple `label`/`isOpen` API.
+ */
 export default function CollapsiblePanel({
   label,
   isOpen: isOpenProp,
@@ -29,33 +34,32 @@ export default function CollapsiblePanel({
   contentClassName,
   chevronClassName,
 }: CollapsiblePanelProps) {
-  const [isOpen, setIsOpen] = useControllableState({
-    value: isOpenProp,
-    defaultValue: defaultOpen,
-    onChange: onToggle ? () => onToggle() : undefined,
-  });
-
-  const handleToggle = () => setIsOpen((prev) => !prev);
+  const isControlled = isOpenProp !== undefined;
 
   return (
-    <div className={cn(className)}>
-      <button
-        type="button"
-        onClick={handleToggle}
+    <Collapsible
+      open={isControlled ? isOpenProp : undefined}
+      defaultOpen={isControlled ? undefined : defaultOpen}
+      onOpenChange={onToggle ? () => onToggle() : undefined}
+      className={cn(className)}
+    >
+      <CollapsibleTrigger
         className={cn(
-          "flex w-full items-center justify-between px-4 py-2.5 text-ui-sm font-medium text-ui-ink-secondary transition hover:bg-ui-bg-soft",
+          "group/cp flex w-full items-center justify-between px-4 py-2.5 text-ui-sm font-medium text-ui-ink-secondary transition hover:bg-ui-bg-soft",
           triggerClassName,
         )}
-        aria-expanded={isOpen}
       >
         <span>{label}</span>
         <ChevronDownIcon
           size="h-4 w-4"
-          className={cn("transition-transform", isOpen ? "rotate-180" : "", chevronClassName)}
+          className={cn(
+            "transition-transform duration-200 group-data-[state=open]/cp:rotate-180",
+            chevronClassName,
+          )}
         />
-      </button>
+      </CollapsibleTrigger>
 
-      {isOpen && <div className={contentClassName}>{children}</div>}
-    </div>
+      <CollapsibleContent className={contentClassName}>{children}</CollapsibleContent>
+    </Collapsible>
   );
 }

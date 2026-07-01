@@ -2,11 +2,25 @@
 
 import type { ReactNode } from "react";
 
-import { ActivityDock } from "@/components/ActivityDock";
-import { ActivityToasts } from "@/components/ActivityToasts";
-import { ActivityProvider } from "@/lib/store/activity";
+import { ActivityDock, ActivityToasts } from "@carneirofc/ui";
+
+import { ActivityProvider, useActivity } from "@/lib/store/activity";
 import { CompareTrayProvider } from "@/lib/store/compare-tray";
 import { SettingsProvider } from "@/lib/store/settings";
+
+/**
+ * Connects the shared-lib activity dock + toasts to comfyhelper's activity
+ * store. Mounted inside {@link ActivityProvider} so it can read live state.
+ */
+function ActivityOverlay() {
+  const { activities, dismiss, clearFinished } = useActivity();
+  return (
+    <>
+      <ActivityDock activities={activities} onDismiss={dismiss} onClearFinished={clearFinished} />
+      <ActivityToasts activities={activities} />
+    </>
+  );
+}
 
 /**
  * App-wide client providers.  The legacy SQLite gallery used Jotai + React Query
@@ -21,8 +35,7 @@ export default function AppProviders({ children }: { children: ReactNode }) {
     <SettingsProvider>
       <ActivityProvider>
         <CompareTrayProvider>{children}</CompareTrayProvider>
-        <ActivityDock />
-        <ActivityToasts />
+        <ActivityOverlay />
       </ActivityProvider>
     </SettingsProvider>
   );

@@ -76,3 +76,17 @@ export const Sizes: Story = {
     </div>
   ),
 };
+
+/**
+ * `asChild` delegates the button styling onto the child element via Radix
+ * `Slot` — here an anchor renders as a real link while keeping the button look.
+ */
+export const AsChildLink: Story = {
+  render: (args) => (
+    <OutlineButton {...args} asChild variant="accent">
+      <a href="https://example.com" target="_blank" rel="noreferrer">
+        Open link
+      </a>
+    </OutlineButton>
+  ),
+};

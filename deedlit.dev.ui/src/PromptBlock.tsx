@@ -1,12 +1,29 @@
 "use client";
 
 import { forwardRef, type HTMLAttributes, type ReactNode } from "react";
+import { cva } from "class-variance-authority";
 
 import CopyButton from "./CopyButton";
 import SectionLabel from "./SectionLabel";
 import { cn } from "./utils";
 
 export type PromptBlockTone = "positive" | "negative" | "neutral";
+
+export const promptBlockTextVariants = cva(
+  "mt-2 max-h-36 overflow-auto whitespace-pre-wrap rounded-lg p-2 text-ui-xs text-[color:var(--ui-ink-primary)]",
+  {
+    variants: {
+      tone: {
+        positive: "bg-success",
+        negative: "bg-error",
+        neutral: "bg-[color:var(--ui-bg-soft)]",
+      },
+    },
+    defaultVariants: {
+      tone: "neutral",
+    },
+  },
+);
 
 export type PromptBlockProps = Omit<HTMLAttributes<HTMLElement>, "children"> & {
   /** Section heading displayed above the prompt text. */
@@ -19,12 +36,6 @@ export type PromptBlockProps = Omit<HTMLAttributes<HTMLElement>, "children"> & {
   copied?: boolean;
   /** Called when the copy button is clicked. */
   onCopy?: () => void;
-};
-
-const TONE_CLASSES: Record<PromptBlockTone, string> = {
-  positive: "bg-success",
-  negative: "bg-error",
-  neutral: "bg-[color:var(--ui-bg-soft)]",
 };
 
 /**
@@ -44,12 +55,7 @@ const PromptBlock = forwardRef<HTMLElement, PromptBlockProps>(
           <SectionLabel>{label}</SectionLabel>
           {onCopy && <CopyButton copied={copied} onClick={onCopy} />}
         </div>
-        <pre
-          className={cn(
-            "mt-2 max-h-36 overflow-auto whitespace-pre-wrap rounded-lg p-2 text-ui-xs text-[color:var(--ui-ink-primary)]",
-            TONE_CLASSES[tone],
-          )}
-        >
+        <pre className={promptBlockTextVariants({ tone })}>
           {children}
         </pre>
       </section>

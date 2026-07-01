@@ -1081,9 +1081,84 @@ textarea {
   transform: scale(1.04);
 }
 
+/* ── Radix primitive transitions ─────────────────────────────────────
+ * data-state driven enter/exit for headless Radix primitives (Dialog,
+ * DropdownMenu, Collapsible). Token-independent and disabled under
+ * prefers-reduced-motion below. Applied via the .ui-anim-* classes the
+ * components attach to Radix Overlay/Content nodes. */
+@keyframes ui-overlay-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes ui-overlay-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes ui-dialog-in {
+  from { opacity: 0; transform: translateY(0.5rem) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes ui-dialog-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(0.5rem) scale(0.97); }
+}
+@keyframes ui-popover-in {
+  from { opacity: 0; transform: translateY(-0.25rem) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes ui-popover-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(-0.25rem) scale(0.97); }
+}
+@keyframes ui-collapsible-down {
+  from { height: 0; }
+  to { height: var(--radix-collapsible-content-height); }
+}
+@keyframes ui-collapsible-up {
+  from { height: var(--radix-collapsible-content-height); }
+  to { height: 0; }
+}
+
+.ui-anim-overlay[data-state="open"] {
+  animation: ui-overlay-in 160ms ease-out;
+}
+.ui-anim-overlay[data-state="closed"] {
+  animation: ui-overlay-out 140ms ease-in;
+}
+.ui-anim-dialog[data-state="open"] {
+  animation: ui-dialog-in 200ms cubic-bezier(.2, .8, .3, 1.1);
+}
+.ui-anim-dialog[data-state="closed"] {
+  animation: ui-dialog-out 150ms ease-in;
+}
+.ui-anim-popover {
+  transform-origin: var(--radix-dropdown-menu-content-transform-origin, center top);
+}
+.ui-anim-popover[data-state="open"] {
+  animation: ui-popover-in 140ms cubic-bezier(.2, .8, .3, 1.1);
+}
+.ui-anim-popover[data-state="closed"] {
+  animation: ui-popover-out 110ms ease-in;
+}
+.ui-anim-collapsible {
+  overflow: hidden;
+}
+.ui-anim-collapsible[data-state="open"] {
+  animation: ui-collapsible-down 240ms cubic-bezier(.2, .8, .3, 1);
+}
+.ui-anim-collapsible[data-state="closed"] {
+  animation: ui-collapsible-up 200ms cubic-bezier(.4, 0, .6, 1);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-in {
     animation: none;
+  }
+  .ui-anim-overlay,
+  .ui-anim-dialog,
+  .ui-anim-popover,
+  .ui-anim-collapsible {
+    animation: none !important;
   }
   .ob-btn,
   .ob-btn:hover,

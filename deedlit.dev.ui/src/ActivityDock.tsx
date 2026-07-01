@@ -1,14 +1,34 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { useActivity } from "@/lib/store/activity";
-import type { Activity, ActivityStatus } from "@/lib/store/activity";
+export type ActivityStatus = "pending" | "running" | "success" | "error";
 
-// ---------------------------------------------------------------------------
-// Presentation helpers — mirror the status language used in
-// components/ServiceStatusBoard.tsx and app/admin/page.tsx.
-// ---------------------------------------------------------------------------
+export interface ActivityProgress {
+  processed: number;
+  total: number;
+  failed: number;
+}
+
+/**
+ * Presentational shape consumed by {@link ActivityDock} / {@link ActivityToasts}.
+ * Apps may store a richer activity (extra fields like `jobId`, `startedAt`) — it
+ * stays structurally assignable to this type.
+ */
+export interface Activity {
+  id: string;
+  /** Human label shown in the dock, e.g. "Ingest folder", "Save rating". */
+  label: string;
+  status: ActivityStatus;
+  /** Determinate progress — only present for job-linked activities. */
+  progress?: ActivityProgress;
+  /** Error text (on `error`) or short result detail. */
+  message?: string;
+  /** Current pipeline stage of a live activity — the worker doing work now. */
+  stage?: string | null;
+  /** Epoch ms when the activity settled; drives toast TTL expiry. */
+  endedAt?: number;
+}
 
 function statusChip(status: ActivityStatus): string {
   switch (status) {
@@ -48,10 +68,6 @@ function pct(a: Activity): number | null {
   if (!a.progress || a.progress.total <= 0) return null;
   return Math.min(100, Math.round((a.progress.processed / a.progress.total) * 100));
 }
-
-// ---------------------------------------------------------------------------
-// One activity row.
-// ---------------------------------------------------------------------------
 
 function ActivityRow({ a, onDismiss }: { a: Activity; onDismiss: (id: string) => void }) {
   const active = a.status === "pending" || a.status === "running";
@@ -123,19 +139,19 @@ function ActivityRow({ a, onDismiss }: { a: Activity; onDismiss: (id: string) =>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Dock.
-// ---------------------------------------------------------------------------
+export type ActivityDockProps = {
+  activities: Activity[];
+  onDismiss: (id: string) => void;
+  onClearFinished: () => void;
+};
 
 /**
  * Floating, always-mounted activity dock (bottom-right). Shows a pill with an
- * in-flight count whenever any tracked backend interaction is running, and an
- * expandable panel listing each operation with live progress, plus errors that
- * stick until dismissed. Reads everything from {@link useActivity}; mounted once
- * in lib/store/providers.tsx so it is visible on every route.
+ * in-flight count whenever a tracked interaction is running, and an expandable
+ * panel listing each operation with live progress; errors stick until dismissed.
+ * Presentational — the app owns the activity store and passes it in.
  */
-export function ActivityDock() {
-  const { activities, dismiss, clearFinished } = useActivity();
+export function ActivityDock({ activities, onDismiss, onClearFinished }: ActivityDockProps) {
   const [open, setOpen] = useState(false);
 
   if (activities.length === 0) return null;
@@ -162,7 +178,7 @@ export function ActivityDock() {
             <h2 className="text-ui-xs font-semibold text-ui-ink-title">Activity</h2>
             {finished > 0 && (
               <button
-                onClick={clearFinished}
+                onClick={onClearFinished}
                 className="rounded-md border border-ui-border/70 px-2 py-0.5 text-ui-2xs text-ui-ink-muted transition hover:bg-accent-cyan/10"
                 data-testid="activity-clear"
               >
@@ -172,7 +188,7 @@ export function ActivityDock() {
           </div>
           <div className="flex max-h-[50vh] flex-col gap-1.5 overflow-y-auto">
             {activities.map((a) => (
-              <ActivityRow key={a.id} a={a} onDismiss={dismiss} />
+              <ActivityRow key={a.id} a={a} onDismiss={onDismiss} />
             ))}
           </div>
         </section>
@@ -193,6 +209,71 @@ export function ActivityDock() {
         )}
         <span className={errors > 0 && active === 0 ? "text-rose-500" : "text-ui-ink"}>{pillLabel}</span>
       </button>
+    </div>
+  );
+}
+
+const SUCCESS_TTL_MS = 3500;
+const ERROR_TTL_MS = 8000;
+
+export type ActivityToastsProps = {
+  activities: Activity[];
+  /** Override the auto-dismiss windows (ms) for settled activities. */
+  successTtlMs?: number;
+  errorTtlMs?: number;
+};
+
+/**
+ * The "glance" layer over {@link ActivityDock}: a transient toast appears when a
+ * tracked interaction settles — brief on success, longer on error. Toasts are
+ * derived from `endedAt` (not stored), so there is no effect-driven state to
+ * keep in sync; a slow tick re-renders so live toasts expire on time.
+ */
+export function ActivityToasts({
+  activities,
+  successTtlMs = SUCCESS_TTL_MS,
+  errorTtlMs = ERROR_TTL_MS,
+}: ActivityToastsProps) {
+  const [now, setNow] = useState(() => Date.now());
+
+  const toasts = activities
+    .filter((a) => {
+      if ((a.status !== "success" && a.status !== "error") || a.endedAt === undefined) return false;
+      const ttl = a.status === "error" ? errorTtlMs : successTtlMs;
+      return now - a.endedAt < ttl;
+    })
+    .slice(0, 4);
+
+  const hasLive = toasts.length > 0;
+  useEffect(() => {
+    if (!hasLive) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [hasLive]);
+
+  if (toasts.length === 0) return null;
+
+  return (
+    <div className="pointer-events-none fixed bottom-20 right-4 z-90 flex flex-col items-end gap-2">
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          className={`pointer-events-auto flex max-w-[20rem] items-start gap-2 rounded-lg border px-3 py-2 text-ui-xs shadow-panel-lg backdrop-blur-xl ${
+            t.status === "success"
+              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+              : "border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400"
+          }`}
+          data-testid={`activity-toast-${t.status}`}
+        >
+          <span className="mt-0.5 shrink-0">{t.status === "success" ? "✓" : "✕"}</span>
+          <span className="min-w-0">
+            <span className="font-medium">{t.label}</span>
+            {t.status === "error" && t.message ? (
+              <span className="block break-words opacity-90">{t.message}</span>
+            ) : null}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
