@@ -9,6 +9,7 @@ import { GraphFilterPanel } from "@/app/library/components/GraphFilterPanel";
 import { Lightbox } from "@/app/library/components/Lightbox";
 import { PathInput } from "@/components/PathInput";
 import type { ImagePatchBody } from "@/lib/api-client";
+import { pillBtnClass } from "@/lib/ui/buttonStyles";
 import { deleteImages } from "@/lib/library/bulk-delete";
 import { moveImages } from "@/lib/library/bulk-move";
 import {
@@ -1345,9 +1346,13 @@ export default function LibraryPage() {
         <button
           data-testid={`library-image-card-similar-${r.imageId}`}
           onClick={() => findSimilar(r.imageId, r.thumbnailUrl, r.summary)}
-          className="rounded-md border border-ui-border/50 bg-ui-bg/90 px-2 py-1 text-ui-2xs font-medium text-ui-ink backdrop-blur-sm transition hover:border-accent-cyan hover:bg-accent-cyan hover:text-ui-bg-deep"
+          className={pillBtnClass}
           title="Find similar images"
         >
+          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
           Similar
         </button>
       )}

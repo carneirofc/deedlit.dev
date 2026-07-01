@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { ctrlBtnClass, pillBtnClass } from "@/lib/ui/buttonStyles";
+
 interface ImageDetail {
   id: string;
   filename: string;
@@ -73,8 +75,8 @@ interface LightboxProps {
   onDelete?: (imageId: string) => Promise<void>;
 }
 
-const ctrlBtn =
-  "grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-ui-border/50 bg-ui-bg/70 text-ui-ink-muted backdrop-blur transition hover:border-accent-cyan hover:text-accent-cyan disabled:cursor-not-allowed disabled:opacity-40";
+const ctrlBtn = ctrlBtnClass;
+const pillBtn = pillBtnClass;
 
 const navBtn =
   "group absolute top-1/2 z-10 grid h-12 w-12 -translate-y-1/2 place-items-center rounded-full border border-ui-border/40 bg-ui-bg/60 text-ui-ink backdrop-blur transition hover:border-accent-cyan hover:bg-ui-bg/90 hover:text-accent-cyan disabled:opacity-30";
@@ -470,7 +472,7 @@ export function Lightbox({
             <button
               type="button"
               onClick={onToggleFullResolution}
-              className={`${ctrlBtn} w-auto px-2 text-ui-2xs font-semibold ${fullResolution ? "border-accent-cyan text-accent-cyan" : ""}`}
+              className={`${pillBtn} font-semibold ${fullResolution ? "border-accent-cyan text-accent-cyan" : ""}`}
               aria-pressed={fullResolution}
               title={fullResolution ? "Showing HD original — switch to thumbnail" : "Showing thumbnail — switch to HD original"}
               data-testid="lightbox-toggle-resolution"
@@ -483,7 +485,7 @@ export function Lightbox({
             <button
               type="button"
               onClick={() => onSimilar(current)}
-              className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium`}
+              className={pillBtn}
               title="Find similar images"
               data-testid="lightbox-find-similar"
             >
@@ -498,7 +500,7 @@ export function Lightbox({
           <button
             type="button"
             onClick={() => setDetailsOpen((v) => !v)}
-            className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${detailsOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
+            className={`${pillBtn} ${detailsOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
             aria-pressed={detailsOpen}
             title="Toggle details panel"
             data-testid="lightbox-toggle-details"
@@ -552,7 +554,7 @@ export function Lightbox({
             <button
               type="button"
               onClick={() => setNotesOpen((v) => !v)}
-              className={`${ctrlBtn} w-auto gap-1.5 px-2 text-ui-2xs font-medium ${notesOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
+              className={`${pillBtn} ${notesOpen ? "border-accent-cyan text-accent-cyan" : ""}`}
               aria-pressed={notesOpen}
               title="Toggle notes panel"
               data-testid="lightbox-toggle-notes"
@@ -574,7 +576,7 @@ export function Lightbox({
                   type="button"
                   onClick={handleDelete}
                   disabled={deleting}
-                  className="grid h-9 w-auto place-items-center gap-1.5 rounded-lg bg-rose-500/90 px-2.5 text-ui-2xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-60"
+                  className="inline-flex h-9 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-rose-500/90 px-3 text-ui-2xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-60"
                   title="Remove this image from the library (original kept on disk)"
                   data-testid="lightbox-delete-confirm"
                 >
@@ -693,19 +695,8 @@ export function Lightbox({
         </div>
       )}
 
-      {/* Stage — details panel + image area */}
+      {/* Stage — image area + details panel */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-
-      {/* Inline details panel */}
-      {detailsOpen && (
-        <aside className="flex w-[min(20rem,80vw)] shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-r border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm sm:w-96">
-          {detailLoading && <p className="text-ui-xs text-ui-ink-muted">Loading…</p>}
-          {detailError && !detailLoading && (
-            <p className="text-ui-xs text-rose-400">Couldn&apos;t load details for this image.</p>
-          )}
-          {detail && <LightboxDetailPanel detail={detail} imageId={current.imageId} />}
-        </aside>
-      )}
 
       {/* Click the empty area to close; swipe horizontally to page (mobile). */}
       <div
@@ -798,6 +789,17 @@ export function Lightbox({
           </svg>
         </button>
       </div>
+
+      {/* Inline details panel */}
+      {detailsOpen && (
+        <aside className="flex w-[min(20rem,80vw)] shrink-0 flex-col gap-3 overflow-x-hidden overflow-y-auto border-l border-ui-border/40 bg-ui-bg/85 p-4 backdrop-blur-sm sm:w-1/2">
+          {detailLoading && <p className="text-ui-xs text-ui-ink-muted">Loading…</p>}
+          {detailError && !detailLoading && (
+            <p className="text-ui-xs text-rose-400">Couldn&apos;t load details for this image.</p>
+          )}
+          {detail && <LightboxDetailPanel detail={detail} imageId={current.imageId} />}
+        </aside>
+      )}
       </div>
 
       {/* Filmstrip — horizontally scrollable, never wraps */}
