@@ -22,7 +22,7 @@ export function BooksSection({ items }: BooksSectionProps) {
   } = useBookFilters(items);
 
   return (
-    <section id="books" className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8">
+    <section id="books" className="section-anchor px-4 pb-16 pt-10 sm:px-6 lg:px-8">
       <div className="mb-6">
         <p className="text-xs uppercase tracking-[0.18em] text-muted font-semibold">Books</p>
         <h2 className="mt-2 text-2xl font-bold tracking-tight text-text sm:text-3xl">
@@ -51,7 +51,7 @@ export function BooksSection({ items }: BooksSectionProps) {
         onReset={resetFilters}
       />
 
-      <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
         {filteredBooks.map((book) => (
           <article
             key={book.id}

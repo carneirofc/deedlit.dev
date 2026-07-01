@@ -100,7 +100,7 @@ export function UiShowcaseSection() {
   return (
     <section
       data-testid="ui-showcase-section"
-      className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8"
+      className="section-anchor px-4 pb-16 pt-10 sm:px-6 lg:px-8"
     >
       <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
         <div>

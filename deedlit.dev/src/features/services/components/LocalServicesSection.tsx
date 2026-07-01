@@ -72,7 +72,7 @@ export function LocalServicesSection({ apps }: LocalServicesSectionProps) {
   };
 
   return (
-    <section id="services" className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8">
+    <section id="services" className="section-anchor px-4 pb-16 pt-10 sm:px-6 lg:px-8">
       <div className="mb-5">
         <SectionLabel>Services Hub</SectionLabel>
         <h2 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">Quick Access</h2>
@@ -120,7 +120,7 @@ export function LocalServicesSection({ apps }: LocalServicesSectionProps) {
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5">
         {filteredApps.map((app) => {
           const accessInfo = accessibility[app.id];
           const isAccessible = accessInfo?.status === "accessible";

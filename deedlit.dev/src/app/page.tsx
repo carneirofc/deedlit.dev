@@ -20,7 +20,7 @@ export default async function HomePage() {
   const { assets } = await getGalleryData();
 
   return (
-    <main className="mx-auto flex w-full max-w-[1700px] flex-col gap-6">
+    <main className="flex w-full flex-col gap-6">
       <CyberPanel id="top" className="scroll-mt-20">
         <PageHeader
           subtitle="deedlit.dev // personal space"

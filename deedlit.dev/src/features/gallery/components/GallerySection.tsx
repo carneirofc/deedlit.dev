@@ -31,7 +31,7 @@ const GalleryCard = memo(function GalleryCard({ src, alt }: { src: string; alt: 
           src={src}
           alt={alt}
           fill
-          sizes="(max-width: 768px) 100vw, (max-width: 1280px) 50vw, 33vw"
+          sizes="(max-width: 768px) 100vw, (max-width: 1024px) 50vw, (max-width: 1280px) 33vw, (max-width: 1536px) 25vw, 20vw"
           className="object-cover transition-transform duration-500 group-hover:scale-[1.03]"
         />
       </div>
@@ -164,7 +164,7 @@ export function GallerySection({ assets }: GallerySectionProps) {
 
   const activeAsset = modalIndex !== null ? filteredAssets[modalIndex] ?? null : null;
   return (
-    <section id="gallery" className="section-anchor mx-auto max-w-7xl px-4 pb-16 pt-10 sm:px-6 lg:px-8">
+    <section id="gallery" className="section-anchor px-4 pb-16 pt-10 sm:px-6 lg:px-8">
       <div className="mb-5">
         <p className="text-xs uppercase tracking-[0.18em] text-muted">Gallery</p>
         <div className="mt-2 flex items-center justify-between gap-3">
@@ -195,7 +195,7 @@ export function GallerySection({ assets }: GallerySectionProps) {
           items={filteredAssets}
           getKey={(asset) => asset.id}
           viewMode="grid"
-          gridClassName="grid gap-4 sm:grid-cols-2 lg:grid-cols-3"
+          gridClassName="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5"
           cardClassName="rounded-xl2 bg-surface/75 p-3 shadow-soft"
           mediaClassName="focus-ring w-full"
           onOpen={(index) => openModal(index)}
