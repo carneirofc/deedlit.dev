@@ -1291,7 +1291,14 @@ export default function LibraryPage() {
         <img
           src={r.gridUrl ?? r.thumbnailUrl}
           alt={r.summary}
-          loading="lazy"
+          // Native lazy-loading is unreliable across a client-side route
+          // transition (e.g. leaving /library and coming back via the sidebar):
+          // the browser's viewport-distance check can run before the new
+          // page's layout has settled and never fires again, leaving
+          // above-the-fold cards blank until a hard refresh. Eager-load the
+          // first fetched page (what's on screen right after the view mounts)
+          // and keep native lazy loading for rows pulled in later via scroll.
+          loading={ctx.index < limit ? "eager" : "lazy"}
           decoding="async"
           className={
             ctx.viewMode === "list"
