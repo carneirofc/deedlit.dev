@@ -37,6 +37,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # package-lock.json is generated on Windows and omits the Linux native
+      # binding for oxc-parser (npm/cli#4828), so install it explicitly.
+      - name: Install Linux native bindings
+        run: npm i --no-save @oxc-parser/binding-linux-x64-gnu
+
       - name: Build Storybook
         run: npm run build-storybook --workspace @carneirofc/ui
 
