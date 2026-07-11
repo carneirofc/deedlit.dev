@@ -59,7 +59,7 @@ flowchart LR
 |---|---|---|
 | [`deedlit.dev`](./deedlit.dev/) | 3001 | Public Next.js site — home, books, gallery, services |
 | [`deedlit.dev.comfyhelper`](./deedlit.dev.comfyhelper/) | 3000 | ComfyHelper UI for the image library |
-| [`deedlit.dev.ui`](./deedlit.dev.ui/) | — | Shared `@carneirofc/ui` component library |
+| [`deedlit.dev.ui`](./deedlit.dev.ui/) | — | Shared `@carneirofc/ui` component library — [live Storybook](https://carneirofc.github.io/deedlit.dev/ui/storybook/) |
 
 #### deedlit.dev — public site
 
@@ -81,8 +81,9 @@ admin page for ingestion, source folders, cache and maintenance jobs:
 
 #### @carneirofc/ui — Storybook
 
-Every shared component is documented in Storybook (see
-[Storybook on GitHub Pages](#storybook-on-github-pages)):
+Every shared component is documented in Storybook — browse it live at
+[carneirofc.github.io/deedlit.dev/ui/storybook](https://carneirofc.github.io/deedlit.dev/ui/storybook/)
+(see [Storybook on GitHub Pages](#storybook-on-github-pages)):
 
 ![@carneirofc/ui Storybook](./docs/screenshots/ui-storybook.png)
 

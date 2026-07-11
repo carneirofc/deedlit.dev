@@ -15,7 +15,9 @@ Conventions:
 ## Storybook
 
 This package documents its components with [Storybook](https://storybook.js.org/)
-(React + Vite builder, Tailwind v4).
+(React + Vite builder, Tailwind v4). The published build lives at
+**<https://carneirofc.github.io/deedlit.dev/ui/storybook/>** (deployed to GitHub
+Pages by [`storybook-pages.yml`](../.github/workflows/storybook-pages.yml)).
 
 ```bash
 # from the repo root
