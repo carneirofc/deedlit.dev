@@ -34,11 +34,14 @@ jobs:
           node-version: 24
           cache: npm
 
-      # npm install, not npm ci: the lockfile is generated on Windows and omits
-      # the Linux builds of native optional deps (oxc-*, npm/cli#4828); install
-      # re-resolves them for the runner's platform.
+      # The lockfile is generated on Windows and contains no Linux entries for
+      # native optional deps (oxc-*, lightningcss, …; npm/cli#4828) — npm ci and
+      # even npm install against that lock skip them. Resolve fresh instead;
+      # this build is a docs artifact, so lockfile determinism is not critical.
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: |
+          rm package-lock.json
+          npm install --no-audit --no-fund
 
       - name: Build Storybook
         run: npm run build-storybook --workspace @carneirofc/ui
