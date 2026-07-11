@@ -1,0 +1,62 @@
+name: Deploy Storybook to GitHub Pages
+
+# Builds the @carneirofc/ui Storybook and publishes it to GitHub Pages under
+# /ui/storybook (i.e. https://carneirofc.github.io/deedlit.dev/ui/storybook/).
+# The Pages artifact is assembled with that folder structure so other docs can
+# later live alongside it on the same site.
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'deedlit.dev.ui/**'
+      - '.github/workflows/storybook-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Storybook
+        run: npm run build-storybook --workspace @carneirofc/ui
+
+      - name: Assemble Pages site under /ui/storybook
+        run: |
+          mkdir -p _site/ui
+          mv deedlit.dev.ui/storybook-static _site/ui/storybook
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
