@@ -13,6 +13,46 @@ the sole writer of its datastore and they never call each other — `search` and
 [`deedlit.dev.comfyhelper/IMAGE_LIBRARY.md`](./deedlit.dev.comfyhelper/IMAGE_LIBRARY.md)
 for the full design.
 
+```mermaid
+flowchart LR
+    subgraph apps["Web apps (npm workspace)"]
+        dev["deedlit.dev<br/>:3001"]
+        ch["ComfyHelper<br/>:3000"]
+        ui["@carneirofc/ui"]
+    end
+    ui -. components .-> dev
+    ui -. components .-> ch
+
+    dev --> api
+    ch --> api
+
+    subgraph services["FastAPI services"]
+        api["deedlit.api :8088<br/>gateway / BFF"]
+        catalog["catalog :8001"]
+        search["search :8002"]
+        graphsvc["graph :8003"]
+        ingest["ingest :8004<br/>+ workers"]
+        metadata["metadata :8005"]
+        labelagent["labelagent :8006"]
+        vision["vision :8000"]
+    end
+    api --> catalog & search & graphsvc & ingest & metadata & labelagent
+
+    subgraph stores["Datastores"]
+        pg[("Postgres")]
+        rustfs[("RustFS S3")]
+        qd[("Qdrant")]
+        neo[("Neo4j")]
+        mq[("RabbitMQ")]
+    end
+    catalog --> pg & rustfs
+    search --> qd
+    graphsvc --> neo
+    ingest <--> mq
+
+    ingest -. "DAG stages call" .-> vision & catalog & search & graphsvc & metadata & labelagent
+```
+
 ### Web apps (npm workspace)
 
 | Package | Port | Description |
@@ -20,6 +60,31 @@ for the full design.
 | [`deedlit.dev`](./deedlit.dev/) | 3001 | Public Next.js site — home, books, gallery, services |
 | [`deedlit.dev.comfyhelper`](./deedlit.dev.comfyhelper/) | 3000 | ComfyHelper UI for the image library |
 | [`deedlit.dev.ui`](./deedlit.dev.ui/) | — | Shared `@carneirofc/ui` component library |
+
+#### deedlit.dev — public site
+
+Home hub with quick access to self-hosted services, an image gallery, and the
+reference book shelf:
+
+| Home / services hub | Image archive | Reference shelf |
+|---|---|---|
+| ![deedlit.dev home](./docs/screenshots/deedlit-dev-home.png) | ![deedlit.dev gallery](./docs/screenshots/deedlit-dev-gallery.png) | ![deedlit.dev books](./docs/screenshots/deedlit-dev-books.png) |
+
+#### ComfyHelper — image library
+
+Library browser with hybrid search, tag/safety filters and a Neo4j graph filter;
+admin page for ingestion, source folders, cache and maintenance jobs:
+
+| Image library | Backend admin |
+|---|---|
+| ![ComfyHelper library](./docs/screenshots/comfyhelper-library.png) | ![ComfyHelper admin](./docs/screenshots/comfyhelper-admin.png) |
+
+#### @carneirofc/ui — Storybook
+
+Every shared component is documented in Storybook (see
+[Storybook on GitHub Pages](#storybook-on-github-pages)):
+
+![@carneirofc/ui Storybook](./docs/screenshots/ui-storybook.png)
 
 ### Services (FastAPI, `uv` per-package venv)
 
@@ -39,6 +104,29 @@ durability boundary; projections converge via idempotent rebuilds). See
 [ADR 0001](./docs/adr/0001-async-queues-for-labelling-and-indexing.md) and
 [ADR 0002](./docs/adr/0002-per-stage-ingest-dag.md). The cross-service id is the
 SHA-256 of the image bytes — see [`id-scheme/`](./id-scheme/README.md).
+
+```mermaid
+flowchart TD
+    scan["folder-scan (producer)<br/>per file: sha / phash / thumb / metadata"]
+    scan -->|"catalog POST /images — VISIBLE"| cat[("catalog<br/>(rendezvous)")]
+    scan --> ed(["embed.dense (GPU)"]) & es(["embed.sparse"]) & ig(["index.graph"]) & lb(["label (vision-LLM)"])
+
+    ed -->|"PUT blob embedding"| cat
+    es -->|"PUT blob sparse"| cat
+    ed --> is(["index.search (fan-in)"])
+    es --> is
+    is -->|"both blobs present → upsert point"| qd[("Qdrant")]
+    ig -->|"refs / tags / lineage edges"| neo[("Neo4j")]
+
+    lb -->|"patch description / safety / tags"| cat
+    lb -->|"text changed"| es
+    lb -->|"tags changed"| ig
+```
+
+Each queue stage persists its output to catalog truth, then publishes its
+successors (choreography, no orchestrator). `index.search` is the only fan-in:
+whichever of `embed.dense`/`embed.sparse` finishes second finds both blobs in
+the catalog and writes the Qdrant point — catalog presence is the latch.
 
 ### Infrastructure & observability (Docker Compose)
 
@@ -88,6 +176,25 @@ npm run build              # everything
 Python services build via their per-package `Dockerfile`; `docker compose up`
 brings up the full stack (see [`docker-compose.yml`](./docker-compose.yml), the
 single compose file for the repo).
+
+## Storybook on GitHub Pages
+
+The `@carneirofc/ui` Storybook is published to GitHub Pages at
+**<https://carneirofc.github.io/deedlit.dev/ui/storybook/>** by
+[`storybook-pages.yml`](./.github/workflows/storybook-pages.yml). The workflow
+runs on every push to `master` that touches `deedlit.dev.ui/` (or manually via
+*workflow dispatch*), builds the static Storybook and deploys it under the
+`/ui/storybook` path — the Pages artifact is assembled with that folder layout
+so other static docs can later live on the same site.
+
+One-time repo setup: **Settings → Pages → Source: GitHub Actions**.
+
+Run it locally instead with:
+
+```bash
+npm run storybook -w @carneirofc/ui          # dev server on :6006
+npm run build-storybook -w @carneirofc/ui    # static build → deedlit.dev.ui/storybook-static
+```
 
 ## Project structure
 
