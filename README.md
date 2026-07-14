@@ -83,7 +83,7 @@ admin page for ingestion, source folders, cache and maintenance jobs:
 
 Every shared component is documented in Storybook — browse it live at
 [carneirofc.github.io/deedlit.dev/ui/storybook](https://carneirofc.github.io/deedlit.dev/ui/storybook/)
-(see [Storybook on GitHub Pages](#storybook-on-github-pages)):
+(see [GitHub Pages](#github-pages)):
 
 ![@carneirofc/ui Storybook](./docs/screenshots/ui-storybook.png)
 
@@ -178,15 +178,21 @@ Python services build via their per-package `Dockerfile`; `docker compose up`
 brings up the full stack (see [`docker-compose.yml`](./docker-compose.yml), the
 single compose file for the repo).
 
-## Storybook on GitHub Pages
+## GitHub Pages
 
-The `@carneirofc/ui` Storybook is published to GitHub Pages at
-**<https://carneirofc.github.io/deedlit.dev/ui/storybook/>** by
-[`storybook-pages.yml`](./.github/workflows/storybook-pages.yml). The workflow
-runs on every push to `master` that touches `deedlit.dev.ui/` (or manually via
-*workflow dispatch*), builds the static Storybook and deploys it under the
-`/ui/storybook` path — the Pages artifact is assembled with that folder layout
-so other static docs can later live on the same site.
+The repo publishes a single GitHub Pages site via
+[`storybook-pages.yml`](./.github/workflows/storybook-pages.yml):
+
+- **<https://carneirofc.github.io/deedlit.dev/>** — the monorepo landing page
+  (source: [`docs/site/index.html`](./docs/site/index.html)), showcasing the apps,
+  services, architecture and screenshots.
+- **<https://carneirofc.github.io/deedlit.dev/ui/storybook/>** — the
+  `@carneirofc/ui` Storybook.
+
+The workflow runs on every push to `master` that touches `deedlit.dev.ui/`,
+`docs/site/` or `docs/screenshots/` (or manually via *workflow dispatch*), builds
+the static Storybook and assembles both into one Pages artifact — the landing
+page at the root and Storybook under `/ui/storybook`.
 
 One-time repo setup: **Settings → Pages → Source: GitHub Actions**.
 

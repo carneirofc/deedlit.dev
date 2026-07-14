@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>deedlit.dev — monorepo</title>
+    <meta
+      name="description"
+      content="deedlit.dev — a generated-image library and landing site: an npm-workspace frontend over a mesh of FastAPI services. Shared @carneirofc/ui component library with live Storybook."
+    />
+    <link rel="icon" href="./icon.svg" />
+
+    <!-- Resolve the persisted theme before first paint to avoid a flash. -->
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem("deedlit-theme");
+          var theme =
+            saved ||
+            (window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {}
+      })();
+    </script>
+
+    <style>
+      /* ============================================================
+       * Webfonts — Sora (display/body) + IBM Plex Mono (mono).
+       * Same gstatic woff2 sources the @carneirofc/ui design system
+       * ships in deedlit.dev.ui/styles/styles.css.
+       * ============================================================ */
+      @font-face {
+        font-family: "Sora";
+        font-style: normal;
+        font-weight: 400;
+        font-display: swap;
+        src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSdSnk-DGQ.woff2)
+          format("woff2");
+      }
+      @font-face {
+        font-family: "Sora";
+        font-style: normal;
+        font-weight: 600;
+        font-display: swap;
+        src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSfWnU-DGQ.woff2)
+          format("woff2");
+      }
+      @font-face {
+        font-family: "Sora";
+        font-style: normal;
+        font-weight: 700;
+        font-display: swap;
+        src: url(https://fonts.gstatic.com/s/sora/v14/xMQOuFFYT72X5wkB_18qmnndmSfsnU-DGQ.woff2)
+          format("woff2");
+      }
+      @font-face {
+        font-family: "IBM Plex Mono";
+        font-style: normal;
+        font-weight: 400;
+        font-display: swap;
+        src: url(https://fonts.gstatic.com/s/ibmplexmono/v19/-F63fjptAgt5VM-kVkqdyU8n1iIq131nj-otFQ.woff2)
+          format("woff2");
+      }
+      @font-face {
+        font-family: "IBM Plex Mono";
+        font-style: normal;
+        font-weight: 500;
+        font-display: swap;
+        src: url(https://fonts.gstatic.com/s/ibmplexmono/v19/-F63fjptAgt5VM-kVkqdyU8n1iIq1391j-otFZ6Z.woff2)
+          format("woff2");
+      }
+
+      /* ============================================================
+       * Design tokens — copied from deedlit.dev.ui/styles/styles.css
+       * (:root light + html[data-theme="dark"]).
+       * ============================================================ */
+      :root {
+        --font-display: "Sora";
+        --font-mono: "IBM Plex Mono";
+
+        --radius-sm: 8px;
+        --radius-md: 10px;
+        --radius-lg: 14px;
+        --radius-xl: 18px;
+        --radius-panel: 20px;
+        --radius-pill: 9999px;
+
+        --bg-0: #f3f8ff;
+        --bg-1: #ebf4ff;
+        --bg-2: #f7f3ff;
+        --surface-0: color-mix(in oklab, #ffffff 87%, #dff4ff 13%);
+        --surface-1: color-mix(in oklab, #ffffff 70%, #d7e9ff 30%);
+        --surface-2: color-mix(in oklab, #ffffff 75%, #ebddff 25%);
+        --panel-border: color-mix(in oklab, #79b9ff 34%, #f7a6ff 22%);
+        --panel-border-strong: color-mix(in oklab, #38a0ff 58%, #f46fff 42%);
+        --text-0: #131a29;
+        --text-1: #36425d;
+        --text-2: #607091;
+        --accent-cyan: #00b7ff;
+        --accent-pink: #ff4ad8;
+        --accent-lime: #67f8bf;
+        --accent-warn: #ffbf4a;
+        --line-soft: color-mix(in oklab, #7dbdff 28%, #ff90df 20%);
+        --shadow-lg: 0 28px 78px -52px rgba(20, 30, 54, 0.45);
+        --shadow-sm: 0 10px 28px -20px rgba(20, 30, 54, 0.38);
+        --glow: rgba(0, 183, 255, 0.14);
+        --glow-2: rgba(255, 74, 216, 0.12);
+      }
+
+      html[data-theme="dark"] {
+        --bg-0: #05080f;
+        --bg-1: #09111f;
+        --bg-2: #0e1524;
+        --surface-0: color-mix(in oklab, #0c1426 90%, #050b18 10%);
+        --surface-1: color-mix(in oklab, #101a2d 76%, #060c1d 24%);
+        --surface-2: color-mix(in oklab, #111a2f 76%, #200726 24%);
+        --panel-border: color-mix(in oklab, #2ed3ff 38%, #e266ff 32%);
+        --panel-border-strong: color-mix(in oklab, #00d2ff 60%, #ff4cd9 40%);
+        --text-0: #fbfdff;
+        --text-1: #edf4ff;
+        --text-2: #d7e3f7;
+        --accent-cyan: #24d7ff;
+        --accent-pink: #ff59dd;
+        --accent-lime: #7cffcb;
+        --accent-warn: #ffd266;
+        --line-soft: color-mix(in oklab, #25bdf1 33%, #d859ff 27%);
+        --shadow-lg: 0 34px 94px -52px rgba(0, 0, 0, 0.82);
+        --shadow-sm: 0 16px 32px -24px rgba(0, 0, 0, 0.7);
+        --glow: rgba(46, 211, 255, 0.16);
+        --glow-2: rgba(226, 102, 255, 0.14);
+      }
+
+      /* ============================================================
+       * Base
+       * ============================================================ */
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: var(--font-display), ui-sans-serif, system-ui, sans-serif;
+        color: var(--text-0);
+        background:
+          radial-gradient(
+            60rem 40rem at 85% -10%,
+            var(--glow) 0%,
+            transparent 60%
+          ),
+          radial-gradient(
+            50rem 40rem at -10% 15%,
+            var(--glow-2) 0%,
+            transparent 55%
+          ),
+          linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 55%, var(--bg-2) 100%);
+        background-attachment: fixed;
+        line-height: 1.6;
+        overflow-x: hidden;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      code,
+      .mono {
+        font-family: var(--font-mono), ui-monospace, monospace;
+        font-feature-settings: "liga" 1, "calt" 1;
+      }
+
+      .wrap {
+        width: min(1120px, 100% - 2.5rem);
+        margin-inline: auto;
+      }
+
+      /* ============================================================
+       * Top bar
+       * ============================================================ */
+      header.topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        backdrop-filter: blur(14px) saturate(1.2);
+        background: color-mix(in oklab, var(--bg-0) 70%, transparent);
+        border-bottom: 1px solid
+          color-mix(in oklab, var(--panel-border) 45%, transparent);
+      }
+      .topbar-inner {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding-block: 0.7rem;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+      .brand img {
+        width: 30px;
+        height: 30px;
+        border-radius: 9px;
+        box-shadow: var(--shadow-sm);
+      }
+      .brand .dot {
+        color: var(--accent-pink);
+      }
+      .topbar nav {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+      }
+      .topbar nav a {
+        padding: 0.4rem 0.7rem;
+        border-radius: var(--radius-pill);
+        font-size: 0.9rem;
+        color: var(--text-1);
+        transition: color 0.15s, background 0.15s;
+      }
+      .topbar nav a:hover {
+        color: var(--text-0);
+        background: color-mix(in oklab, var(--surface-1) 60%, transparent);
+      }
+      .nav-hide {
+        display: none;
+      }
+      @media (min-width: 720px) {
+        .nav-hide {
+          display: inline-flex;
+        }
+      }
+
+      .icon-btn {
+        display: inline-grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        border-radius: var(--radius-pill);
+        border: 1px solid
+          color-mix(in oklab, var(--panel-border-strong) 55%, transparent);
+        background: color-mix(in oklab, var(--surface-1) 70%, transparent);
+        color: var(--text-0);
+        cursor: pointer;
+        transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+      }
+      .icon-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 0 0 3px var(--glow);
+      }
+      .icon-btn svg {
+        width: 18px;
+        height: 18px;
+      }
+      .theme-sun {
+        display: none;
+      }
+      html[data-theme="dark"] .theme-sun {
+        display: block;
+      }
+      html[data-theme="dark"] .theme-moon {
+        display: none;
+      }
+
+      /* ============================================================
+       * Buttons
+       * ============================================================ */
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.7rem 1.15rem;
+        border-radius: var(--radius-pill);
+        font-weight: 600;
+        font-size: 0.95rem;
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s,
+          background 0.15s;
+      }
+      .btn svg {
+        width: 18px;
+        height: 18px;
+      }
+      .btn-primary {
+        color: #04101c;
+        background: linear-gradient(
+          135deg,
+          var(--accent-cyan),
+          var(--accent-pink)
+        );
+        box-shadow: var(--shadow-sm), 0 0 0 1px
+          color-mix(in oklab, var(--accent-cyan) 40%, transparent);
+      }
+      .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-lg), 0 0 30px -6px var(--glow);
+      }
+      .btn-ghost {
+        color: var(--text-0);
+        background: color-mix(in oklab, var(--surface-1) 70%, transparent);
+        border-color: color-mix(in oklab, var(--panel-border-strong) 55%, transparent);
+      }
+      .btn-ghost:hover {
+        transform: translateY(-2px);
+        border-color: var(--panel-border-strong);
+        box-shadow: 0 0 24px -8px var(--glow);
+      }
+
+      /* ============================================================
+       * Panels & sections
+       * ============================================================ */
+      .panel {
+        position: relative;
+        border-radius: var(--radius-panel);
+        background: color-mix(in oklab, var(--surface-0) 88%, transparent);
+        border: 1px solid
+          color-mix(in oklab, var(--panel-border) 60%, transparent);
+        box-shadow: var(--shadow-sm);
+        backdrop-filter: blur(8px);
+      }
+      section {
+        padding-block: clamp(2.5rem, 6vw, 4.5rem);
+      }
+      .eyebrow {
+        font-family: var(--font-mono);
+        font-size: 0.75rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--accent-cyan);
+        margin: 0 0 0.6rem;
+      }
+      h2.section-title {
+        font-size: clamp(1.5rem, 3.4vw, 2.1rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin: 0 0 0.4rem;
+      }
+      .section-lead {
+        color: var(--text-2);
+        max-width: 58ch;
+        margin: 0 0 2rem;
+      }
+
+      /* ============================================================
+       * Hero
+       * ============================================================ */
+      .hero {
+        padding-top: clamp(3rem, 8vw, 5.5rem);
+        text-align: center;
+      }
+      .hero .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 0.85rem;
+        border-radius: var(--radius-pill);
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+        color: var(--text-1);
+        border: 1px solid
+          color-mix(in oklab, var(--panel-border) 60%, transparent);
+        background: color-mix(in oklab, var(--surface-1) 60%, transparent);
+      }
+      .hero .badge .pulse {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent-lime);
+        box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent-lime) 70%, transparent);
+        animation: pulse 2.2s infinite;
+      }
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent-lime) 60%, transparent);
+        }
+        70% {
+          box-shadow: 0 0 0 8px transparent;
+        }
+        100% {
+          box-shadow: 0 0 0 0 transparent;
+        }
+      }
+      .hero h1 {
+        font-size: clamp(2.6rem, 8vw, 4.6rem);
+        line-height: 1.02;
+        letter-spacing: -0.035em;
+        font-weight: 700;
+        margin: 1.3rem 0 0;
+      }
+      .hero h1 .grad {
+        background: linear-gradient(
+          120deg,
+          var(--accent-cyan),
+          var(--accent-pink) 70%
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero p.tagline {
+        font-size: clamp(1.05rem, 2.4vw, 1.3rem);
+        color: var(--text-1);
+        max-width: 62ch;
+        margin: 1.2rem auto 0;
+      }
+      .hero .cta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        justify-content: center;
+        margin-top: 2rem;
+      }
+
+      /* ============================================================
+       * Grids & cards
+       * ============================================================ */
+      .grid {
+        display: grid;
+        gap: 1rem;
+      }
+      .grid.apps {
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      }
+      .grid.services {
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      }
+      .card {
+        display: flex;
+        flex-direction: column;
+        gap: 0.55rem;
+        padding: 1.3rem;
+        border-radius: var(--radius-lg);
+        background: color-mix(in oklab, var(--surface-0) 85%, transparent);
+        border: 1px solid
+          color-mix(in oklab, var(--panel-border) 50%, transparent);
+        transition: transform 0.18s, border-color 0.18s, box-shadow 0.18s;
+      }
+      a.card:hover {
+        transform: translateY(-3px);
+        border-color: var(--panel-border-strong);
+        box-shadow: var(--shadow-lg), 0 0 26px -10px var(--glow);
+      }
+      .card-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+      }
+      .card h3 {
+        margin: 0;
+        font-size: 1.02rem;
+        font-family: var(--font-mono);
+        font-weight: 500;
+      }
+      .port {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: var(--radius-pill);
+        color: var(--accent-cyan);
+        background: color-mix(in oklab, var(--accent-cyan) 14%, transparent);
+        border: 1px solid color-mix(in oklab, var(--accent-cyan) 40%, transparent);
+        white-space: nowrap;
+      }
+      .card p {
+        margin: 0;
+        color: var(--text-2);
+        font-size: 0.9rem;
+      }
+      .card .owns {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        color: var(--accent-pink);
+        letter-spacing: 0.02em;
+      }
+      .card .link-arrow {
+        margin-top: auto;
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: var(--accent-cyan);
+      }
+
+      /* ============================================================
+       * Architecture flow
+       * ============================================================ */
+      .flow {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: 1fr;
+      }
+      @media (min-width: 860px) {
+        .flow {
+          grid-template-columns: repeat(3, 1fr);
+          align-items: stretch;
+        }
+      }
+      .flow-col {
+        padding: 1.2rem;
+        border-radius: var(--radius-lg);
+      }
+      .flow-col h4 {
+        margin: 0 0 0.8rem;
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--text-2);
+      }
+      .flow-node {
+        padding: 0.6rem 0.8rem;
+        border-radius: var(--radius-sm);
+        font-family: var(--font-mono);
+        font-size: 0.82rem;
+        margin-bottom: 0.5rem;
+        border: 1px solid color-mix(in oklab, var(--panel-border) 55%, transparent);
+        background: color-mix(in oklab, var(--surface-1) 60%, transparent);
+      }
+      .flow-node small {
+        display: block;
+        color: var(--text-2);
+        font-size: 0.72rem;
+        margin-top: 0.15rem;
+      }
+      .flow-node.accent-cyan {
+        border-color: color-mix(in oklab, var(--accent-cyan) 45%, transparent);
+      }
+      .flow-node.accent-pink {
+        border-color: color-mix(in oklab, var(--accent-pink) 45%, transparent);
+      }
+      .stores {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 1.5rem;
+        justify-content: center;
+      }
+      .store-chip {
+        font-family: var(--font-mono);
+        font-size: 0.78rem;
+        padding: 0.4rem 0.75rem;
+        border-radius: var(--radius-pill);
+        color: var(--text-1);
+        border: 1px solid color-mix(in oklab, var(--line-soft) 55%, transparent);
+        background: color-mix(in oklab, var(--surface-1) 55%, transparent);
+      }
+
+      /* ============================================================
+       * Screenshots
+       * ============================================================ */
+      .shots {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      }
+      .shot {
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        border: 1px solid color-mix(in oklab, var(--panel-border) 55%, transparent);
+        background: var(--surface-0);
+        box-shadow: var(--shadow-sm);
+        transition: transform 0.2s, box-shadow 0.2s;
+      }
+      .shot:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--shadow-lg);
+      }
+      .shot img {
+        display: block;
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 10;
+        object-fit: cover;
+        object-position: top;
+      }
+      .shot .cap {
+        padding: 0.7rem 0.9rem;
+        font-size: 0.82rem;
+        color: var(--text-2);
+        font-family: var(--font-mono);
+        border-top: 1px solid
+          color-mix(in oklab, var(--panel-border) 40%, transparent);
+      }
+      .shot.wide {
+        grid-column: 1 / -1;
+      }
+      .shot.wide img {
+        aspect-ratio: 21 / 9;
+        object-fit: cover;
+      }
+
+      /* ============================================================
+       * Footer
+       * ============================================================ */
+      footer {
+        border-top: 1px solid
+          color-mix(in oklab, var(--panel-border) 40%, transparent);
+        padding-block: 2.5rem;
+        margin-top: 2rem;
+      }
+      .foot-inner {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+        color: var(--text-2);
+        font-size: 0.88rem;
+      }
+      .foot-inner a {
+        color: var(--text-1);
+      }
+      .foot-inner a:hover {
+        color: var(--accent-cyan);
+      }
+      .foot-links {
+        display: flex;
+        gap: 1.2rem;
+        flex-wrap: wrap;
+      }
+    </style>
+  </head>
+
+  <body>
+    <!-- ===================== Top bar ===================== -->
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <a class="brand" href="#top" aria-label="deedlit.dev home">
+          <img src="./icon.svg" alt="" />
+          <span>deedlit<span class="dot">.dev</span></span>
+        </a>
+        <nav>
+          <a class="nav-hide" href="#apps">Apps</a>
+          <a class="nav-hide" href="#services">Services</a>
+          <a class="nav-hide" href="#architecture">Architecture</a>
+          <a href="./ui/storybook/">Storybook</a>
+          <a
+            href="https://github.com/carneirofc/deedlit.dev"
+            rel="noopener"
+            >GitHub</a
+          >
+          <button
+            class="icon-btn"
+            id="theme-toggle"
+            type="button"
+            aria-label="Toggle color theme"
+          >
+            <svg class="theme-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+            <svg class="theme-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          </button>
+        </nav>
+      </div>
+    </header>
+
+    <!-- ===================== Hero ===================== -->
+    <a id="top"></a>
+    <section class="hero wrap">
+      <span class="badge"><span class="pulse"></span> monorepo · npm workspace + FastAPI mesh</span>
+      <h1>deedlit<span class="grad">.dev</span></h1>
+      <p class="tagline">
+        A generated-image library and landing site — an npm-workspace frontend
+        over a mesh of standalone <strong>FastAPI</strong> services, sharing one
+        <code>@carneirofc/ui</code> component system.
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="./ui/storybook/">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M8 4v16"/><path d="M12 8h4M12 12h4"/></svg>
+          Explore Storybook
+        </a>
+        <a class="btn btn-ghost" href="https://github.com/carneirofc/deedlit.dev" rel="noopener">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.3 9.3 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.35 4.79-4.58 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.6.69.49A10.03 10.03 0 0 0 22 12.25C22 6.58 17.52 2 12 2z"/></svg>
+          View on GitHub
+        </a>
+      </div>
+    </section>
+
+    <!-- ===================== Web apps ===================== -->
+    <section id="apps" class="wrap">
+      <p class="eyebrow">Web apps · npm workspace</p>
+      <h2 class="section-title">Three frontends, one design system</h2>
+      <p class="section-lead">
+        Two Next.js apps and the shared component library they both consume.
+        Every app talks only to the <code>deedlit.api</code> gateway.
+      </p>
+      <div class="grid apps">
+        <a class="card" href="https://github.com/carneirofc/deedlit.dev/tree/master/deedlit.dev" rel="noopener">
+          <div class="card-head">
+            <h3>deedlit.dev</h3>
+            <span class="port">:3001</span>
+          </div>
+          <p>Public Next.js site — home hub, reference book shelf, image gallery and self-hosted service links.</p>
+          <span class="link-arrow">Source →</span>
+        </a>
+        <a class="card" href="https://github.com/carneirofc/deedlit.dev/tree/master/deedlit.dev.comfyhelper" rel="noopener">
+          <div class="card-head">
+            <h3>comfyhelper</h3>
+            <span class="port">:3000</span>
+          </div>
+          <p>ComfyHelper UI for the image library — hybrid search, tag/safety filters, a Neo4j graph filter and an ingestion admin.</p>
+          <span class="link-arrow">Source →</span>
+        </a>
+        <a class="card" href="./ui/storybook/">
+          <div class="card-head">
+            <h3>@carneirofc/ui</h3>
+            <span class="port">lib</span>
+          </div>
+          <p>Shared, app-agnostic component library and the cyber/neon design system backing both apps — documented live in Storybook.</p>
+          <span class="link-arrow">Open Storybook →</span>
+        </a>
+      </div>
+    </section>
+
+    <!-- ===================== Services ===================== -->
+    <section id="services" class="wrap">
+      <p class="eyebrow">Backend · FastAPI mesh</p>
+      <h2 class="section-title">Database-per-service, HTTP-only</h2>
+      <p class="section-lead">
+        Each service is the sole writer of its datastore and they never call each
+        other — <code>search</code> and <code>graph</code> are rebuildable
+        projections of <code>catalog</code>, the canonical truth.
+      </p>
+      <div class="grid services">
+        <div class="card">
+          <div class="card-head"><h3>api</h3><span class="port">:8088</span></div>
+          <p>Gateway / BFF: aggregate detail pages, host MCP, dispatch ingest jobs.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>catalog</h3><span class="port">:8001</span></div>
+          <span class="owns">owns · Postgres + RustFS</span>
+          <p>Canonical images, tags, params, references, ratings, notes, collections, thumbnails, cached vectors.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>search</h3><span class="port">:8002</span></div>
+          <span class="owns">owns · Qdrant</span>
+          <p>Dense (CLIP) + sparse (SPLADE) hybrid vector search.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>graph</h3><span class="port">:8003</span></div>
+          <span class="owns">owns · Neo4j</span>
+          <p>Shared-asset, tag co-occurrence and lineage edges.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>ingest</h3><span class="port">:8004</span></div>
+          <p>Scan, hash, thumbnail; publishes the per-stage ingest DAG over RabbitMQ.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>metadata</h3><span class="port">:8005</span></div>
+          <p>Bytes → embedded prompt / tags / params + resolved reference graph.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>labelagent</h3><span class="port">:8006</span></div>
+          <p>Vision-LLM describe / safety / tags via a local llama-server.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>vision</h3><span class="port">:8000</span></div>
+          <p>CLIP dense + SPLADE sparse embeddings (GPU).</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== Architecture ===================== -->
+    <section id="architecture" class="wrap">
+      <p class="eyebrow">Architecture</p>
+      <h2 class="section-title">A queue-driven ingest DAG</h2>
+      <p class="section-lead">
+        Ingest is fully queue-driven over RabbitMQ as a per-stage DAG — the
+        catalog write is the durability boundary, and projections converge via
+        idempotent rebuilds. The cross-service id is the SHA-256 of the image bytes.
+      </p>
+      <div class="panel" style="padding: clamp(1.2rem, 3vw, 1.8rem)">
+        <div class="flow">
+          <div class="flow-col panel">
+            <h4>1 · Produce</h4>
+            <div class="flow-node accent-cyan">
+              folder-scan
+              <small>per file: sha · phash · thumb · metadata</small>
+            </div>
+            <div class="flow-node">catalog POST /images → <em>VISIBLE</em></div>
+          </div>
+          <div class="flow-col panel">
+            <h4>2 · Fan-out (choreography)</h4>
+            <div class="flow-node accent-cyan">embed.dense · GPU</div>
+            <div class="flow-node accent-cyan">embed.sparse</div>
+            <div class="flow-node accent-pink">index.graph</div>
+            <div class="flow-node accent-pink">label · vision-LLM</div>
+          </div>
+          <div class="flow-col panel">
+            <h4>3 · Fan-in &amp; project</h4>
+            <div class="flow-node accent-cyan">
+              index.search
+              <small>both blobs present → upsert Qdrant point</small>
+            </div>
+            <div class="flow-node accent-pink">
+              catalog is the latch
+              <small>rebuildable projections converge</small>
+            </div>
+          </div>
+        </div>
+        <div class="stores">
+          <span class="store-chip">Postgres</span>
+          <span class="store-chip">Neo4j</span>
+          <span class="store-chip">Qdrant</span>
+          <span class="store-chip">RustFS S3</span>
+          <span class="store-chip">RabbitMQ</span>
+          <span class="store-chip">Redis</span>
+          <span class="store-chip">Grafana · Loki · Tempo</span>
+        </div>
+      </div>
+      <p class="section-lead" style="margin-top: 1.5rem">
+        Full design in
+        <a href="https://github.com/carneirofc/deedlit.dev/blob/master/deedlit.dev.comfyhelper/IMAGE_LIBRARY.md" rel="noopener" style="color: var(--accent-cyan)">IMAGE_LIBRARY.md</a>,
+        the ingest ADRs
+        (<a href="https://github.com/carneirofc/deedlit.dev/blob/master/docs/adr/0001-async-queues-for-labelling-and-indexing.md" rel="noopener" style="color: var(--accent-cyan)">0001</a>,
+        <a href="https://github.com/carneirofc/deedlit.dev/blob/master/docs/adr/0002-per-stage-ingest-dag.md" rel="noopener" style="color: var(--accent-cyan)">0002</a>)
+        and the <a href="https://github.com/carneirofc/deedlit.dev#readme" rel="noopener" style="color: var(--accent-cyan)">repo README</a>.
+      </p>
+    </section>
+
+    <!-- ===================== Screenshots ===================== -->
+    <section id="screenshots" class="wrap">
+      <p class="eyebrow">Screens</p>
+      <h2 class="section-title">The apps in motion</h2>
+      <p class="section-lead">
+        The public site, the ComfyHelper library and the shared component
+        catalog — all built from <code>@carneirofc/ui</code>.
+      </p>
+      <div class="shots">
+        <a class="shot wide" href="./ui/storybook/">
+          <img src="./screenshots/ui-storybook.png" alt="@carneirofc/ui Storybook" loading="lazy" />
+          <div class="cap">@carneirofc/ui — live Storybook</div>
+        </a>
+        <div class="shot">
+          <img src="./screenshots/deedlit-dev-home.png" alt="deedlit.dev home / services hub" loading="lazy" />
+          <div class="cap">deedlit.dev — home &amp; services hub</div>
+        </div>
+        <div class="shot">
+          <img src="./screenshots/deedlit-dev-gallery.png" alt="deedlit.dev image gallery" loading="lazy" />
+          <div class="cap">deedlit.dev — image gallery</div>
+        </div>
+        <div class="shot">
+          <img src="./screenshots/deedlit-dev-books.png" alt="deedlit.dev reference shelf" loading="lazy" />
+          <div class="cap">deedlit.dev — reference shelf</div>
+        </div>
+        <div class="shot">
+          <img src="./screenshots/comfyhelper-admin.png" alt="ComfyHelper backend admin" loading="lazy" />
+          <div class="cap">ComfyHelper — backend admin</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== Footer ===================== -->
+    <footer>
+      <div class="wrap foot-inner">
+        <span>MIT · built with <code>@carneirofc/ui</code></span>
+        <div class="foot-links">
+          <a href="https://github.com/carneirofc/deedlit.dev" rel="noopener">GitHub</a>
+          <a href="./ui/storybook/">Storybook</a>
+          <a href="https://github.com/carneirofc/deedlit.dev#readme" rel="noopener">README</a>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      (function () {
+        var btn = document.getElementById("theme-toggle");
+        if (!btn) return;
+        btn.addEventListener("click", function () {
+          var root = document.documentElement;
+          var next =
+            root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+          root.setAttribute("data-theme", next);
+          try {
+            localStorage.setItem("deedlit-theme", next);
+          } catch (e) {}
+        });
+      })();
+    </script>
+  </body>
+</html>
