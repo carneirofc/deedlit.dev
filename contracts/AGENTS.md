@@ -18,5 +18,5 @@
 ## Verification
 - `uv run --with openapi-spec-validator --with pyyaml python contracts/validate.py`
 
-## Child DOX Index
+## Child Guides
 - None.

@@ -17,5 +17,5 @@
 ## Verification
 - `uv run --directory deedlit.labelagent pytest`
 
-## Child DOX Index
+## Child Guides
 - None.

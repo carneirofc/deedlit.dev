@@ -20,5 +20,5 @@
 ## Verification
 - `npm run lint` · `npm run build` · `npm run test:e2e` (from repo root: `npm run dev:comfyhelper`).
 
-## Child DOX Index
+## Child Guides
 - None.

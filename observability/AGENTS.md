@@ -18,5 +18,5 @@
 ## Verification
 - No automated check — bring up the profile and inspect the Grafana/Alloy UIs.
 
-## Child DOX Index
+## Child Guides
 - None.

@@ -10,7 +10,8 @@
 - `adr/` — decision records (source of truth for the ingest design):
   - `0001-async-queues-for-labelling-and-indexing.md` (Accepted).
   - `0002-per-stage-ingest-dag.md` (Accepted; makes ingest fully queue-driven, RabbitMQ a hard dependency).
-- `agents/` — agent workflow conventions:
+- `agents/` — agent workflow conventions (indexed from the root [`../AGENTS.md`](../AGENTS.md)):
+  - `toolchain.md` — fnm/uv toolchain locations & activation (Windows/PowerShell).
   - `domain.md` — read root context + relevant ADRs before exploring; flag ADR conflicts rather than overriding.
   - `issue-tracker.md` — issues/PRDs live as GitHub issues on `carneirofc/deedlit.dev` via the `gh` CLI.
   - `triage-labels.md` — canonical triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`).
@@ -23,5 +24,5 @@
 ## Verification
 - None automated — ADRs/agent docs are read as guidance; `site/index.html` is served statically via GitHub Pages.
 
-## Child DOX Index
+## Child Guides
 - None.

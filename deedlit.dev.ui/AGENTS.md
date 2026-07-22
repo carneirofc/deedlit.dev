@@ -20,5 +20,5 @@
 - `npm run build -w @carneirofc/ui` (type-check via `tsc` + ESM import fix). No unit-test or lint script in this package.
 - `npm run build-storybook -w @carneirofc/ui` for the static Storybook.
 
-## Child DOX Index
+## Child Guides
 - None.

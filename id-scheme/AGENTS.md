@@ -17,5 +17,5 @@
 ## Verification
 - Each service's own unit tests exercise its copy against `vectors.json` (e.g. `deedlit.vision/tests/test_id_scheme.py`, `deedlit.dev.comfyhelper/tests/unit/id-scheme.unit.ts`). No standalone runner.
 
-## Child DOX Index
+## Child Guides
 - None.

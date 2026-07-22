@@ -19,5 +19,5 @@
 ## Verification
 - `uv run --directory deedlit.graph pytest`
 
-## Child DOX Index
+## Child Guides
 - None.

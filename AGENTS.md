@@ -1,30 +1,12 @@
 # Deedlit Monorepo Agent Guide
 
+Root guide for the monorepo: project-wide instructions, global preferences, durable workflow rules, and the index of nested `AGENTS.md` guides. Each package's own `AGENTS.md` is the local contract for its subtree; this file holds repo-wide rules and points to the rest. See [Maintaining These Guides](#maintaining-these-guides) before editing any `AGENTS.md`.
+
 ## Start Here
 - The repo root is a workspace orchestrator, not the primary home of application logic.
 - Check `package.json` at the repo root for workspace-level commands, then move into the package that owns the task.
 - Read the nearest package-local `.github/copilot-instructions.md` before editing code.
-
-## Toolchain & Environment (Windows / PowerShell)
-Don't go hunting for these every session — they are version-managed, not on the bare PATH.
-
-### Node — managed by **fnm**
-- `fnm.exe`: `%LOCALAPPDATA%\Microsoft\WinGet\Links\fnm.exe` (already on PATH).
-- `FNM_DIR`: `%APPDATA%\fnm`; installed versions live under `…\fnm\node-versions\`.
-- Default/active version: **v24.13.1** (`node` resolves into an fnm multishell, not a fixed path).
-- Activate in a PowerShell session (the Bash/PowerShell tool does NOT auto-load fnm):
-  ```powershell
-  fnm env --use-on-cd | Out-String | Invoke-Expression
-  ```
-  After that, `node`, `npm`, `npx` work. `--use-on-cd` makes fnm honor a repo's `.node-version`/`.nvmrc` on entry. Use `npm` for workspace scripts (see Command Reference).
-
-### Python — managed by **uv**, per-package venvs
-- `uv.exe`: `%USERPROFILE%\.local\bin\uv.exe` (on PATH).
-- ⚠️ Bare `python` on PATH is the **Windows Store stub** (`%LOCALAPPDATA%\Microsoft\WindowsApps\python.exe`) — do not use it.
-- `deedlit.vision/` has its own venv: `deedlit.vision\.venv` (**Python 3.14.5**).
-  - Activate: `deedlit.vision\.venv\Scripts\Activate.ps1`
-  - Or run without activating: `uv run --project deedlit.vision <cmd>` (or `cd deedlit.vision; uv run <cmd>`).
-- To get a python without a venv: `uv run python …` or `uv python find`.
+- Toolchain not on the bare PATH (fnm/uv, Windows/PowerShell): [`docs/agents/toolchain.md`](docs/agents/toolchain.md).
 
 ## Package Ownership
 - `deedlit.dev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
@@ -62,103 +44,61 @@ All commits must follow **[Conventional Commits](https://www.conventionalcommits
 
 Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `style`, `perf`.
 
-## Agent skills
+## Agent Skills
+- **Issue tracker** — issues live as GitHub issues on `carneirofc/deedlit.dev` via the `gh` CLI. See [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md).
+- **Triage labels** — canonical vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md).
+- **Domain docs** — single-context monorepo (root `CONTEXT.md` + `docs/adr/`, with authoritative package-local docs). See [`docs/agents/domain.md`](docs/agents/domain.md).
 
-### Issue tracker
+## Maintaining These Guides
 
-Issues live as GitHub issues on `carneirofc/deedlit.dev` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+`AGENTS.md` files are the working contract for their subtree. Any file, folder, or workflow should stay understandable from the nearest `AGENTS.md` plus every parent above it. Follow these rules across any edit.
 
-### Triage labels
+### Read before editing
+1. Read this root guide.
+2. Identify every file or folder you expect to touch, and walk from the repo root to each one.
+3. Read every `AGENTS.md` along the way; when a guide lists a nested child whose scope contains your path, read that child and continue from there.
+4. Use the nearest `AGENTS.md` as the local contract and parent guides for repo-wide rules. If they conflict, the closer guide wins for local details.
 
-Default canonical vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+Re-read the relevant guides in the current session — don't rely on memory.
 
-### Domain docs
+### Update after editing
+Update the closest owning `AGENTS.md` when a change affects:
+- purpose, scope, ownership, or responsibilities;
+- durable structure, contracts, workflows, or operating rules;
+- required inputs, outputs, permissions, constraints, side effects, or artifacts;
+- user preferences about behavior, process, organization, or quality;
+- creation, deletion, move, rename, or index contents of any `AGENTS.md`.
 
-Single-context monorepo (root `CONTEXT.md` + `docs/adr/`, with authoritative package-local docs). See `docs/agents/domain.md`.
+Update parent guides when parent-level structure, ownership, workflow, or the child index changes; update child guides when a parent change alters local rules. Remove stale or contradictory text immediately.
 
-# DOX framework
+### Hierarchy & shape
+- The root guide holds project-wide rules, global preferences, and the top-level child index. Nested guides own domain-specific rules and their own child index. Each parent explains what its direct children cover and what stays owned by the parent.
+- The closer a guide is to the work, the more specific and practical it must be.
+- Add a nested `AGENTS.md` when a folder becomes a durable boundary with its own purpose, rules, workflow, or quality standards. Suggested section order: Purpose, Ownership, Local Contracts, Work Guidance, Verification, Child Guides. Leave Work Guidance or Verification empty until real standards or checks exist.
 
-- DOX is highly performant AGENTS.md hierarchy installed here
-- Agent must follow DOX instructions across any edits
+### Style
+- Keep guides concise, current, and operational — document stable contracts, not history.
+- Put broad rules in parent guides, concrete details in child guides; don't duplicate a rule across scopes unless each needs a local version.
+- Prefer direct bullets with explicit names. Delete stale notes instead of explaining them.
 
-## Core Contract
-
-- AGENTS.md files are binding work contracts for their subtrees
-- Work products, source materials, instructions, records, assets, and durable docs must stay understandable from the nearest applicable AGENTS.md plus every parent AGENTS.md above it
-
-## Read Before Editing
-
-1. Read the root AGENTS.md
-2. Identify every file or folder you expect to touch
-3. Walk from the repository root to each target path
-4. Read every AGENTS.md found along each route
-5. If a parent AGENTS.md lists a child AGENTS.md whose scope contains the path, read that child and continue from there
-6. Use the nearest AGENTS.md as the local contract and parent docs for repo-wide rules
-7. If docs conflict, the closer doc controls local work details, but no child doc may weaken DOX
-
-Do not rely on memory. Re-read the applicable DOX chain in the current session before editing.
-
-## Update After Editing
-
-Every meaningful change requires a DOX pass before the task is done.
-
-Update the closest owning AGENTS.md when a change affects:
-
-- purpose, scope, ownership, or responsibilities
-- durable structure, contracts, workflows, or operating rules
-- required inputs, outputs, permissions, constraints, side effects, or artifacts
-- user preferences about behavior, communication, process, organization, or quality
-- AGENTS.md creation, deletion, move, rename, or index contents
-
-Update parent docs when parent-level structure, ownership, workflow, or child index changes. Update child docs when parent changes alter local rules. Remove stale or contradictory text immediately. Small edits that do not change behavior or contracts may leave docs unchanged, but the DOX pass still must happen.
-
-## Hierarchy
-
-- Root AGENTS.md is the DOX rail: project-wide instructions, global preferences, durable workflow rules, and the top-level Child DOX Index
-- Child AGENTS.md files own domain-specific instructions and their own Child DOX Index
-- Each parent explains what its direct children cover and what stays owned by the parent
-- The closer a doc is to the work, the more specific and practical it must be
-
-## Child Doc Shape
-
-- Create a child AGENTS.md when a folder becomes a durable boundary with its own purpose, rules, responsibilities, workflow, materials, or quality standards
-- Work Guidance must reflect the current standards of the project or user instructions; if there are no specific standards or instructions yet, leave it empty
-- Verification must reflect an existing check; if no verification framework exists yet, leave it empty and update it when one exists
-
-Default section order:
-- Purpose
-- Ownership
-- Local Contracts
-- Work Guidance
-- Verification
-- Child DOX Index
-
-## Style
-
-- Keep docs concise, current, and operational
-- Document stable contracts, not diary entries
-- Put broad rules in parent docs and concrete details in child docs
-- Prefer direct bullets with explicit names
-- Do not duplicate rules across many files unless each scope needs a local version
-- Delete stale notes instead of explaining history
-- Trim obvious statements, repeated rules, misplaced detail, and warnings for risks that no longer exist
-
-## Closeout
-
-1. Re-check changed paths against the DOX chain
-2. Update nearest owning docs and any affected parents or children
-3. Refresh every affected Child DOX Index
-4. Remove stale or contradictory text
-5. Run existing verification when relevant
-6. Report any docs intentionally left unchanged and why
+### Closeout
+1. Re-check changed paths against the guides above them.
+2. Update the nearest owning guide and any affected parents or children, and refresh every affected child index.
+3. Remove stale or contradictory text, run existing verification when relevant, and report any guide left unchanged and why.
 
 ## User Preferences
 
-When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md
+When the user requests a durable behavior change, record it here or in the relevant child AGENTS.md.
 
-## Child DOX Index
+## Child Guides
 
-Each child AGENTS.md is the local contract for its subtree. Ownership detail lives in the child; this index is the map.
+Each nested `AGENTS.md` is the local contract for its subtree. Ownership detail lives in the child; this index is the map.
+
+### Agent operating docs (`docs/agents/`)
+- [`docs/agents/toolchain.md`](docs/agents/toolchain.md) — fnm/uv toolchain locations & activation (Windows/PowerShell).
+- [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md) — GitHub-issue workflow via `gh`.
+- [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md) — canonical triage vocabulary.
+- [`docs/agents/domain.md`](docs/agents/domain.md) — domain-doc reading order and glossary rules.
 
 ### Web apps (npm workspace)
 - [`deedlit.dev/AGENTS.md`](deedlit.dev/AGENTS.md) — public Next.js site (:3001): home, books, gallery, services, PWA. Nests [`deedlit.dev/docs/AGENTS.md`](deedlit.dev/docs/AGENTS.md) (testing/setup guide).

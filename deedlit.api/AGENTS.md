@@ -22,5 +22,5 @@
 ## Verification
 - `uv run --directory deedlit.api pytest`
 
-## Child DOX Index
+## Child Guides
 - None.
