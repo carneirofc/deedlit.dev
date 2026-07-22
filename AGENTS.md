@@ -6,7 +6,7 @@ Root guide for the monorepo: project-wide instructions, global preferences, dura
 - The repo root is a workspace orchestrator, not the primary home of application logic.
 - Check `package.json` at the repo root for workspace-level commands, then move into the package that owns the task.
 - Read the nearest package-local `.github/copilot-instructions.md` before editing code.
-- Toolchain not on the bare PATH (fnm/uv, Windows/PowerShell): [`docs/agents/toolchain.md`](docs/agents/toolchain.md).
+- Toolchain not on the bare PATH: Node is via **fnm** (`fnm env --use-on-cd | Out-String | Invoke-Expression`), Python via **uv** (`uv run …`) — full details in [`docs/agents/toolchain.md`](docs/agents/toolchain.md).
 
 ## Package Ownership
 - `deedlit.dev/`: marketing site, home page, books, gallery presentation, services, static content, and PWA-related work.
